@@ -1,6 +1,6 @@
 # Review response — P0, not full v1 approval
 
-**Follow-up:** the newer user-supplied verification approves baseline bdb4bf2/0dd0b6b for P0 conditional on F-1/F-2. See [pre-measurement fixes](p0-premeasurement-fixes.md). The remaining text records the earlier design-review response, not the latest P0 approval state.
+**Follow-up:** verification §6a accepts the F-1/F-2 patch after reviewer-reported Windows 96/96 tests. The subsequent Codex review and Claude triage request L-1 plus H-1/H-2/H-3 procedure changes. See [pre-measurement fixes](p0-premeasurement-fixes.md) and [Measurement](../README.md#measurement). This is P0 approval only; the remaining text records the earlier design-review response.
 
 Reviewed source: user-uploaded `CODEXish-review-by-Claude.md`, 2026-09-15; reviewer label Claude Fable 5.1; commit 8cecfc7680ddb032eddb7c35837a9ed4bedb9621; decision CHANGES_REQUESTED. This response does not change that decision.
 

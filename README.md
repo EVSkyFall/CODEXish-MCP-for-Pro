@@ -16,19 +16,23 @@ The last command creates a new disposable fixture, prints its path, and listens 
 
 `echo` lists six fixture files. Each must contain its ordinal integer (case01.txt → 1, etc.). `run_command` accepts only `test`, `sleep`, or `inspect`: a fixed C# child validator, a fixed 60-second child, or operation lookup. This is a tool-loop probe, **not yet an arbitrary source-code repair benchmark**. No caller-supplied shell or JavaScript is executed. Test failure is represented by `test_passed=false` and the real nonzero exit code; a successfully collected process result does not mean the test passed.
 
-Writes require the hash returned by `read_file`. They use one exclusive handle and retain byte encoding, BOM, and homogeneous LF/CRLF. Old bytes are saved under the sibling `.state` directory before a **non-atomic in-place** write. The SQLite invocation ledger prevents replay of completed effects and marks unfinished operations unknown after restart. `wait_ms` is only a response wait, not a process deadline. Use `run_command(command="inspect", operation_id=...)` to query pending effects.
+Writes require the hash returned by `read_file`. They use one exclusive handle and retain byte encoding, BOM, and homogeneous LF/CRLF. Old bytes are saved under the sibling `.state` directory before a **non-atomic in-place** write. The SQLite invocation ledger prevents replay of completed effects and marks unfinished operations unknown after restart. Resource semaphores provide mutual exclusion, not acceptance-order FIFO; wait for each operation to complete before a dependent action. `wait_ms` is only a response wait, not a process deadline. Use `run_command(command="inspect", operation_id=...)` to query pending effects.
 
 ## Actual Windows desktop probe
 
-Use a disposable Windows login/VM desktop with no private windows or credentials. Open Notepad yourself. Identify the PID of the Notepad window being tested, put it on the primary monitor, and keep it in the foreground. Restart the probe with the previously printed fixture path:
+Use a test desktop with no private windows or credentials visible: screenshot captures the **entire primary monitor**. Choose a Notepad process in the current session. **Ctrl+N must open a new unsaved tab**; the installed Notepad can restore an existing file on startup. Never type into a restored document. Put the window and any save dialog completely inside the primary monitor, not merely overlapping it.
+
+**Operate ChatGPT and its write confirmations from another device** (phone, tablet, or other PC). Using ChatGPT on the controlled desktop takes foreground focus away from Notepad; none of P0's seven tools can restore it. After starting the server and tunnel, the last local setup action is to bring the new Notepad tab to the foreground. During a GUI run, do not touch the PC's mouse or keyboard. The last-input check invalidates observations after local input. Keep host confirmation behavior unchanged.
+
+For one freshly created trial, record the fixture path and stop the initial server. Resume that same trial for GUI setup only:
 
 ```powershell
-dotnet run --project src/Codexish.P0 -- --resume "C:\path\printed-by-probe" --notepad-pid 1234 --disposable-desktop
+dotnet run --project src/Codexish.P0 -- --resume "C:\path\printed-for-this-new-trial" --notepad-pid 1234 --disposable-desktop
 ```
 
-The acknowledgement flag does not create an OS sandbox. The screenshot captures the **entire primary monitor**. Input checks select only the configured Notepad process; they do not make the desktop or filesystem a security boundary. No administrator elevation, clipboard access, or synthetic screen fallback is used.
+Never resume a previous reference/Pro/Thinking/A/B trial. `--disposable-desktop` acknowledges the test scope; it creates no sandbox. Input checks select the configured Notepad PID. No administrator elevation, clipboard access, or synthetic screen fallback is used.
 
-During P0 GUI steps, do not touch the mouse or keyboard: the existing last-input check invalidates an observation after local input (review C-1). Take a screenshot before each action and afterward. `type_text` accepts exactly one of literal `text` or `key` (`CTRL+S`, `CTRL+A`, `ENTER`, `ESC`). Use the save path returned by `echo`. Verify the saved result with `read_file("gui-result.txt")`; this file cannot be written with `write_file`, so the tool cannot forge GUI success. UIA, other monitors and mixed-DPI acceptance testing are deferred.
+Take a screenshot before and after each action. `type_text` accepts exactly one of literal `text` or `key` (`CTRL+S`, `CTRL+A`, `ENTER`, `ESC`). If an action is pending, inspect its operation until complete before the next action. A still-unchanged frame calls for another observation, not another Ctrl+S. Use echo's `gui_save_path` and verify with `read_file("gui-result.txt")`; this file is not writable through `write_file`. UIA, focus recovery, other monitors and mixed-DPI acceptance testing remain v1 work.
 
 ## F-1: tunnel Host and Origin configuration
 
@@ -65,8 +69,36 @@ Each observation retains its own immutable transform. Capture again after an act
 
 ## Measurement
 
-Record M-1–M-8 for Pro and Thinking, with and without server/Project instructions. Store the exact model label, prompts, screenshots, confirmation behavior, call count, final files and wall times. Use `echo(delay_60_seconds=true)` for the HTTP-timeout experiment; `run_command sleep` tests a different property: a child continuing past the response wait. Logs in `.state/calls.jsonl` contain tool timing metadata, not model-thinking time or Chat UI behavior.
+This procedure adopts the supplied `CODEXish-P0-codex-review-triage.md` §3. H-1 is the other-device requirement, H-2 is fresh state, and H-3 replaces the old M-4 marker score with an image-only nonce. M-1–M-8 are measurement IDs; Codex finding M-1 (persistence) and M-2 (FIFO) are separate IDs.
 
-A 15-call exercise is a target workload, not a guaranteed minimum number of calls or a success metric by itself. Successful early completion is not a failure. The user controls model selection and connector attachment; server-side tests cannot establish those observations.
+0. **Reference run first, on its own fresh fixture.** A person or script directs the same seven MCP tools over loopback to finish the identical GUI task, with no manual desktop input after setup and no alternate GUI automation. Record each returned frame, tool result, and saved bytes/hash. In particular verify Save As PID checks and literal full-path entry. Failure here is harness/environment evidence, not evidence that Pro cannot do the task. Use a separate device or prearranged script so initiating the run does not steal focus.
+1. **Fresh state for every task/model/instructions trial.** Start without `--resume`, record the newly printed fixture path (also its sibling `.state` directory), and assign a new trial label and invocation IDs. Never reuse a completed or reference trial. On that fixture record `run_command test` with a real failing exit code and `read_file("gui-result.txt")` returning `NOT_FOUND`; distinguish preflight calls from measured calls. For GUI, create a new Ctrl+N Notepad tab and manually type a new random 6–8-character nonce without saving. Do not put this nonce in the model prompt, fixture files, echo message, or other text accessible to the model. The initial screenshot must be its only source. Record the expected nonce separately for scoring. Stop/restart with `--resume` only to finish configuration of this **same, not-yet-measured** fresh trial, adding its Notepad PID and desktop flag. This setup exception is not permission to reuse state between trials.
+2. Start one controlled tunnel using the F-1 options above. Inspect Host/Origin rejection logs and add only the intended exact values as needed; lack of the custom log does not prove an Origin problem. Finish server/tunnel setup, then put the new unsaved tab fully on the primary monitor and in the foreground. No local input from this point through the GUI run.
+3. Use ChatGPT on another device, in a new conversation with the exact intended Pro label and connector. Perform the existing write confirmations there. Where offered, select remembering the choice for this conversation and record whether it actually persists.
+4. Use the task prompts below, without adding the nonce. Each code or GUI task is its own measured trial. Follow pending operations to completion and reobserve after actions. After Enter in Save As, transient `NOT_FOUND`/`FILE_LOCKED` can mean save processing is unfinished: reobserve and reread, not blindly repeat the save. Record final text, byte count, BOM/encoding, and raw-byte hash; equal decoded text is not proof of equal bytes.
+5. Repeat with Thinking and with `--no-instructions`, restarting at step 1 each time. Refresh the connector's schema/instructions between A/B configurations. Hold any Project/custom instructions constant or record them as a separate variable; they must not silently reintroduce the server instructions in the off trial.
+6. Record the table below. Keep setup/reference calls outside the measured call count and preserve their logs separately. A successful short run is not hours-long reliability evidence.
+7. Stop the tunnel after the trial and preserve that trial's fixture, sibling `.state`, frames, results, prompts and timing record together, separate from every other trial.
 
-See [review response](docs/review-response.md) and [actual status](IMPLEMENTATION_STATUS.md). Historical v0.1 docs describe a superseded proposal, not implemented services.
+**Code task (fixed-fixture tool loop, not general source repair):**
+
+> workspace의 테스트가 실패한다. 통과할 때까지 고쳐라. 중간에 묻지 말고 끝까지 진행하라.
+
+**GUI task (no example or expected nonce in this prompt):**
+
+> 먼저 screenshot을 찍고 메모장 본문에 보이는 코드를 그대로 보고하라. 그 다음 Ctrl+A 후 `CODEXISH-P0-OK`를 입력하고 CTRL+S로 echo가 알려준 경로에 저장하라. 대화상자도 화면을 보고 처리하라. 저장 후 read_file로 확인하라.
+
+| ID | Record |
+| --- | --- |
+| M-1 | Exact displayed model, tool visibility and actual successful call; screenshot evidence. Diagnose transport 403 separately from model support. |
+| M-2 | Calls in one user input: total **and screenshot / action / file-command / other** counts; task outcome and final/stop message. The ordinary path is roughly 17 calls in the review; that includes observation overhead, not a target or cap. |
+| M-3 | Write confirmations, whether remembering works, and confirmation-wait intervals measured on the Chat device. |
+| M-4 | Correct report of the unpredictable **initial image-only nonce, before replacement or file verification**. Mentioning the supplied `CODEXISH-P0-OK` is not image-reception evidence. |
+| M-5 | `echo(delay_60_seconds=true)` observed duration/timeout. Success proves survival through 60 seconds only, not the ceiling. `run_command sleep` instead checks child lifetime past response wait. The reviewer proposes 120/180-second variants after success; this unchanged P0 API has no such echo variant, so record them as not run unless a separately identified variation is actually tested. |
+| M-6 | Matched Pro/Thinking trial M-2 values and total wall time, with instructions settings and fresh-state evidence. |
+| M-7 | Observe/action task completion, action count, Save As behavior, final file text **and** bytes/encoding/hash. |
+| M-8 | Define a step as an action plus its follow-up observation; record mean/max wall time, tool durations and inter-call gaps separately. `.state/calls.jsonl` has server-side call metadata; gaps can include model reasoning, network and confirmation wait. Use the Chat-side record to separate confirmation time rather than attributing the whole gap to Pro reasoning. |
+
+A 15-call exercise is a target workload, not a guaranteed minimum or a success metric by itself. Successful early completion is not failure. CI and the reference run do not establish Pro/Thinking image ingestion, confirmations, or continuation behavior.
+
+See [review response](docs/review-response.md), [pre-measurement fixes and v1 deferrals](docs/p0-premeasurement-fixes.md), and [actual status](IMPLEMENTATION_STATUS.md).

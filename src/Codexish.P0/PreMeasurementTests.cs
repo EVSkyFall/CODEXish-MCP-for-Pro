@@ -5,7 +5,7 @@ using System.Text.Json;
 
 namespace Codexish.P0;
 
-// F-1/F-2 regression tests. Bitmap fixtures never count as real desktop or Chat evidence.
+// F-1/F-2 and L-1 constructor regression tests. Bitmap fixtures never count as real desktop or Chat evidence.
 internal static class PreMeasurementTests
 {
     public static async Task Run(ProbeRuntime runtime, Action<bool, string> check)
@@ -34,6 +34,12 @@ internal static class PreMeasurementTests
         defaultRequest.Scheme = "http"; defaultRequest.Host = new HostString("tunnel.example");
         check(new ProbeAccessPolicy().RejectionReason(defaultRequest) == "host_not_allowed", "F1 public host denied without opt-in");
         await Http(runtime, check);
+        if (OperatingSystem.IsWindows())
+        {
+            // Constructor rejection only: no Notepad launch/input, and not a live-exit regression.
+            InvalidOption(() => new NativeDesktop(int.MaxValue), "L1 missing Notepad PID rejected during construction (not live-exit test)");
+        }
+        else Console.WriteLine("SKIP L1 missing-PID constructor: non-Windows environment; Current() mapping reviewed statically.");
 
         var half = ScreenshotGeometry.Fit(2560, 1440);
         check(half.ImageWidth == 1280 && half.ImageHeight == 720 && half.ScaleX == 2 && half.ScaleY == 2,

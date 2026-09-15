@@ -45,7 +45,10 @@ public sealed class NativeDesktop
                 throw new ProbeFault("UNSUPPORTED_CAPABILITY", "Locked or secure desktops are not supported.");
         }
         finally { CloseDesktop(desktop); }
-        using var p = Process.GetProcessById(pid.Value);
+        Process selected;
+        try { selected = Process.GetProcessById(pid.Value); }
+        catch (ArgumentException) { throw new ProbeFault("WINDOW_NOT_FOUND", "The selected Notepad process no longer exists.", "none"); }
+        using var p = selected;
         if (p.HasExited || p.StartTime.ToUniversalTime().Ticks != started)
             throw new ProbeFault("WINDOW_NOT_FOUND", "The selected Notepad process no longer exists.");
         nint window = GetForegroundWindow();
