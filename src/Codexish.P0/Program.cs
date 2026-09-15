@@ -3,9 +3,14 @@ using Codexish.P0;
 using ModelContextProtocol.AspNetCore;
 using ModelContextProtocol.Server;
 
-if (args.Contains("--self-test")) return await SelfTest.Run();
+if (args.Contains("--self-test")) { int old = await SelfTest.Run(); return old != 0 ? old : await Codexish.P0.V1.SliceTests.Run(); }
+if (args.Contains("--v1-test-child")) return await Codexish.P0.V1.SliceTests.Child(args);
+if (args.Contains("--v1-child")) return await Codexish.P0.V1.Processes.Child();
+if (args.Contains("--hash-password")) return Codexish.P0.V1.Host.HashPassword();
 if (args.Contains("--fixture-test")) return ProbeRuntime.CheckFixture(args[^1]);
 if (args.Contains("--fixture-sleep")) { await Task.Delay(TimeSpan.FromSeconds(60)); return 0; }
+
+if (!args.Contains("--p0")) return await Codexish.P0.V1.Host.Run(args);
 
 string? Option(string name) => ProbeOptions.Values(args, name).FirstOrDefault();
 string[] allowedHosts = ProbeOptions.Values(args, "--allow-host");

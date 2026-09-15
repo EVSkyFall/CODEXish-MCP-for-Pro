@@ -9,6 +9,7 @@ namespace Codexish.P0;
 public static class SelfTest
 {
     private static int passed;
+    public static int Passed => passed;
     private static void Check(bool condition, string label)
     {
         if (!condition) throw new InvalidOperationException(label);

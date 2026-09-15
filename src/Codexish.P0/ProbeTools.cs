@@ -77,9 +77,9 @@ public static class Reply
         Pack(code == "EXECUTION_UNKNOWN" ? "unknown" : "failed", null,
             new { code, message, retryable = false, side_effects = effects,
                 recovery = new { action = "inspect_or_reobserve_before_replanning" } });
-    private static CallToolResult Pack(string status, object? data, object? error)
+    public static CallToolResult Pack(string status, object? data, object? error, string schemaVersion = "p0.2")
     {
-        var body = JsonSerializer.SerializeToElement(new { schema_version = "p0.2", status, data, error,
+        var body = JsonSerializer.SerializeToElement(new { schema_version = schemaVersion, status, data, error,
             execution_boundary = "unconfined_user" });
         return new() { IsError = error is not null, StructuredContent = body,
             Content = [new TextContentBlock { Text = body.GetRawText() }] };
