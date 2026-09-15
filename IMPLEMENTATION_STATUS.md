@@ -1,5 +1,28 @@
 # 실제 구현·검증 상태
 
+## Latest triage follow-up (2026-09-15)
+
+The user requested the supplied Codex/Claude triage. Preserve reviewer commits `9137ce3` (F-1/F-2) and `52147cd` (delivery/CI evidence). The first attempted ref update detected those concurrent commits and was rejected as non-fast-forward; no force push was used. This change is based on `52147cd57abb85857b4f952fb33384c269aa7baa` and adds only L-1 plus H-1/H-2/H-3 procedure corrections and the explicit non-FIFO P0 contract.
+
+L-1 maps missing selected Notepad in Current() to WINDOW_NOT_FOUND / side_effects=none before input. The new Windows-only regression covers construction with a missing PID, not an initialized Notepad exiting at runtime; the latter branch is reviewed statically. No additional GUI tool or v1 feature is introduced.
+
+**Current code: `41afc82e25ced21421d0998d2257977a407e3a75`, pushed to PR #2 without force.** GitHub Actions pull_request run [34933335170](https://github.com/EVSkyFall/CODEXish-MCP-for-Pro/actions/runs/34933335170) completed successfully. The checkout was PR merge ref `79545138b4f4f1afb6536d9cc59f4a234e451dfe` for this head. Job metadata and both complete job logs were fetched through the GitHub connector; the results below are actual runner output, not the earlier reviewer report.
+
+| Runner / SDK | Job ID | Restore / Release build / self-test | Compiler | Self-test checks | Schema artifact ID |
+| --- | --- | --- | --- | --- | --- |
+| Windows Server 2025 10.0.26100 / .NET 10.0.401 | 104265935383 | SUCCESS / SUCCESS / SUCCESS | 0 warnings, 0 errors | 97 PASS | 10381949733 |
+| Ubuntu 24.04.5 / .NET 10.0.401 | 104265935532 | SUCCESS / SUCCESS / SUCCESS | 0 warnings, 0 errors | 93 PASS | 10381899772 |
+
+Windows job completed 2026-09-15 05:36:21 UTC; Ubuntu completed 05:35:31 UTC. Windows log PASS 76 is the new missing-PID constructor check; PASS 94–95 use synthetic bitmaps for PNG encoding. Linux skips that constructor, the two bitmap checks and the Windows file-sharing check. Its 93 checks are not four failures. Both logs finish with SELF_TEST_PASSED and explicitly state that Chat and interactive desktop measurements were not performed. The workflow emits Node.js/action deprecation warnings separately; zero compiler warnings does not mean the entire workflow log contains no warnings. Artifacts contain SDK tool schemas, not GUI evidence.
+
+Local diff/encoding/JSON/XML checks and clean application of the incremental patch onto the exact `52147cd` file subset also passed. This container still has no dotnet executable; compilation and self-tests above ran on GitHub runners. This status update changes documentation only and does not change the tested C# source.
+
+Latest uploaded verification §§6a–6b reports F-1/F-2 96/96 tests and Notepad HWND/capture inspection with no clicks or input. The complete same-seven-tool reference journey, Save As behavior, and Pro/Thinking M-1–M-8 remain NOT_RUN. Follow README Measurement: fresh state, unsaved tab with image-only nonce, and ChatGPT on another device.
+
+## Historical F-1/F-2 evidence retained from 52147cd
+
+The records below are the preceding delivery record, not claims about the new triage commit. Later section labels and counts refer to their named commits.
+
 기준일: 2026-09-15. 전체 v1: **CHANGES_REQUESTED**. 최신 첨부 검증 리뷰는 기존 P0 코드 `bdb4bf2`/문서 `0dd0b6b`에 대해 **APPROVE for P0 scope**, F-1/F-2 수정 후 실측 조건이다.
 
 ## F-1/F-2 후속 변경
