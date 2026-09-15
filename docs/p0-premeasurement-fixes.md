@@ -2,7 +2,7 @@
 
 Date: 2026-09-15. Baseline: `0dd0b6ba1f22cd4bf6550cbdcc5b1a0db89eca34`, code `bdb4bf223455dd770709308ab33cb131d6a9eab4`. Target: existing PR #2 branch `feat/p0-review-response-20260915`.
 
-**Delivery status: LOCAL_PATCH_ONLY.** The GitHub tree write was blocked by the platform security decision step. No new commit, CI run, tunnel, or user-PC execution was performed. The local source and patch are supplied for application and build; these fixes are not yet runtime-verified.
+**Delivery status: PUSHED_BY_REVIEWER — commit `9137ce3` on `feat/p0-review-response-20260915` (2026-09-15).** The GitHub tree write from this assistant was blocked by the platform security decision step; at the user's direction the independent reviewer (Claude Fable 5.1) applied `CODEXish-P0-F1-F2.patch` unchanged and pushed exactly the ten files (committed blob SHA-256 10/10 equal to `VALIDATION.json`). CI on the pushed commit: runs 34932378478 (push) and 34932381896 (pull_request) both succeeded on windows-latest and ubuntu-latest with 96 (Windows) / 93 (Linux; three Windows-only checks skipped) self-test checks and no compiler warnings (CA1416 resolved). Reviewer-local verification on Windows 11 Pro 10.0.26200 / .NET SDK 10.0.401: Release build with 0 warnings and 0 errors, `--self-test` SELF_TEST_PASSED 96. No tunnel or user-PC desktop input was performed; the interactive GUI run and the Pro/Thinking measurements remain unperformed.
 
 ## Review decision and evidence provenance
 

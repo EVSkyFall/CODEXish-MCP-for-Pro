@@ -6,7 +6,7 @@
 
 같은 PR #2 브랜치에 명시적 Host/Origin 허용 목록·거부 로그, 기본 1280px 캡처·관찰별 좌표 변환을 추가한다. `click.coordinate_space`는 필수 인자이므로 커넥터 스키마를 새로고침한다. 상세는 [반영 기록](docs/p0-premeasurement-fixes.md), 사용법은 README.
 
-**현재 전달 상태: LOCAL_PATCH_ONLY / REMOTE_WRITE_BLOCKED.** GitHub create_tree 요청이 OpenAI의 보안 판정 단계에서 차단되었고 원격 브랜치 수정·새 CI 실행은 수행하지 못했다. 다른 쓰기 경로로 우회하지 않았다. 새 회귀 테스트는 작성했지만 실행·통과로 기록하지 않는다. 로컬 컨테이너는 .NET/C# compiler 미설치이고 2026-09-15 SDK 다운로드 URL 조회는 DNS 실패(curl exit 6)였다. 아래 CI 기록은 수정 전 baseline의 결과다.
+**현재 전달 상태: PUSHED_BY_REVIEWER — commit `9137ce3` (2026-09-15).** GitHub create_tree 요청이 OpenAI의 보안 판정 단계에서 차단되어 이 assistant는 원격 브랜치를 수정하지 못했다. 사용자 지시로 독립 리뷰어(Claude Fable 5.1)가 `CODEXish-P0-F1-F2.patch`를 변경 없이 적용해 정확히 10개 파일을 commit·push했다(커밋된 blob sha256 10/10이 `VALIDATION.json`과 일치). push가 트리거한 CI: run 34932378478(push)와 34932381896(pull_request) 모두 success. windows-latest job 104263105954와 ubuntu-latest job 104263105648에서 restore/build/`--self-test`/artifact 전 스텝 success, self-test Windows 96개·Linux 93개(Windows 전용 검사 3개 skip) 통과, 컴파일 경고 0(CA1416 해소). 리뷰어의 로컬 검증(Windows 11 Pro 10.0.26200, .NET SDK 10.0.401)도 `dotnet build -c Release` 경고 0·오류 0, `--self-test` SELF_TEST_PASSED 96이다. 이는 이 assistant가 직접 실행한 결과가 아니며, 로컬 컨테이너는 여전히 .NET 미설치다. 아래 실제 실행한 CI 절의 run 34928723766은 수정 전 baseline의 결과다.
 
 로컬에서 실행한 검사는 `git diff --cached --check`, 변경 텍스트 UTF-8/마지막 newline/trailing whitespace, Markdown fence 및 JSON 예시 파싱, csproj/manifest XML 파싱이다. 이 검사는 C# compilation/런타임 시험을 대신하지 않는다.
 
