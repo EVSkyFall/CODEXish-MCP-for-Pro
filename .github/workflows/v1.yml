@@ -1,0 +1,30 @@
+name: v1 slice 1 build and tool tests
+on:
+  push:
+    branches: ['feat/v1-**']
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  server:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - run: dotnet restore src/Codexish.Server/Codexish.Server.csproj
+      - run: dotnet build src/Codexish.Server/Codexish.Server.csproj --no-restore -c Release
+      - run: dotnet run --project src/Codexish.Server/Codexish.Server.csproj --no-build -c Release -- --self-test
+        env:
+          CODEXISH_TEST_OUTPUT: ${{ github.workspace }}/evidence
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: v1-evidence-${{ matrix.os }}
+          path: evidence/
+          if-no-files-found: error
