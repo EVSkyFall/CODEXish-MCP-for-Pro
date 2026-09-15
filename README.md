@@ -1,8 +1,118 @@
-# CODEXish MCP for Pro — P0 probe
+# CODEXish MCP for Pro
 
-A single C#/.NET 10 Streamable HTTP application for measuring whether the selected Chat Pro model can actually use tools and observe/control a disposable Windows Notepad. This branch responds to the independent CHANGES_REQUESTED review of PR #1. It is **P0**, not the 23-tool v1 product.
+A single C#/.NET 10 Streamable HTTP application that gives a ChatGPT connector real tools on a Windows PC.
+Two projects live here:
 
-## Build and run
+- **[v1 slice 1](#v1-slice-1-coding-core) — `src/Codexish.Server`**: the coding core. Files, patches, shell and
+  process supervision, read-only Git, artifacts, an invocation ledger, a built-in OAuth authorization server and
+  a loopback control API. 21 MCP tools. Desktop control is slice 2 and is **not** in this build.
+- **[P0 probe](#p0-probe) — `src/Codexish.P0`**: the seven-tool measurement fixture that answers whether the
+  selected Chat Pro model can use tools and observe/control a disposable Notepad at all. It is unchanged and
+  still runnable; the M-1 to M-8 measurements are still unperformed.
+
+Design decisions for v1 are in [docs/v1-design.md](docs/v1-design.md) and the slice order is in
+[docs/v1-plan.md](docs/v1-plan.md).
+
+## v1 slice 1: coding core
+
+### Create a configuration
+
+```powershell
+dotnet run --project src/Codexish.Server -c Release -- --init `
+  --password "<a password you choose>" `
+  --public-url "https://<your-tunnel-host>" `
+  --root "proj=C:\Projects\Example"
+```
+
+`--init` writes `%LOCALAPPDATA%\Codexish\codexish.json` (override with `--config <path>`), generates the client
+secret and the loopback control token with `RandomNumberGenerator`, stores the password as a PBKDF2-SHA256 hash,
+and puts the hostname from `--public-url` into `allow_hosts`. Repeat `--root id=path` for more roots; each root
+grants read, write and shell unless you edit the file afterwards. `--state-dir` moves the ledger, artifacts and
+backups; it must stay outside every root or the server refuses to start. Add `--redirect-uri <uri>` (repeatable)
+if your connector's callback differs from the default ChatGPT one. **`--init` prints the client secret and the
+control token once. Treat both as passwords.**
+
+### Run it
+
+```powershell
+dotnet run --project src/Codexish.Server -c Release
+cloudflared tunnel --url http://127.0.0.1:3000
+```
+
+The listener is loopback only; the tunnel is what makes it reachable. Host and Origin checks are not
+authentication — the bearer token is. `--no-auth` is accepted only when `allow_hosts` is empty, that is, for
+loopback development.
+
+### Connect the ChatGPT connector
+
+| Field | Value |
+| --- | --- |
+| MCP endpoint | `<public_url>/mcp` |
+| Authorization URL | `<public_url>/authorize` |
+| Token URL | `<public_url>/token` |
+| Client ID | `codexish-chatgpt` (from `codexish.json`) |
+| Client secret | printed by `--init`, stored in `codexish.json` |
+| Scope | `mcp` |
+| PKCE | S256, required whenever the client sends a `code_challenge` |
+
+Signing in opens a single password form served by this server. If the connector's callback is refused, the
+server prints `rejected oauth stage=authorize reason=redirect_uri_mismatch offered_redirect_uri="..."` — rerun
+`--init` with that value as `--redirect-uri`.
+
+### ChatGPT Project custom instructions
+
+Paste this into the Project's custom instructions so the harness text survives a client that does not surface
+`initialize.instructions`:
+
+> You are operating the user's Windows PC through these tools. Work until the stated completion condition is met
+> and verified; do not stop to ask unless permission is missing or the user cancels. Read before editing and pass
+> the returned sha256 to writes. After every edit run the relevant tests or build and fix observed failures. Long
+> commands return handles: poll them; a response wait is not a deadline and never kills the process. Reuse
+> invocation_id only when retrying the same action; inspect unknown operations, never replay them. Report actual
+> exit codes, diffs, and file contents, not inferred success. Call session_checkpoint after each milestone so work
+> can resume across turns.
+
+### Local control
+
+The control API answers only when the connection is loopback, the `Host` header is loopback, and the request
+carries the control token. It is never reachable through the tunnel and it is not an MCP tool.
+
+```powershell
+$t = (Get-Content "$env:LOCALAPPDATA\Codexish\codexish.json" | ConvertFrom-Json).control_token
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:3000/control/pause         -Headers @{ "X-Codexish-Control" = $t }
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:3000/control/resume        -Headers @{ "X-Codexish-Control" = $t }
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:3000/control/kill-children -Headers @{ "X-Codexish-Control" = $t }
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:3000/control/revoke-tokens -Headers @{ "X-Codexish-Control" = $t }
+Invoke-RestMethod -Method Get  -Uri http://127.0.0.1:3000/control/status        -Headers @{ "X-Codexish-Control" = $t }
+```
+
+Pause is a hold, not a refusal: while paused, a write is accepted into its queue and returned as `queued` with
+`paused: true`, reads keep working, and the queue drains on resume.
+
+### Tests
+
+```powershell
+dotnet run --project src/Codexish.Server -c Release -- --self-test
+```
+
+The self-test uses real files, a real SQLite ledger, real child processes, a real booby-trapped Git repository
+and a real in-process HTTP listener. It opens no tunnel, sends no desktop input and performs no ChatGPT
+measurement. Windows-only checks print `SKIP` elsewhere.
+
+### What v1 slice 1 does not do
+
+There is no sandbox: `shell_run`, builds, tests and any Git hook they invoke run with your full Windows rights.
+`mode=replace` is not crash-atomic, `fs_apply_patch` has no rollback, redaction is a small published pattern set
+and not a guarantee, and no part of this has been measured against ChatGPT Pro. The complete list is the final
+section of [docs/v1-design.md](docs/v1-design.md).
+
+## P0 probe
+
+The sections below describe the unchanged P0 measurement fixture. It is **P0**, not the v1 product, and it
+responds to the independent CHANGES_REQUESTED review of PR #1. It measures whether the selected Chat Pro model
+can actually use tools and observe or control a disposable Windows Notepad.
+
+### Build and run
 
 Install the .NET 10 SDK. From the repository root:
 
@@ -18,7 +128,7 @@ The last command creates a new disposable fixture, prints its path, and listens 
 
 Writes require the hash returned by `read_file`. They use one exclusive handle and retain byte encoding, BOM, and homogeneous LF/CRLF. Old bytes are saved under the sibling `.state` directory before a **non-atomic in-place** write. The SQLite invocation ledger prevents replay of completed effects and marks unfinished operations unknown after restart. Resource semaphores provide mutual exclusion, not acceptance-order FIFO; wait for each operation to complete before a dependent action. `wait_ms` is only a response wait, not a process deadline. Use `run_command(command="inspect", operation_id=...)` to query pending effects.
 
-## Actual Windows desktop probe
+### Actual Windows desktop probe
 
 Use a test desktop with no private windows or credentials visible: screenshot captures the **entire primary monitor**. Choose a Notepad process in the current session. **Ctrl+N must open a new unsaved tab**; the installed Notepad can restore an existing file on startup. Never type into a restored document. Put the window and any save dialog completely inside the primary monitor, not merely overlapping it.
 
@@ -34,7 +144,7 @@ Never resume a previous reference/Pro/Thinking/A/B trial. `--disposable-desktop`
 
 Take a screenshot before and after each action. `type_text` accepts exactly one of literal `text` or `key` (`CTRL+S`, `CTRL+A`, `ENTER`, `ESC`). If an action is pending, inspect its operation until complete before the next action. A still-unchanged frame calls for another observation, not another Ctrl+S. Use echo's `gui_save_path` and verify with `read_file("gui-result.txt")`; this file is not writable through `write_file`. UIA, focus recovery, other monitors and mixed-DPI acceptance testing remain v1 work.
 
-## F-1: tunnel Host and Origin configuration
+### F-1: tunnel Host and Origin configuration
 
 The listener stays on `127.0.0.1`. `--allow-host` adds one exact hostname (no scheme, port, wildcard, or suffix match); repeat it for multiple names. Loopback hosts remain allowed. `--allow-origin` separately adds an exact HTTP(S) origin, including a nondefault port when applicable; repeat it as needed. Requests without Origin do not need an origin allowance. A host allowance never disables Origin checks.
 
@@ -53,7 +163,7 @@ ngrok http 3000 --host-header=localhost:3000
 
 Choose one tunnel, not both. These commands only fix Host forwarding; they do not add authentication. Host/Origin checks are not access control for remote clients. Use a private or authenticated tunnel for desktop access. This change neither provisions a tunnel nor changes account credentials. Secure MCP Tunnel organization access, Windows client operation and fees remain unmeasured.
 
-## F-2: scaled screenshots and click units
+### F-2: scaled screenshots and click units
 
 `screenshot(max_width=1280)` is the default. `max_width=0` returns native resolution; larger values never upscale. Negative values return `INVALID_ARGUMENT`. For a 2560×1440 primary monitor, the default PNG is 1280×720 and both scale factors are 2. This is a geometry example, not a measured Chat payload limit.
 
@@ -67,7 +177,7 @@ The returned top-level `width`/`height` remain **physical** dimensions. `image.w
 
 Each observation retains its own immutable transform. Capture again after an action. Invalid or stale coordinates produce no click. The same invocation ID with different coordinate units is an idempotency conflict, not a retry.
 
-## Measurement
+### Measurement
 
 This procedure adopts the supplied `CODEXish-P0-codex-review-triage.md` §3. H-1 is the other-device requirement, H-2 is fresh state, and H-3 replaces the old M-4 marker score with an image-only nonce. M-1–M-8 are measurement IDs; Codex finding M-1 (persistence) and M-2 (FIFO) are separate IDs.
 
