@@ -66,17 +66,63 @@ public static class SliceTests
             await ProcessTests(Path.Combine(parent, "process-tests"));
             await HttpTests(Path.Combine(parent, "http-tests"), false);
             await HttpTests(Path.Combine(parent, "oauth-tests"), true);
-            Console.WriteLine($"V1_SELF_TEST_PASSED: {passed}; P0_PASSED: {SelfTest.Passed}; TOTAL_PASSED: {passed + SelfTest.Passed}; Chat and interactive desktop NOT measured.");
+            await CleanupRegression(parent);
+            // Git loose objects are read-only on Windows. Cleanup is part of the test run,
+            // and must succeed before any overall success marker or success artifact is emitted.
+            DeleteOwnedFixture(parent);
+            Check(!Directory.Exists(parent), "owned fixture cleanup removes read-only Git objects before success");
             string? evidence = Environment.GetEnvironmentVariable("CODEXISH_TEST_OUTPUT");
             if (evidence is not null)
             {
                 Directory.CreateDirectory(evidence);
-                await File.WriteAllTextAsync(Path.Combine(evidence, "v1-test-results.json"), JsonSerializer.Serialize(new { os = Environment.OSVersion.ToString(), p0 = SelfTest.Passed, v1 = passed, total = SelfTest.Passed + passed, checks, chat_measured = false, desktop_measured = false }, ServerConfig.Json));
+                await File.WriteAllTextAsync(Path.Combine(evidence, "v1-test-results.json"), JsonSerializer.Serialize(new { os = Environment.OSVersion.ToString(), p0 = SelfTest.Passed, v1 = passed, total = SelfTest.Passed + passed, checks, fixture_cleanup_complete = true, chat_measured = false, desktop_measured = false }, ServerConfig.Json));
             }
+            Console.WriteLine($"V1_SELF_TEST_PASSED: {passed}; P0_PASSED: {SelfTest.Passed}; TOTAL_PASSED: {passed + SelfTest.Passed}; Chat and interactive desktop NOT measured.");
             return 0;
         }
         catch (Exception e) { Console.Error.WriteLine($"V1_SELF_TEST_FAILED after {passed}: {e}"); return 1; }
-        finally { try { Directory.Delete(parent, true); } catch (IOException) { } }
+        finally
+        {
+            // On a failed test, make one best-effort cleanup attempt without replacing its error.
+            // This helper is called only for the newly generated fixture, never a configured root.
+            if (Directory.Exists(parent))
+                try { DeleteOwnedFixture(parent); }
+                catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+                { Console.Error.WriteLine("fixture_cleanup_failed: " + e.GetType().Name); }
+        }
+    }
+    private static void DeleteOwnedFixture(string path)
+    {
+        var directory = new DirectoryInfo(path);
+        if ((directory.Attributes & FileAttributes.ReparsePoint) != 0) { directory.Delete(); return; }
+        foreach (var entry in directory.EnumerateFileSystemInfos())
+        {
+            var attributes = entry.Attributes;
+            // Do not enumerate a link target or change its attributes, even within test data.
+            if ((attributes & FileAttributes.ReparsePoint) != 0) { entry.Delete(); continue; }
+            if (entry is DirectoryInfo child) DeleteOwnedFixture(child.FullName);
+            else
+            {
+                if ((attributes & FileAttributes.ReadOnly) != 0) entry.Attributes = attributes & ~FileAttributes.ReadOnly;
+                entry.Delete();
+            }
+        }
+        if ((directory.Attributes & FileAttributes.ReadOnly) != 0) directory.Attributes &= ~FileAttributes.ReadOnly;
+        directory.Delete();
+    }
+    private static async Task CleanupRegression(string parent)
+    {
+        string owned = Path.Combine(parent, "cleanup-owned"), target = Path.Combine(parent, "cleanup-target");
+        Directory.CreateDirectory(owned); Directory.CreateDirectory(target);
+        string readOnly = Path.Combine(owned, "read-only.txt"), preserved = Path.Combine(target, "preserved.txt");
+        File.WriteAllText(readOnly, "fixture"); File.SetAttributes(readOnly, File.GetAttributes(readOnly) | FileAttributes.ReadOnly);
+        File.WriteAllText(preserved, "unchanged");
+        string link = Path.Combine(owned, "link");
+        if (OperatingSystem.IsWindows())
+            await Exec(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "cmd.exe"), ["/d", "/c", "mklink", "/J", link, target], parent);
+        else Directory.CreateSymbolicLink(link, target);
+        DeleteOwnedFixture(owned);
+        Check(!Directory.Exists(owned) && File.ReadAllText(preserved) == "unchanged", "fixture cleanup clears read-only files but unlinks rather than follows reparse targets");
     }
     private static async Task FilesAndRecovery(string parent)
     {
