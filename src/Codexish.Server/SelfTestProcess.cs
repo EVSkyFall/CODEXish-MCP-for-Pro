@@ -72,6 +72,11 @@ internal static class ProcessTests
         var echoed = await tools.ProcessPoll(stdinId, null, 15000);
         Check(Data(echoed).GetProperty("stdout").GetString()!.Contains("alpha"),
             "process_write reached stdin and the program acted on it");
+        // A poll returns as soon as output is available, so the exit is awaited by re-polling with the cursor
+        // until the state changes: pwsh on Linux needs more than the 500 ms grace inside process_stop to finish.
+        var exitDeadline = DateTimeOffset.UtcNow.AddSeconds(30);
+        while (Data(echoed).GetProperty("state").GetString() == "running" && DateTimeOffset.UtcNow < exitDeadline)
+            echoed = await tools.ProcessPoll(stdinId, Output(echoed).GetProperty("next_cursor").GetString(), 2000);
         Check(Data(echoed).GetProperty("state").GetString() == "exited" &&
               Data(echoed).GetProperty("exit_code").GetInt32() == 0,
             "an exited process keeps reporting its real exit code");
