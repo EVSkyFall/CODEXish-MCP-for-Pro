@@ -45,14 +45,16 @@ public sealed class ProbeTools(ProbeRuntime runtime)
     }
 
     [McpServerTool(Name = "screenshot", ReadOnly = true, OpenWorld = false)]
-    [Description("Capture the REAL primary Windows monitor as PNG image content plus physical pixel size and observation_id. Requires an explicitly selected foreground Notepad on a disposable desktop. No synthetic fallback. Use this before and after each click/type; mixed-DPI and other monitors are outside P0.")]
-    public CallToolResult Screenshot() { runtime.Log("screenshot", "called"); return Reply.Guard(runtime.Desktop.Observe); }
+    [Description("Capture the REAL primary Windows monitor as PNG. max_width defaults to 1280; 0 keeps native resolution; never upscales. width/height are physical pixels; image.width/height describe the PNG; image_to_desktop gives actual scales. Use image coordinates and coordinate_space=image when clicking with this observation_id. Requires an explicitly selected foreground Notepad on a disposable desktop. No synthetic fallback. Use this before and after each click/type; mixed-DPI and other monitors are outside P0.")]
+    public CallToolResult Screenshot([Description("Maximum PNG width; default 1280, 0 for native resolution.")] int max_width = 1280)
+    { runtime.Log("screenshot", "called"); return Reply.Guard(() => runtime.Desktop.Observe(max_width)); }
 
     [McpServerTool(Name = "click", ReadOnly = false, Destructive = true, OpenWorld = false)]
-    [Description("Click primary-monitor physical pixel x,y from the latest screenshot. Foreground Notepad identity, bounds and last-input marker must still match. Always screenshot afterward; STALE_OBSERVATION requires re-observation, not blind retry.")]
-    public Task<CallToolResult> Click(int x, int y, string observation_id, string invocation_id) =>
-        runtime.Invoke(invocation_id, "click", new { x, y, observation_id }, "desktop",
-            () => Task.FromResult(runtime.Desktop.Click(x, y, observation_id)), 1000);
+    [Description("Click x,y from the latest screenshot with coordinate_space=image: the server maps image pixels using that observation_id (floor(image coordinate * scale)). Do not multiply twice. For existing physical pixels explicitly use primary_monitor_physical_px. coordinate_space is required; refresh the connector schema after upgrade. Foreground Notepad identity, bounds and last-input marker must still match. Always screenshot afterward; STALE_OBSERVATION requires re-observation, not blind retry.")]
+    public Task<CallToolResult> Click(int x, int y, string observation_id, string invocation_id,
+        [Description("Required units: image (recommended) or primary_monitor_physical_px.")] string coordinate_space) =>
+        runtime.Invoke(invocation_id, "click", new { x, y, observation_id, coordinate_space }, "desktop",
+            () => Task.FromResult(runtime.Desktop.Click(x, y, observation_id, coordinate_space)), 1000);
 
     [McpServerTool(Name = "type_text", ReadOnly = false, Destructive = true, OpenWorld = false)]
     [Description("Type literal text OR one allowed key (CTRL+S, CTRL+A, ENTER, ESC) into the selected Notepad/dialog. Supply exactly one of text/key. Observe first and screenshot afterward. Save only to echo's gui_save_path, then read_file gui-result.txt to verify. No clipboard.")]

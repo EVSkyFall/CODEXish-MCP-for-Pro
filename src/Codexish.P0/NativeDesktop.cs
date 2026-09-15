@@ -1,6 +1,8 @@
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Imaging;
+using System.Drawing.Drawing2D;
+using System.Runtime.Versioning;
 using System.Runtime.InteropServices;
 using System.Text;
 using Microsoft.Win32.SafeHandles;
@@ -16,7 +18,7 @@ public sealed class NativeDesktop
     private readonly int? pid;
     private readonly long started;
     private Snapshot? last;
-    private sealed record Snapshot(string Id, nint Window, Rect Bounds, int Width, int Height, uint InputTick);
+    private sealed record Snapshot(string Id, nint Window, Rect Bounds, int Width, int Height, uint InputTick, ScreenshotGeometry? Geometry = null);
 
     public NativeDesktop(int? notepadPid)
     {
@@ -58,31 +60,54 @@ public sealed class NativeDesktop
         return new Snapshot(Guid.NewGuid().ToString("N"), window, rect, width, height, input.Tick);
     }
 
-    public CallToolResult Observe()
+    public CallToolResult Observe(int maxWidth = 1280)
     {
         lock (gate)
         {
-            if (!OperatingSystem.IsWindows()) return Reply.Error("UNSUPPORTED_CAPABILITY", "Actual Windows capture is unavailable; no synthetic image substituted.");
+            if (maxWidth < 0) throw new ProbeFault("INVALID_ARGUMENT", "max_width must be nonnegative; 0 means native resolution.");
+            if (!OperatingSystem.IsWindowsVersionAtLeast(6, 1)) return Reply.Error("UNSUPPORTED_CAPABILITY", "Actual Windows capture is unavailable; no synthetic image substituted.");
             using var dpi = new DpiScope();
             DateTimeOffset begin = DateTimeOffset.UtcNow;
             Snapshot before = Current();
             using var image = new Bitmap(before.Width, before.Height);
             using (Graphics graphics = Graphics.FromImage(image))
                 graphics.CopyFromScreen(0, 0, 0, 0, new Size(before.Width, before.Height), CopyPixelOperation.SourceCopy);
-            using var bytes = new MemoryStream();
-            image.Save(bytes, ImageFormat.Png);
+            var geometry = ScreenshotGeometry.Fit(before.Width, before.Height, maxWidth);
+            byte[] png = EncodePng(image, geometry);
             Snapshot after = Current();
             if (!Same(before, after)) throw new ProbeFault("STALE_OBSERVATION", "Target changed during capture; observe again.");
-            last = after;
+            last = after with { Geometry = geometry };
             var result = Reply.Ok(new { observation_id = after.Id, window_id = after.Window.ToString(), process_id = pid,
                 capture_started_at = begin, capture_finished_at = DateTimeOffset.UtcNow,
                 width = after.Width, height = after.Height, coordinate_space = "primary_monitor_physical_px",
-                image_to_desktop = new { scale_x = 1, scale_y = 1, offset_x = 0, offset_y = 0 },
+                image = new { width = geometry.ImageWidth, height = geometry.ImageHeight },
+                image_to_desktop = new { scale_x = geometry.ScaleX, scale_y = geometry.ScaleY, offset_x = 0, offset_y = 0 },
+                click_coordinate_space = "image", max_width = maxWidth, png_bytes = png.Length,
                 window_bounds = new { x = after.Bounds.Left, y = after.Bounds.Top, right = after.Bounds.Right, bottom = after.Bounds.Bottom },
                 source = "actual_screen_capture", next_tool = "click or type_text, then screenshot" });
-            result.Content.Add(ImageContentBlock.FromBytes(bytes.ToArray(), "image/png"));
+            result.Content.Add(ImageContentBlock.FromBytes(png, "image/png"));
             return result;
         }
+    }
+
+    [SupportedOSPlatform("windows6.1")]
+    internal static byte[] EncodePng(Bitmap source, ScreenshotGeometry geometry)
+    {
+        using var bytes = new MemoryStream();
+        if (source.Width == geometry.ImageWidth && source.Height == geometry.ImageHeight)
+            source.Save(bytes, ImageFormat.Png);
+        else
+        {
+            using var resized = new Bitmap(geometry.ImageWidth, geometry.ImageHeight);
+            using (Graphics graphics = Graphics.FromImage(resized))
+            {
+                graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                graphics.DrawImage(source, new Rectangle(0, 0, resized.Width, resized.Height),
+                    0, 0, source.Width, source.Height, GraphicsUnit.Pixel);
+            }
+            resized.Save(bytes, ImageFormat.Png);
+        }
+        return bytes.ToArray();
     }
 
     private static bool Same(Snapshot a, Snapshot b) => a.Window == b.Window && a.Bounds.Equals(b.Bounds)
@@ -92,24 +117,25 @@ public sealed class NativeDesktop
         var current = Current();
         if (last is null || last.Id != id || !Same(last, current))
             throw new ProbeFault("STALE_OBSERVATION", "Window, focus, layout, or input changed. Call screenshot before acting.");
-        return current;
+        return last; // Keep the immutable image transform from the validated observation.
     }
 
-    public CallToolResult Click(int x, int y, string observationId)
+    public CallToolResult Click(int x, int y, string observationId, string coordinateSpace)
     {
         lock (gate)
         {
             using var dpi = new DpiScope();
             Snapshot target = Validate(observationId);
-            if (x < 0 || y < 0 || x >= target.Width || y >= target.Height)
-                throw new ProbeFault("INVALID_ARGUMENT", "Coordinates must be primary-monitor physical pixels.");
+            // Explicit coordinate_space prevents old cached schemas from silently changing click units.
+            (x, y) = target.Geometry!.ToPhysical(x, y, coordinateSpace);
             GetWindowThreadProcessId(WindowFromPoint(new PointNative { X = x, Y = y }), out uint owner);
             if (owner != pid) throw new ProbeFault("PERMISSION_DENIED", "The coordinate does not belong to the selected Notepad process.");
             last = null;
             if (!SetCursorPos(x, y)) throw new ProbeFault("EXECUTION_FAILED", "Could not position the pointer.");
             Send([new Input { Type = 0, Union = new InputUnion { Mouse = new MouseInput { Flags = 2 } } },
                   new Input { Type = 0, Union = new InputUnion { Mouse = new MouseInput { Flags = 4 } } }]);
-            return Reply.Ok(new { input_delivered = true, business_outcome = "not_verified", next_tool = "screenshot" });
+            return Reply.Ok(new { input_delivered = true, business_outcome = "not_verified", next_tool = "screenshot",
+                physical_x = x, physical_y = y, coordinate_space = "primary_monitor_physical_px" });
         }
     }
 
@@ -192,4 +218,33 @@ public sealed class NativeDesktop
     private static extern bool GetUserObjectInformation(nint handle, int index, StringBuilder value, int size, out uint needed);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, EntryPoint = "GetFinalPathNameByHandleW", SetLastError = true)]
     private static extern uint GetFinalPathNameByHandle(SafeFileHandle handle, StringBuilder path, uint size, uint flags);
+}
+
+// Pure geometry is also tested on Linux. It does not fabricate a desktop observation.
+public sealed record ScreenshotGeometry(int PhysicalWidth, int PhysicalHeight, int ImageWidth, int ImageHeight)
+{
+    public double ScaleX => (double)PhysicalWidth / ImageWidth;
+    public double ScaleY => (double)PhysicalHeight / ImageHeight;
+
+    public static ScreenshotGeometry Fit(int width, int height, int maxWidth = 1280)
+    {
+        if (width <= 0 || height <= 0 || maxWidth < 0)
+            throw new ProbeFault("INVALID_ARGUMENT", "Positive physical dimensions and nonnegative max_width required.");
+        int imageWidth = maxWidth == 0 ? width : Math.Min(width, maxWidth);
+        int imageHeight = Math.Max(1, (int)Math.Round((double)height * imageWidth / width, MidpointRounding.AwayFromZero));
+        return new(width, height, imageWidth, imageHeight);
+    }
+
+    public (int X, int Y) ToPhysical(int x, int y, string coordinateSpace)
+    {
+        if (coordinateSpace is not ("image" or "primary_monitor_physical_px"))
+            throw new ProbeFault("INVALID_ARGUMENT", "coordinate_space must be image or primary_monitor_physical_px.");
+        int width = coordinateSpace == "image" ? ImageWidth : PhysicalWidth;
+        int height = coordinateSpace == "image" ? ImageHeight : PhysicalHeight;
+        if (x < 0 || y < 0 || x >= width || y >= height)
+            throw new ProbeFault("INVALID_ARGUMENT", "Coordinates are outside this observation's selected coordinate space.");
+        return coordinateSpace == "image"
+            ? ((int)((long)x * PhysicalWidth / ImageWidth), (int)((long)y * PhysicalHeight / ImageHeight))
+            : (x, y);
+    }
 }

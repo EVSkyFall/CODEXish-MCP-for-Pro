@@ -28,9 +28,40 @@ dotnet run --project src/Codexish.P0 -- --resume "C:\path\printed-by-probe" --no
 
 The acknowledgement flag does not create an OS sandbox. The screenshot captures the **entire primary monitor**. Input checks select only the configured Notepad process; they do not make the desktop or filesystem a security boundary. No administrator elevation, clipboard access, or synthetic screen fallback is used.
 
-Take a screenshot before each action and afterward. `type_text` accepts exactly one of literal `text` or `key` (`CTRL+S`, `CTRL+A`, `ENTER`, `ESC`). Use the save path returned by `echo`. Verify the saved result with `read_file("gui-result.txt")`; this file cannot be written with `write_file`, so the tool cannot forge GUI success. UIA, other monitors and mixed-DPI acceptance testing are deferred.
+During P0 GUI steps, do not touch the mouse or keyboard: the existing last-input check invalidates an observation after local input (review C-1). Take a screenshot before each action and afterward. `type_text` accepts exactly one of literal `text` or `key` (`CTRL+S`, `CTRL+A`, `ENTER`, `ESC`). Use the save path returned by `echo`. Verify the saved result with `read_file("gui-result.txt")`; this file cannot be written with `write_file`, so the tool cannot forge GUI success. UIA, other monitors and mixed-DPI acceptance testing are deferred.
 
-The probe listens only on loopback, rejects foreign Host/Origin headers, and has no OAuth implementation. **Do not publish it through an unauthenticated public tunnel.** Secure MCP Tunnel is a candidate private route; account entitlement, Windows client operation, and the real Chat roundtrip must be checked. A private-tunnel client may need to preserve/rewrite the local Host header. No tunnel or connection has been provisioned by this change.
+## F-1: tunnel Host and Origin configuration
+
+The listener stays on `127.0.0.1`. `--allow-host` adds one exact hostname (no scheme, port, wildcard, or suffix match); repeat it for multiple names. Loopback hosts remain allowed. `--allow-origin` separately adds an exact HTTP(S) origin, including a nondefault port when applicable; repeat it as needed. Requests without Origin do not need an origin allowance. A host allowance never disables Origin checks.
+
+```powershell
+dotnet run --project src/Codexish.P0 -c Release -- --resume "C:\path\printed-by-probe" --notepad-pid 1234 --disposable-desktop --port 3000 --allow-host example.trycloudflare.com
+```
+
+On 403, stdout now prints `rejected host="..." origin="..." reason=...`. Check the value against the intended client before adding `--allow-origin https://expected-client.example`. Never copy arbitrary rejected headers into an allowlist automatically. Header values are escaped in logs; no authorization headers are logged.
+
+When preserving local Host instead of using `--allow-host`, these are the review's Host-header rewrite commands:
+
+```powershell
+cloudflared tunnel --url http://127.0.0.1:3000 --http-host-header 127.0.0.1:3000
+ngrok http 3000 --host-header=localhost:3000
+```
+
+Choose one tunnel, not both. These commands only fix Host forwarding; they do not add authentication. Host/Origin checks are not access control for remote clients. Use a private or authenticated tunnel for desktop access. This change neither provisions a tunnel nor changes account credentials. Secure MCP Tunnel organization access, Windows client operation and fees remain unmeasured.
+
+## F-2: scaled screenshots and click units
+
+`screenshot(max_width=1280)` is the default. `max_width=0` returns native resolution; larger values never upscale. Negative values return `INVALID_ARGUMENT`. For a 2560×1440 primary monitor, the default PNG is 1280×720 and both scale factors are 2. This is a geometry example, not a measured Chat payload limit.
+
+The returned top-level `width`/`height` remain **physical** dimensions. `image.width`/`image.height` describe the actual PNG; `image_to_desktop.scale_x/scale_y` use physical dimensions divided by the respective rounded image dimensions. `png_bytes` records encoded size.
+
+**Upgrade note:** refresh the connector's tool schema. `click` now requires `coordinate_space` so cached clients cannot silently change coordinate units. Use `"image"` with the screenshot's `observation_id`; the server converts automatically using that observation's scale (floored to an integer). Do not multiply coordinates yourself. Existing physical coordinates are accepted only with the explicit value `"primary_monitor_physical_px"`.
+
+```json
+{"x":640,"y":360,"observation_id":"<latest observation>","invocation_id":"<new action ID>","coordinate_space":"image"}
+```
+
+Each observation retains its own immutable transform. Capture again after an action. Invalid or stale coordinates produce no click. The same invocation ID with different coordinate units is an idempotency conflict, not a retry.
 
 ## Measurement
 

@@ -87,7 +87,7 @@ public static class SelfTest
                 Check(Error(runtime.Inspect("missing")) == "NOT_FOUND", "unknown operation ID rejected");
                 Check(Error(await tools.RunCommand("whoami", "forbidden")) == "PERMISSION_DENIED", "no arbitrary shell command");
                 Check(Error(tools.Screenshot()) == "UNSUPPORTED_CAPABILITY", "no synthetic capture fallback");
-                Check(Error(await tools.Click(1, 1, "invented", "no-input")) == "UNSUPPORTED_CAPABILITY", "GUI input disabled without local opt-in");
+                Check(Error(await tools.Click(1, 1, "invented", "no-input", "image")) == "UNSUPPORTED_CAPABILITY", "GUI input disabled without local opt-in");
                 var failed = await runtime.RunChild("test");
                 Check(Data(failed).GetProperty("exit_code").GetInt32() == 1 && !Data(failed).GetProperty("test_passed").GetBoolean(), "real child reports failing fixture");
                 for (int i = 0; i < ProbeRuntime.Names.Length; i++)
@@ -96,6 +96,7 @@ public static class SelfTest
                 Check(Data(succeeded).GetProperty("exit_code").GetInt32() == 0 && Data(succeeded).GetProperty("test_passed").GetBoolean(), "real child reports passing fixture and drained output");
                 await HttpTests(runtime, true);
                 await HttpTests(runtime, false);
+                await PreMeasurementTests.Run(runtime, Check);
             }
             using (var db = new SqliteConnection($"Data Source={root}.state/p0.db;Pooling=False"))
             {

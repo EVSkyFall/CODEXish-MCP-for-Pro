@@ -2,7 +2,7 @@
 
 Read README.md, IMPLEMENTATION_STATUS.md and docs/review-response.md first.
 
-The user-supplied independent review of 8cecfc7 is CHANGES_REQUESTED. P0 probe implementation and measurement are explicitly permitted before v1 approval. Full v1 is not approved. The earlier universal pre-approval prohibition is superseded for P0 only.
+The user-supplied design review of 8cecfc7 is CHANGES_REQUESTED. The later CODEXish-P0-verification-by-Claude.md approves bdb4bf2/0dd0b6b for P0 scope, conditional on F-1 (Host/Origin configuration) and F-2 (scaled screenshots). Apply those fixes on PR #2; keep C-1–C-7 as v1 follow-ups. Full v1 is not approved before M-1–M-8 measurements. The earlier universal pre-approval prohibition is superseded for P0 only.
 
 Build one C#/.NET 10 application. Chat Pro performs reasoning; this server provides tools, not another model. Do not rebuild the proposed TypeScript Gateway, custom WSS, mTLS enrollment or broker split for v1.
 
