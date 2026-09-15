@@ -3,7 +3,14 @@ using Codexish.P0;
 using ModelContextProtocol.AspNetCore;
 using ModelContextProtocol.Server;
 
-if (args.Contains("--self-test")) { int old = await SelfTest.Run(); return old != 0 ? old : await Codexish.P0.V1.SliceTests.Run(); }
+if (args.Contains("--self-test"))
+{
+    int old = await SelfTest.Run(); if (old != 0) return old;
+    int slice = await Codexish.P0.V1.SliceTests.Run(); if (slice != 0) return slice;
+    int fifo = await Codexish.P0.V1.FifoRegressionTests.Run(); if (fifo != 0) return fifo;
+    Console.WriteLine("ALL_SELF_TEST_SUITES_PASSED: P0, v1 coding slice and FIFO cancellation regression; all fixtures cleaned.");
+    return 0;
+}
 if (args.Contains("--v1-test-child")) return await Codexish.P0.V1.SliceTests.Child(args);
 if (args.Contains("--v1-child")) return await Codexish.P0.V1.Processes.Child();
 if (args.Contains("--hash-password")) return Codexish.P0.V1.Host.HashPassword();

@@ -168,8 +168,10 @@ public sealed class Operations(Store store)
                 live.Add(key, run);
                 string[] keys = resources.Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray();
                 Task prior = Task.WhenAll(keys.Select(k => tails.GetValueOrDefault(k, Task.CompletedTask)));
-                // Append under the SAME acceptance lock, before scheduling. This establishes FIFO.
-                foreach (string resource in keys) tails[resource] = run.Completion.Task;
+                // Acceptance and tail append share a lock. A cancelled queued result may finish early,
+                // but its resource barrier MUST still include every predecessor's completion.
+                Task barrier = Task.WhenAll(prior, run.Completion.Task);
+                foreach (string resource in keys) tails[resource] = barrier;
                 resultTask = run.Completion.Task;
                 _ = Task.Run(async () =>
                 {
@@ -209,10 +211,12 @@ public sealed class Operations(Store store)
                         }
                         run.Completion.TrySetResult(result);
                         live.Remove(key);
-                        foreach (string resource in keys) if (ReferenceEquals(tails.GetValueOrDefault(resource), run.Completion.Task)) tails.Remove(resource);
                         run.Cancel.Dispose();
                     }
                     store.Event(session, tool, new { operation_id = id, status = VReply.Status(result) });
+                    await barrier;
+                    lock (store.Gate)
+                        foreach (string resource in keys) if (ReferenceEquals(tails.GetValueOrDefault(resource), barrier)) tails.Remove(resource);
                 });
             }
         }
@@ -237,7 +241,14 @@ public sealed class Operations(Store store)
     }
     public CallToolResult Cancel(string session, string id)
     {
-        lock (store.Gate) { if (live.TryGetValue((session, id), out var r)) r.Cancel.Cancel(); return Inspect(session, id); }
+        lock (store.Gate)
+        {
+            // The tool wrapper must not report cancellation_requested=true for an unknown target.
+            if (store.Scalar("SELECT id FROM invocations WHERE session=$s AND id=$i", ("$s", session), ("$i", id)) is null)
+                throw new ProbeFault("NOT_FOUND", "No operation in this session.");
+            if (live.TryGetValue((session, id), out var r)) r.Cancel.Cancel();
+            return Inspect(session, id);
+        }
     }
     public Task Close()
     {
