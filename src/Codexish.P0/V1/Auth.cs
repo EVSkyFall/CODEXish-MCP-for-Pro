@@ -65,8 +65,8 @@ public sealed class OAuth(ServerConfig config, Store store)
             code_challenge_methods_supported = new[] { "S256" }, token_endpoint_auth_methods_supported = new[] { "client_secret_basic", "client_secret_post" },
             scopes_supported = new[] { "codexish", "offline_access" } }));
         app.MapGet("/authorize", (HttpContext c) => Begin(c));
-        app.MapPost("/authorize", (HttpContext c) => Login(c));
-        app.MapPost("/token", (HttpContext c) => Exchange(c));
+        app.MapPost("/authorize", (Func<HttpContext, Task<IResult>>)Login);
+        app.MapPost("/token", (Func<HttpContext, Task<IResult>>)Exchange);
     }
     private static string One(IQueryCollection q, string key) => q.TryGetValue(key, out var v) && v.Count == 1 ? v[0]! : "";
     private static string One(IFormCollection q, string key) => q.TryGetValue(key, out var v) && v.Count == 1 ? v[0]! : "";
