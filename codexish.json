@@ -1,0 +1,23 @@
+{
+  "port": 3000,
+  "control_port": 3001,
+  "roots": [
+    {
+      "id": "work",
+      "path": "C:\\Work\\YourProject",
+      "read": true,
+      "write": true,
+      "shell": true
+    }
+  ],
+  "public_url": "https://YOUR-TUNNEL-HOST.example",
+  "client_id": "codexish-chatgpt",
+  "client_secret": "REPLACE_WITH_A_NEW_LOCAL_RANDOM_SECRET",
+  "password_hash": "REPLACE_WITH_HASH_PASSWORD_OUTPUT",
+  "redirect_uris": [
+    "https://REPLACE-WITH-EXACT-CHATGPT-REDIRECT.example/callback"
+  ],
+  "git_executable": "C:\\Program Files\\Git\\cmd\\git.exe",
+  "allowed_hosts": [],
+  "allowed_origins": []
+}

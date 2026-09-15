@@ -1,71 +1,62 @@
-# 실제 구현·검증 상태
+# 실제 구현·검증 상태 — v1 slice 1
 
-## Latest triage follow-up (2026-09-15)
+기준일: 2026-09-15. 작업 브랜치: feat/v1-slice1-coding-core, PR #3, base: feat/p0-review-response-20260915 (c1b04cd).
 
-The user requested the supplied Codex/Claude triage. Preserve reviewer commits `9137ce3` (F-1/F-2) and `52147cd` (delivery/CI evidence). The first attempted ref update detected those concurrent commits and was rejected as non-fast-forward; no force push was used. This change is based on `52147cd57abb85857b4f952fb33384c269aa7baa` and adds only L-1 plus H-1/H-2/H-3 procedure corrections and the explicit non-FIFO P0 contract.
+**상태: 첫 v1 코딩 슬라이스 구현 및 서버 측 CI 통과. 실제 Chat/GUI 측정은 미기록.** 최신 사용자 패키지 §D의 직접 구현 지시를 수행했으며, 새 코드에 대한 독립 리뷰 승인이나 전체 v1 완료를 뜻하지 않는다.
 
-L-1 maps missing selected Notepad in Current() to WINDOW_NOT_FOUND / side_effects=none before input. The new Windows-only regression covers construction with a missing PID, not an initialized Notepad exiting at runtime; the latter branch is reviewed statically. No additional GUI tool or v1 feature is introduced.
+## A. 사용자 제공 검증 통보 반영
 
-**Current code: `41afc82e25ced21421d0998d2257977a407e3a75`, pushed to PR #2 without force.** GitHub Actions pull_request run [34933335170](https://github.com/EVSkyFall/CODEXish-MCP-for-Pro/actions/runs/34933335170) completed successfully. The checkout was PR merge ref `79545138b4f4f1afb6536d9cc59f4a234e451dfe` for this head. Job metadata and both complete job logs were fetched through the GitHub connector; the results below are actual runner output, not the earlier reviewer report.
+CODEXish-GPT-next-input-package.md §A는 리뷰어 Claude Fable 5.1이 사용자 Windows 11 Pro 10.0.26200 / .NET SDK 10.0.401에서 41afc82 코드와 c1b04cd 문서를 재현했다고 보고한다. Release build는 경고 0·오류 0, self-test 97이며 CI 34933335170/34933330570도 성공을 확인했다고 한다. L-1과 실측 절차는 승인되어 P0 코드·절차는 완료 상태다.
 
-| Runner / SDK | Job ID | Restore / Release build / self-test | Compiler | Self-test checks | Schema artifact ID |
-| --- | --- | --- | --- | --- | --- |
-| Windows Server 2025 10.0.26100 / .NET 10.0.401 | 104265935383 | SUCCESS / SUCCESS / SUCCESS | 0 warnings, 0 errors | 97 PASS | 10381949733 |
-| Ubuntu 24.04.5 / .NET 10.0.401 | 104265935532 | SUCCESS / SUCCESS / SUCCESS | 0 warnings, 0 errors | 93 PASS | 10381899772 |
+위는 리뷰어가 보고한 사용자 하드웨어 결과다. 아래 새 CI 결과는 이 assistant가 GitHub job 상태와 전체 로그를 직접 조회한 별도 증거다. 원본 P0 진행 기록은 [IMPLEMENTATION_STATUS.p0.md](IMPLEMENTATION_STATUS.p0.md)에 그대로 보존했다.
 
-Windows job completed 2026-09-15 05:36:21 UTC; Ubuntu completed 05:35:31 UTC. Windows log PASS 76 is the new missing-PID constructor check; PASS 94–95 use synthetic bitmaps for PNG encoding. Linux skips that constructor, the two bitmap checks and the Windows file-sharing check. Its 93 checks are not four failures. Both logs finish with SELF_TEST_PASSED and explicitly state that Chat and interactive desktop measurements were not performed. The workflow emits Node.js/action deprecation warnings separately; zero compiler warnings does not mean the entire workflow log contains no warnings. Artifacts contain SDK tool schemas, not GUI evidence.
+## B/C. 미기록 실측과 case
 
-Local diff/encoding/JSON/XML checks and clean application of the incremental patch onto the exact `52147cd` file subset also passed. This container still has no dotnet executable; compilation and self-tests above ran on GitHub runners. This status update changes documentation only and does not change the tested C# source.
+[docs/p0-measurement-record.md](docs/p0-measurement-record.md)에 §B 결과표를 그대로 기록했고 빈칸은 미기록으로 남겼다. R/T/P/P'의 호출 기록·이미지·저장 byte 증거는 없다. **Case=UNDETERMINED**이며 Case 0 실패 또는 Case 4 성공을 추정하지 않는다. PR #2는 해당 case 기반 ready 조건이 확인되지 않아 Draft를 유지한다. 서버 개발은 최신 proceed/continue 및 §D·§E 구현 지시를 근거로 진행했다.
 
-Latest uploaded verification §§6a–6b reports F-1/F-2 96/96 tests and Notepad HWND/capture inspection with no clicks or input. The complete same-seven-tool reference journey, Save As behavior, and Pro/Thinking M-1–M-8 remain NOT_RUN. Follow README Measurement: fresh state, unsaved tab with image-only nonce, and ChatGPT on another device.
+## C. 검증한 코드와 실제 CI
 
-## Historical F-1/F-2 evidence retained from 52147cd
+코드 commit: `c478da8986a320defbac6db566160ea37049b11f`.
+테스트 checkout: PR merge SHA `af9860e8ee3493123408b92e2e6238daf3d58f74`.
+CI run: [34963266835](https://github.com/EVSkyFall/CODEXish-MCP-for-Pro/actions/runs/34963266835), pull_request, conclusion SUCCESS.
 
-The records below are the preceding delivery record, not claims about the new triage commit. Later section labels and counts refer to their named commits.
+| OS / SDK | Job ID | Restore / Release build / self-test | 컴파일 경고 / 오류 | P0 | v1 slice | FIFO 회귀 | 합계 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Windows Server 2025 10.0.26100 / .NET 10.0.401 | 104361647043 | SUCCESS / SUCCESS / SUCCESS | 0 / 0 | 97 | 123 | 4 | **224** |
+| Ubuntu 24.04.5 / .NET 10.0.401 | 104361646799 | SUCCESS / SUCCESS / SUCCESS | 0 / 0 | 93 | 121 | 4 | **218** |
 
-기준일: 2026-09-15. 전체 v1: **CHANGES_REQUESTED**. 최신 첨부 검증 리뷰는 기존 P0 코드 `bdb4bf2`/문서 `0dd0b6b`에 대해 **APPROVE for P0 scope**, F-1/F-2 수정 후 실측 조건이다.
+Windows job 종료 2026-09-15 11:27:55 UTC, Ubuntu 11:26:41 UTC. 두 전체 로그에서 fixture cleanup 뒤 ALL_SELF_TEST_SUITES_PASSED와 정상 step 종료를 확인했다. V1 suite 자체의 TOTAL_PASSED 220/214는 P0+v1 소계이고 뒤 FIFO 4개를 포함한 총합이 224/218이다. OS별 차이는 Windows 고유 공유 핸들/PNG/생성자/Job 검사를 Linux에서 실행하지 않는 데서 온다.
 
-## F-1/F-2 후속 변경
+Artifact: Windows `10393944179` (p0-evidence-windows-latest), Ubuntu `10393909056` (p0-evidence-ubuntu-latest). 각각 P0 schema, v1-tools.json, v1-test-results.json, fifo-regression-results.json의 4개 파일을 업로드했다. Windows zip SHA-256은 `2baf9989605446d15a88aaa3c10fd719707925c2b943a1940b25c6e9059704d9`, Ubuntu는 `c9429a2cccd3d96637ef951a6a3c4a4b74364632d8233f88b39b23f2cb5e82e6`다. 이 artifact는 GUI 캡처나 Chat 대화 증거가 아니다.
 
-같은 PR #2 브랜치에 명시적 Host/Origin 허용 목록·거부 로그, 기본 1280px 캡처·관찰별 좌표 변환을 추가한다. `click.coordinate_space`는 필수 인자이므로 커넥터 스키마를 새로고침한다. 상세는 [반영 기록](docs/p0-premeasurement-fixes.md), 사용법은 README.
+workflow의 Node/action deprecation 경고는 그대로 있다. 컴파일 경고 0과 전체 로그에 경고가 전혀 없다는 주장은 구분한다. 로컬 컨테이너에는 dotnet이 없고 SDK 다운로드 DNS 조회도 실패했으므로, C# 검증은 GitHub runner에서 수행했다.
 
-**현재 전달 상태: PUSHED_BY_REVIEWER — commit `9137ce3` (2026-09-15).** GitHub create_tree 요청이 OpenAI의 보안 판정 단계에서 차단되어 이 assistant는 원격 브랜치를 수정하지 못했다. 사용자 지시로 독립 리뷰어(Claude Fable 5.1)가 `CODEXish-P0-F1-F2.patch`를 변경 없이 적용해 정확히 10개 파일을 commit·push했다(커밋된 blob sha256 10/10이 `VALIDATION.json`과 일치). push가 트리거한 CI: run 34932378478(push)와 34932381896(pull_request) 모두 success. windows-latest job 104263105954와 ubuntu-latest job 104263105648에서 restore/build/`--self-test`/artifact 전 스텝 success, self-test Windows 96개·Linux 93개(Windows 전용 검사 3개 skip) 통과, 컴파일 경고 0(CA1416 해소). 리뷰어의 로컬 검증(Windows 11 Pro 10.0.26200, .NET SDK 10.0.401)도 `dotnet build -c Release` 경고 0·오류 0, `--self-test` SELF_TEST_PASSED 96이다. 이는 이 assistant가 직접 실행한 결과가 아니며, 로컬 컨테이너는 여전히 .NET 미설치다. 아래 실제 실행한 CI 절의 run 34928723766은 수정 전 baseline의 결과다.
+## D. 이번 이어받기에서 수정한 실제 실패
 
-로컬에서 실행한 검사는 `git diff --cached --check`, 변경 텍스트 UTF-8/마지막 newline/trailing whitespace, Markdown fence 및 JSON 예시 파싱, csproj/manifest XML 파싱이다. 이 검사는 C# compilation/런타임 시험을 대신하지 않는다.
+이전 코드 09dabd28의 run 34949928577은 Windows에서 218개 assertion 뒤 Git의 read-only object 파일 정리에 실패했다. 중간 PASS 문구만으로 성공 처리하지 않았다. 22157cf는 새로 만든 시험 디렉터리에만 적용하는 read-only 정리 함수를 추가하고 reparse target을 따라가지 않는 회귀 검사, 정리 후 최종 성공 출력으로 수정했다.
 
-## 사용자 제공 독립 검증
+c478da8은 FIFO 취소 경로를 보강했다. A 실행 중 queued B를 취소해 B의 결과가 먼저 완료되어도 C의 자원 barrier가 A를 포함하도록 한다. 별도 4개 검사가 즉시 취소 결과·C 대기·최종 [A,C] 순서·없는 취소 target의 NOT_FOUND를 확인한다. 기존 사용자/reviewer 커밋을 보존하고 force push하지 않았다.
 
-첨부 `CODEXish-P0-verification-by-Claude.md` §1은 사용자 Windows 11 Pro 10.0.26200/.NET 10.0.401에서 restore/build 성공, 48개 self-test, HTTP smoke 재현을 보고한다. 이는 **리뷰어의 실행 보고**로 기록하며 이 assistant가 사용자 PC에서 직접 실행했다고 주장하지 않는다. 대화형 메모장 캡처·입력과 M-1–M-8은 여전히 미실측이다.
+## E. 구현·검증 범위
 
-검증한 코드 commit: `bdb4bf223455dd770709308ab33cb131d6a9eab4`.
-후속 상태 문서 수정은 위 코드의 검증 결과를 기록하며 새로운 실계정 시험을 뜻하지 않는다.
-
-## 실제 실행한 CI
-
-GitHub Actions run: https://github.com/EVSkyFall/CODEXish-MCP-for-Pro/actions/runs/34928723766
-
-| 환경 | Job ID | restore / build / --self-test | 스키마 artifact |
-| --- | --- | --- | --- |
-| windows-latest | 104252250359 | 모두 SUCCESS | p0-evidence-windows-latest, ID 10381171483 |
-| ubuntu-latest | 104252250555 | 모두 SUCCESS | p0-evidence-ubuntu-latest, ID 10380508178 |
-
-2026-09-15 04:25 UTC 완료된 job 결과와 artifact 목록을 GitHub connector로 확인했다. 테스트는 실제 파일·SQLite DB·자식 프로세스 및 HTTP MCP 요청을 사용한다. 테스트 이름만 작성하고 통과로 처리한 것이 아니다.
-
-검사 범위: expected-hash 실패 시 원본 보존, 변경 전 backup, UTF-8/UTF-16 BOM·줄바꿈 보존, 중복 재조회·인자 충돌, 대기 핸들·동일 자원 큐·독립 작업 진행, 고정 자식 검증기의 실패/성공 exit code, initialize·tools/list·tools/call, instructions on/off, 구조화 오류, Host/Origin 거부, 재시작 후 결과 보존·unknown. Windows job에는 공유 핸들 충돌 시 FILE_LOCKED 검사도 포함된다.
-
-첫 실행(run 34928470689)의 Windows 로그에서 48개 검사 통과를 확인했다. 이 실행에는 SQLitePCLRaw.lib.e_sqlite3 2.1.11의 NU1903 경고와 상대 artifact 경로 오류가 있었다. 이후 native dependency를 2.1.12로 고정하고 NU1901–NU1904를 오류로 취급하며 artifact 경로를 절대 경로로 수정했다. 위 최종 run은 수정 후 재검증 결과다. Windows 플랫폼 분석 경고(CA1416)는 별개이며 경고 없는 빌드나 GUI 검증 완료를 주장하지 않는다.
-
-## 상태 경계
-
-| 항목 | 상태 |
+| 영역 | 실제 근거 |
 | --- | --- |
-| 단일 C# P0 서버·7개 도구·서버 측 프로토콜 시험 | 구현 및 CI 검증 |
-| 주 모니터 캡처·선택한 메모장 입력 | 코드 빌드 완료, 실제 대화형 GUI 실행은 미수행 |
-| M-1–M-8 Pro/Thinking 실측 | BLOCKED_EXTERNAL; 실제 값·스크린샷 없음 |
-| Secure MCP Tunnel | 공식 문서 확인만 수행; 조직 권한·Windows client·요금 미확인 |
-| OAuth·트레이·UIA·브라우저 MCP 연결·전체 23도구 | 미구현; P0 완료로 대체하지 않음 |
-| 로컬 컨테이너의 .NET 실행 | .NET 미설치 및 다운로드 DNS 실패. 위 검증은 GitHub runner에서 수행 |
+| 파일 6개 도구 | 실제 임시 root의 읽기/list/search/stat/create/조건부 replace, mismatch 보존, .bak, encoding/BOM/줄바꿈, unified diff 부분 결과, junction/symlink 경로 거부 |
+| operation·FIFO·checkpoint | 같은 ID 합류/충돌, root alias, 읽기·독립 작업 진행, pause/resume, 취소 barrier, checkpoint, 재시작 cancelled/unknown |
+| persist_failed | 효과 뒤 SQLite PRAGMA query_only=ON으로 실제 SQLITE_READONLY를 유발; memory unknown·inspect·같은 ID 효과 미재실행 |
+| 프로세스 | 실제 executable과 cmd/sh의 종료 코드, stdout/stderr 순서, stdin UTF-8, wait 핸들·자식 생존, Windows Job launch gate, session/persistent·stop·drain |
+| Git | 임시 악성 textconv의 실제 실행을 양성 대조로 확인한 뒤 고정 status/diff/log에서 hook·fsmonitor·pager·textconv·external diff·clean/process fixture 미실행 확인 |
+| 내장 OAuth와 MCP | 합성 client/password로 401·discovery·authorize·PKCE·token·21개 도구·실제 HTTP fs.write, redirect/resource/client/verifier 거부, 만료·회전·단일 소비·철회 |
+| 로컬 control | 별도 listener, public Host와 없는 token 거부, MCP 포트는 loopback Host+올바른 token도 거부, local pause/resume/revoke |
 
-현재 P0는 고정 fixture를 수정하는 도구 루프 시험이다. 임의 프로젝트 소스코드 수리 시험이나 완성된 v1 에이전트가 아니다. 사용자 PC, Platform 조직, 터널, 인증정보는 변경하지 않았다. 외부 desktop 연결 검색에서 미설치 후보만 확인했으며 실제 장치 접근 권한은 얻지 않았다.
+전체 구현된 도구: host.capabilities, workspace.info, fs.list, fs.read, fs.search, fs.stat, fs.write, fs.apply_patch, shell.run, process.start, process.poll, process.write, process.stop, git.status, git.diff, git.log, artifact.read, artifact.search, operation.inspect, operation.cancel, session.checkpoint.
 
-기존 v0.1 문서는 과거 제안으로 남아 있다. 해당 문서의 multi-process 선행 조건은 P0 예외를 막지 않지만, 전체 설계 승인이나 실측 완료로 자동 전환되지도 않는다.
+## F. 잔여·가정·정책
+
+computer.observe/query_ui/act는 이번 등록 목록에서 제외했고 P0 NativeDesktop는 변경 없이 보존했다. 외부 브라우저 MCP 마운트, tray·설치 UX, worktree/LSP/batch/다중 PC는 예정된 후속 슬라이스다. fs.apply_patch의 생성·삭제·rename 변형, PTY/ConPTY, 대용량 보존/정리·부하 및 모든 실패 조합은 미구현/미검증이다. 기존 파일 수정 patch와 파일 create 도구가 있다는 이유로 이 변형들을 완료로 표시하지 않는다.
+
+가정: §D의 직접 지시에 따라 서버 측 첫 슬라이스를 진행한다. 포트 기본값은 MCP 3000/control 3001이며 둘 다 같은 프로세스의 loopback listener다. 상태는 기본 LocalApplicationData/Codexish, credentials·callback·Git 위치는 사용자가 로컬에서 새 설정으로 채운다. HTTP 연결 종료와 product session 종료를 분리하며 refresh는 session을 유지한다.
+
+정책 제안(미채택): 없음. 반복 승인/BUSY/작업 시간·호출 cap을 추가하지 않았다. 사용자의 기존 자격 증명·PC 보안·배포·safeguard 설정을 읽거나 변경하지 않았다. 실제 터널 생성·사용자 OAuth 로그인·Chat 모델 호출·대화형 GUI 측정은 수행하지 않았다.
+
+[README.md](README.md)의 설치·연결 절차와 [docs/v1-plan.md](docs/v1-plan.md)를 따라 다음 실제 연결 및 후속 슬라이스를 진행한다. 새 코드에 대한 독립 리뷰와 사용자 merge는 별도다.
