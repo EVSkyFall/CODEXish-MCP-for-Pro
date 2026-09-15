@@ -1,70 +1,104 @@
-# CODEXish MCP for Pro
+# CODEXish MCP for Pro — P0 probe
 
-## 최상위 설계 원칙: 사용자 입력 한 번에서 최대한 많은 작업을 완수한다
+A single C#/.NET 10 Streamable HTTP application for measuring whether the selected Chat Pro model can actually use tools and observe/control a disposable Windows Notepad. This branch responds to the independent CHANGES_REQUESTED review of PR #1. It is **P0**, not the 23-tool v1 product.
 
-**이 프로젝트의 최상위 제품 가정은 “ChatGPT 공홈 Chat의 6 Pro는 토큰제 할당량이 아니라 사용자 입력 횟수제 할당량을 사용한다”는 것이다. 따라서 한 번의 사용자 입력 안에서 가능한 한 많은 도구 호출·관찰·수정·실행·테스트·재수정 반복을 수행하여, Codex에 가까운 장시간 작업 루프를 구성한다.**
+## Build and run
 
-이는 사용자가 지정한 **설계 전제**다. 구체적인 입력 한도, 초기화 주기, 도구 호출의 과금·집계 방식, 비공개 정책을 확인된 사실로 단정하지 않는다. 무제한 실행이나 한 턴의 지속 시간을 보장하지 않으며, 목표는 불필요한 호출 수 증가가 아니라 **추가 사용자 입력 없이 완료하는 유효 작업량**이다. 근거와 검증 항목은 [제품 가정과 호환성](docs/product-assumptions.md)에 기록한다.
+Install the .NET 10 SDK. From the repository root:
 
-토큰과 출력 크기는 여전히 문맥 유지·지연·신뢰성에 영향을 준다. 큰 결과는 검색 가능한 artifact로 보존하고, 모델에는 다음 판단에 필요한 관찰을 전달한다.
-
-## 무엇을 만드는가
-
-ChatGPT의 일반 Chat에서 사용하는 GPT-6 Pro에 Windows PC의 개발·앱 조작 도구를 제공하는 MCP 시스템을 설계한다. 공개 기술로 로컬 작업의 기본 기능을 구현하고, 모델이 결과를 관찰하며 다음 행동을 결정하도록 한다.
-
-```text
-사용자 입력 한 번
-  → 작업 범위와 완료 조건 파악
-  → 관찰 → 판단 → 파일/셸/브라우저/GUI 작업
-               ↑              ↓
-               └── 검증·오류 수정
-  → 결과와 근거 보고
+```powershell
+dotnet restore src/Codexish.P0/Codexish.P0.csproj
+dotnet run --project src/Codexish.P0 -- --self-test
+dotnet run --project src/Codexish.P0
 ```
 
-**현재 상태: 설계 문서만 있는 저장소다.** 실행 가능한 MCP 서버, Windows Agent, 설치 프로그램, 테스트 구현은 아직 없다. 아래 도구명과 데이터 구조는 구현을 위한 제안 계약이며 Codex 내부 API가 아니다.
+The last command creates a new disposable fixture, prints its path, and listens at `http://127.0.0.1:3000/mcp`. It exposes seven tools: `echo`, `read_file`, `write_file`, `run_command`, `screenshot`, `click`, `type_text`. The official SDK generates their JSON Schemas. `--no-instructions` turns off server instructions for an A/B trial.
 
-## 아키텍처 요약
+`echo` lists six fixture files. Each must contain its ordinal integer (case01.txt → 1, etc.). `run_command` accepts only `test`, `sleep`, or `inspect`: a fixed C# child validator, a fixed 60-second child, or operation lookup. This is a tool-loop probe, **not yet an arbitrary source-code repair benchmark**. No caller-supplied shell or JavaScript is executed. Test failure is represented by `test_passed=false` and the real nonzero exit code; a successfully collected process result does not mean the test passed.
 
-```mermaid
-flowchart LR
-    Chat["ChatGPT Web · GPT-6 Pro"] -->|"HTTPS · Streamable HTTP"| Gateway["Remote MCP Gateway"]
-    Agent["Windows Local Agent"] -->|"인증된 outbound WSS 연결"| Gateway
-    Agent --> Files["Filesystem · Shell · Process · Git · LSP"]
-    Agent --> Desktop["화면 캡처 · UI Automation · 입력"]
-    Agent --> Browser["Managed Browser · CDP"]
-    Agent --> State["Worktree · Session Journal · Artifact"]
-    User["사용자 · 로컬 제어 UI"] -->|"연결 · 권한 설정 · 승인 · 취소"| Agent
+Writes require the hash returned by `read_file`. They use one exclusive handle and retain byte encoding, BOM, and homogeneous LF/CRLF. Old bytes are saved under the sibling `.state` directory before a **non-atomic in-place** write. The SQLite invocation ledger prevents replay of completed effects and marks unfinished operations unknown after restart. Resource semaphores provide mutual exclusion, not acceptance-order FIFO; wait for each operation to complete before a dependent action. `wait_ms` is only a response wait, not a process deadline. Use `run_command(command="inspect", operation_id=...)` to query pending effects.
+
+## Actual Windows desktop probe
+
+Use a test desktop with no private windows or credentials visible: screenshot captures the **entire primary monitor**. Choose a Notepad process in the current session. **Ctrl+N must open a new unsaved tab**; the installed Notepad can restore an existing file on startup. Never type into a restored document. Put the window and any save dialog completely inside the primary monitor, not merely overlapping it.
+
+**Operate ChatGPT and its write confirmations from another device** (phone, tablet, or other PC). Using ChatGPT on the controlled desktop takes foreground focus away from Notepad; none of P0's seven tools can restore it. After starting the server and tunnel, the last local setup action is to bring the new Notepad tab to the foreground. During a GUI run, do not touch the PC's mouse or keyboard. The last-input check invalidates observations after local input. Keep host confirmation behavior unchanged.
+
+For one freshly created trial, record the fixture path and stop the initial server. Resume that same trial for GUI setup only:
+
+```powershell
+dotnet run --project src/Codexish.P0 -- --resume "C:\path\printed-for-this-new-trial" --notepad-pid 1234 --disposable-desktop
 ```
 
-Local Agent가 Gateway로 연결하고 그 연결에서 양방향 요청·결과를 전달한다. PC의 공개 수신 포트를 필수로 요구하지 않는다. Gateway는 인증·라우팅·MCP 변환을, Agent는 실제 실행과 최종 권한 검사를 맡는다.
+Never resume a previous reference/Pro/Thinking/A/B trial. `--disposable-desktop` acknowledges the test scope; it creates no sandbox. Input checks select the configured Notepad PID. No administrator elevation, clipboard access, or synthetic screen fallback is used.
 
-장기 프로세스는 실행 핸들을 즉시 돌려주고 이후 상태·증분 출력을 조회한다. Chat 턴이 끝나도 허가된 프로세스와 journal은 유지할 수 있지만, **MCP 서버가 Chat의 추론을 계속시키거나 새 사용자 메시지를 만들어낼 수 있다고 가정하지 않는다.**
+Take a screenshot before and after each action. `type_text` accepts exactly one of literal `text` or `key` (`CTRL+S`, `CTRL+A`, `ENTER`, `ESC`). If an action is pending, inspect its operation until complete before the next action. A still-unchanged frame calls for another observation, not another Ctrl+S. Use echo's `gui_save_path` and verify with `read_file("gui-result.txt")`; this file is not writable through `write_file`. UIA, focus recovery, other monitors and mixed-DPI acceptance testing remain v1 work.
 
-## 권한 프로필
+## F-1: tunnel Host and Origin configuration
 
-| 프로필 | 목적 | 대표 기능 |
-| --- | --- | --- |
-| `READ_ONLY` | 허용된 대상 관찰 | 파일·검색·Git 조회·프로세스 조회·화면/UIA·이미 연결된 브라우저의 관찰 |
-| `FULL_CONTROL` | 허가된 범위에서 작업 수행 | 파일 편집·셸·프로세스·Git 변경·브라우저·데스크톱 입력 |
+The listener stays on `127.0.0.1`. `--allow-host` adds one exact hostname (no scheme, port, wildcard, or suffix match); repeat it for multiple names. Loopback hosts remain allowed. `--allow-origin` separately adds an exact HTTP(S) origin, including a nondefault port when applicable; repeat it as needed. Requests without Origin do not need an origin allowance. A host allowance never disables Origin checks.
 
-프로필은 요금제 이름과 독립적이다. 현재 공식 Developer mode 문서는 Pro를 포함한 계정에서 읽기·쓰기 MCP 지원을 안내한다. 실제 대상 계정과 **6 Pro 선택 상태**에서의 도구 호출·이미지 전달·승인·연속 호출은 별도로 검증해야 한다. [OpenAI Developer mode](https://developers.openai.com/api/docs/guides/developer-mode)
+```powershell
+dotnet run --project src/Codexish.P0 -c Release -- --resume "C:\path\printed-by-probe" --notepad-pid 1234 --disposable-desktop --port 3000 --allow-host example.trycloudflare.com
+```
 
-`FULL_CONTROL`도 사용자가 설정한 기기·workspace·앱·외부 전송 범위를 따른다. 이미 허가된 작업은 반복 확인으로 끊지 않고, 추가 권한이 필요한 행동은 구체적인 대상과 효과를 보여준다.
+On 403, stdout now prints `rejected host="..." origin="..." reason=...`. Check the value against the intended client before adding `--allow-origin https://expected-client.example`. Never copy arbitrary rejected headers into an allowlist automatically. Header values are escaped in logs; no authorization headers are logged.
 
-## 문서 안내
+When preserving local Host instead of using `--allow-host`, these are the review's Host-header rewrite commands:
 
-| 문서 | 다루는 내용 |
+```powershell
+cloudflared tunnel --url http://127.0.0.1:3000 --http-host-header 127.0.0.1:3000
+ngrok http 3000 --host-header=localhost:3000
+```
+
+Choose one tunnel, not both. These commands only fix Host forwarding; they do not add authentication. Host/Origin checks are not access control for remote clients. Use a private or authenticated tunnel for desktop access. This change neither provisions a tunnel nor changes account credentials. Secure MCP Tunnel organization access, Windows client operation and fees remain unmeasured.
+
+## F-2: scaled screenshots and click units
+
+`screenshot(max_width=1280)` is the default. `max_width=0` returns native resolution; larger values never upscale. Negative values return `INVALID_ARGUMENT`. For a 2560×1440 primary monitor, the default PNG is 1280×720 and both scale factors are 2. This is a geometry example, not a measured Chat payload limit.
+
+The returned top-level `width`/`height` remain **physical** dimensions. `image.width`/`image.height` describe the actual PNG; `image_to_desktop.scale_x/scale_y` use physical dimensions divided by the respective rounded image dimensions. `png_bytes` records encoded size.
+
+**Upgrade note:** refresh the connector's tool schema. `click` now requires `coordinate_space` so cached clients cannot silently change coordinate units. Use `"image"` with the screenshot's `observation_id`; the server converts automatically using that observation's scale (floored to an integer). Do not multiply coordinates yourself. Existing physical coordinates are accepted only with the explicit value `"primary_monitor_physical_px"`.
+
+```json
+{"x":640,"y":360,"observation_id":"<latest observation>","invocation_id":"<new action ID>","coordinate_space":"image"}
+```
+
+Each observation retains its own immutable transform. Capture again after an action. Invalid or stale coordinates produce no click. The same invocation ID with different coordinate units is an idempotency conflict, not a retry.
+
+## Measurement
+
+This procedure adopts the supplied `CODEXish-P0-codex-review-triage.md` §3. H-1 is the other-device requirement, H-2 is fresh state, and H-3 replaces the old M-4 marker score with an image-only nonce. M-1–M-8 are measurement IDs; Codex finding M-1 (persistence) and M-2 (FIFO) are separate IDs.
+
+0. **Reference run first, on its own fresh fixture.** A person or script directs the same seven MCP tools over loopback to finish the identical GUI task, with no manual desktop input after setup and no alternate GUI automation. Record each returned frame, tool result, and saved bytes/hash. In particular verify Save As PID checks and literal full-path entry. Failure here is harness/environment evidence, not evidence that Pro cannot do the task. Use a separate device or prearranged script so initiating the run does not steal focus.
+1. **Fresh state for every task/model/instructions trial.** Start without `--resume`, record the newly printed fixture path (also its sibling `.state` directory), and assign a new trial label and invocation IDs. Never reuse a completed or reference trial. On that fixture record `run_command test` with a real failing exit code and `read_file("gui-result.txt")` returning `NOT_FOUND`; distinguish preflight calls from measured calls. For GUI, create a new Ctrl+N Notepad tab and manually type a new random 6–8-character nonce without saving. Do not put this nonce in the model prompt, fixture files, echo message, or other text accessible to the model. The initial screenshot must be its only source. Record the expected nonce separately for scoring. Stop/restart with `--resume` only to finish configuration of this **same, not-yet-measured** fresh trial, adding its Notepad PID and desktop flag. This setup exception is not permission to reuse state between trials.
+2. Start one controlled tunnel using the F-1 options above. Inspect Host/Origin rejection logs and add only the intended exact values as needed; lack of the custom log does not prove an Origin problem. Finish server/tunnel setup, then put the new unsaved tab fully on the primary monitor and in the foreground. No local input from this point through the GUI run.
+3. Use ChatGPT on another device, in a new conversation with the exact intended Pro label and connector. Perform the existing write confirmations there. Where offered, select remembering the choice for this conversation and record whether it actually persists.
+4. Use the task prompts below, without adding the nonce. Each code or GUI task is its own measured trial. Follow pending operations to completion and reobserve after actions. After Enter in Save As, transient `NOT_FOUND`/`FILE_LOCKED` can mean save processing is unfinished: reobserve and reread, not blindly repeat the save. Record final text, byte count, BOM/encoding, and raw-byte hash; equal decoded text is not proof of equal bytes.
+5. Repeat with Thinking and with `--no-instructions`, restarting at step 1 each time. Refresh the connector's schema/instructions between A/B configurations. Hold any Project/custom instructions constant or record them as a separate variable; they must not silently reintroduce the server instructions in the off trial.
+6. Record the table below. Keep setup/reference calls outside the measured call count and preserve their logs separately. A successful short run is not hours-long reliability evidence.
+7. Stop the tunnel after the trial and preserve that trial's fixture, sibling `.state`, frames, results, prompts and timing record together, separate from every other trial.
+
+**Code task (fixed-fixture tool loop, not general source repair):**
+
+> workspace의 테스트가 실패한다. 통과할 때까지 고쳐라. 중간에 묻지 말고 끝까지 진행하라.
+
+**GUI task (no example or expected nonce in this prompt):**
+
+> 먼저 screenshot을 찍고 메모장 본문에 보이는 코드를 그대로 보고하라. 그 다음 Ctrl+A 후 `CODEXISH-P0-OK`를 입력하고 CTRL+S로 echo가 알려준 경로에 저장하라. 대화상자도 화면을 보고 처리하라. 저장 후 read_file로 확인하라.
+
+| ID | Record |
 | --- | --- |
-| [아키텍처](docs/architecture.md) | 구성요소, 권한 교집합, 장기 실행, 동시 작업, worktree, journal, 복구 |
-| [요구사항과 수용 기준](docs/requirements.md) | 구현 순서, 기능 요구사항, 실제 사용자 흐름 검증, 완료 기준 |
-| [도구 계약](docs/tool-contracts.md) | filesystem/shell/process/git/computer-use/browser-CDP/LSP/artifact/세션 API와 오류 모델 |
-| [승인과 보안](docs/security.md) | 인증, 기기 연결, 권한 지속성, 실제 격리 경계, 비밀정보, 신뢰할 수 없는 콘텐츠 |
-| [제품 가정과 호환성](docs/product-assumptions.md) | 공식 근거, 미확인 사항, 이전 설계 정정, 실계정 확인표 |
+| M-1 | Exact displayed model, tool visibility and actual successful call; screenshot evidence. Diagnose transport 403 separately from model support. |
+| M-2 | Calls in one user input: total **and screenshot / action / file-command / other** counts; task outcome and final/stop message. The ordinary path is roughly 17 calls in the review; that includes observation overhead, not a target or cap. |
+| M-3 | Write confirmations, whether remembering works, and confirmation-wait intervals measured on the Chat device. |
+| M-4 | Correct report of the unpredictable **initial image-only nonce, before replacement or file verification**. Mentioning the supplied `CODEXISH-P0-OK` is not image-reception evidence. |
+| M-5 | `echo(delay_60_seconds=true)` observed duration/timeout. Success proves survival through 60 seconds only, not the ceiling. `run_command sleep` instead checks child lifetime past response wait. The reviewer proposes 120/180-second variants after success; this unchanged P0 API has no such echo variant, so record them as not run unless a separately identified variation is actually tested. |
+| M-6 | Matched Pro/Thinking trial M-2 values and total wall time, with instructions settings and fresh-state evidence. |
+| M-7 | Observe/action task completion, action count, Save As behavior, final file text **and** bytes/encoding/hash. |
+| M-8 | Define a step as an action plus its follow-up observation; record mean/max wall time, tool durations and inter-call gaps separately. `.state/calls.jsonl` has server-side call metadata; gaps can include model reasoning, network and confirmation wait. Use the Chat-side record to separate confirmation time rather than attributing the whole gap to Pro reasoning. |
 
-## 첫 구현의 성공 조건
+A 15-call exercise is a target workload, not a guaranteed minimum or a success metric by itself. Successful early completion is not failure. CI and the reference run do not establish Pro/Thinking image ingestion, confirmations, or continuation behavior.
 
-사용자가 작업을 지시하면 모델이 workspace를 읽고, 파일을 수정하고, 테스트 실패를 관찰한 뒤 수정·재검증하고, 필요하면 브라우저나 Windows 앱으로 결과를 확인한다. 진행 중인 작업과 모든 결과는 다시 조회할 수 있고, 최종 diff와 실제 검증 결과로 완료를 설명한다.
-
-이를 위해 일반적인 작업 중 충돌은 큐·진행 중 작업 합류·파일 변경 감지로 처리한다. 다른 작업이 실행 중이라는 이유만으로 유효 요청을 거절하는 `busy`/`already_running` 장벽을 도입하지 않는다. 작업 전체의 임의 시간·호출 횟수 제한도 설계에 넣지 않는다. 실제 환경의 제한이 있다면 출처와 영향을 표시한다.
-
-Codex와 유사한 실행 기능을 목표로 하되 Codex의 시스템 프롬프트, 내부 도구 구현, 사용량 집계, 자동 지속 실행, UI가 그대로 제공된다고 주장하지 않는다. MVP와 후속 기능의 경계는 [요구사항](docs/requirements.md)에 정의한다.
+See [review response](docs/review-response.md), [pre-measurement fixes and v1 deferrals](docs/p0-premeasurement-fixes.md), and [actual status](IMPLEMENTATION_STATUS.md).
