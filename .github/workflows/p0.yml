@@ -1,0 +1,30 @@
+name: P0 build and protocol tests
+on:
+  push:
+    branches: ['feat/p0-review-response-20260915']
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - run: dotnet restore src/Codexish.P0/Codexish.P0.csproj
+      - run: dotnet build src/Codexish.P0/Codexish.P0.csproj --no-restore -c Release
+      - run: dotnet run --project src/Codexish.P0/Codexish.P0.csproj --no-build -c Release -- --self-test
+        env:
+          CODEXISH_TEST_OUTPUT: evidence
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: p0-evidence-${{ matrix.os }}
+          path: evidence/
+          if-no-files-found: ignore
