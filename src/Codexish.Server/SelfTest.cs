@@ -218,15 +218,17 @@ public static class SelfTest
         }
         else Skip("junction fence and Windows sharing checks: not Windows");
 
-        // A link whose target does not exist reports Exists == false on both platforms, so an existence check
-        // alone would let it through.
+        // A link whose target does not exist must still be refused as a reparse point, whatever an existence
+        // check happens to say about it on this platform.
         string dangling = Path.Combine(root, "dangling.txt");
         bool created = false;
         try { File.CreateSymbolicLink(dangling, "missing-target.txt"); created = true; }
         catch (Exception) { Skip("dangling link fence: this session may not create symbolic links"); }
         if (created)
         {
-            Check(!File.Exists(dangling), "the dangling link reports that it does not exist");
+            // File.Exists is platform-dependent for a broken link (.NET falls back to lstat on Unix and reads the
+            // link's own attributes on Windows), so it is recorded, not asserted; the fence must not depend on it.
+            Console.WriteLine($"NOTE dangling link: File.Exists={File.Exists(dangling)} on {Environment.OSVersion.Platform}");
             Check(Error(tools.FsRead("proj", "dangling.txt", null, null, null, null)) == "UNSUPPORTED_CAPABILITY",
                 "a dangling reparse point is refused even though an existence check says it is not there");
             File.Delete(dangling);
