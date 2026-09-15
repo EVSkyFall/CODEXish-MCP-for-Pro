@@ -37,6 +37,10 @@ When a redirect_uri is refused, the offered value is written to the rejection lo
 **Decision: a grant is per root and has three bits — read, write, shell — and a listed root defaults to all
 three.** There is no per-action approval UI and no model-writable approval tool: the local user edits the file.
 
+**Decision: two roots may not name the same directory or nest inside one another, and the server refuses to
+start otherwise.** FIFO resources are keyed by `root_id`, so two ids over one tree would give the same files
+two independent queues and let concurrent writes interleave.
+
 **Decision: the state directory must lie outside every root, and the server refuses to start otherwise.** The
 ledger, the artifact store and the `.bak` backups must not be reachable through `fs_*` or through a shell grant
 pointed at a root.
@@ -93,6 +97,19 @@ mangled text.**
 
 ## 5. Shell and processes
 
+**Decision: every process result reports the `supervision` mechanism that will end it — `job_object`,
+`process_tree_fallback` or `not_supervised_persistent`.** A Job Object that cannot be created is recorded in
+the events table and downgrades supervision to `Process.Kill(entireProcessTree)`; it never costs the caller
+their command, and it is also the ordinary path on Linux, where there are no Job Objects.
+
+**Decision: a `persistent` process that is still alive after a restart is adopted as a usable handle, not only
+as a database row.** It can be polled and stopped, it reports `reattached: true` and
+`output_since_restart: not_captured`, its exit code is `exited_unknown_code` because the server no longer owns
+the process, and `process_write` is refused because its stdin belongs to nobody.
+
+**Decision: a process cursor is bound to the process that issued it.** A cursor from another process is
+`CURSOR_INVALID` rather than an offset into a different pair of streams.
+
 **Decision: `shell_run` and `process_start` are the same supervisor; structured `executable` plus `args` is
 preferred and a `command` string requires an explicit shell from `shell.allowed`.** `cmd` is invoked as
 `cmd.exe /s /c "<command>"` because cmd does not follow `CommandLineToArgvW` quoting; `pwsh` is invoked as
@@ -126,6 +143,15 @@ re-attached as `running` with `reattached: true` and `output_since_restart: not_
 on every call, `-c core.hooksPath=<empty directory in the state dir> -c core.fsmonitor=false -c core.pager=cat
 -c diff.external= -c core.editor=true --no-optional-locks`, plus `--no-ext-diff --no-textconv` on diff and
 `GIT_TERMINAL_PROMPT=0` in the environment.** Reading a repository must not execute the repository's code.
+
+**Decision: before each read, the repository's declared clean and process filters are listed by name with
+`git config --null --name-only --get-regexp '^filter\..*\.(clean|process|required)$'` and each one is
+disabled with `-c <name>=` (`=false` for `.required`).** A filter declared by `.gitattributes` runs during
+status and diff as well, so disabling hooks alone would not be enough. Only names are read, never values.
+
+**Decision: `--no-lazy-fetch` is probed once and used only where git understands it.** It stops a read of a
+partial clone from starting a network fetch, which would run the remote and credential helpers; git 2.40
+rejects the option, so an unconditional flag would break every call on that version.
 
 **Decision: `ref` and `path` arrive from the model, so a ref must match `^[A-Za-z0-9._/@^~{}-]+$`, must not
 start with `-` and must not be a filesystem traversal; `--end-of-options` precedes any ref and `--` precedes any
@@ -180,6 +206,23 @@ preserved prefix readable, and reports `OUTPUT_INCOMPLETE` when a read asks for 
 
 ## 9. Authentication, control and redaction
 
+**Decision: `public_url` must be https whenever authentication is enabled, and its origin is added to
+`allow_origins` automatically.** The tunnel terminates TLS, so the browser posts the login form with
+`Origin: https://<host>` while Kestrel sees scheme http; without the automatic allowance the server's own login
+form would be rejected as cross-origin.
+
+**Decision: the only scope is `mcp`.** An empty scope becomes `mcp`, anything else is `invalid_scope` at
+`/authorize`, the granted scope is stored on the token row, and `/mcp` refuses a token that does not carry it.
+
+**Decision: refresh rotation is one atomic consume-and-revoke.** Two concurrent exchanges of the same refresh
+token cannot both succeed; the loser is `invalid_grant`.
+
+**Decision: replaying a refresh token that was already rotated away revokes every token of that family.** The
+family is the authorization the tokens descend from, and the revocation is recorded in the events table.
+
+**Decision: the authorization response carries `iss`** (RFC 9207), on both the success redirect and the error
+redirect.
+
 **Decision: authentication is a built-in single-user OAuth 2.1 authorization server on the same listener — no
 external IdP — with `S256` PKCE, opaque 32-byte tokens stored only as SHA-256 hashes with an audience and an
 expiry, a rotating refresh token, and both `client_secret_post` and `client_secret_basic`.**
@@ -208,6 +251,10 @@ tunnel Host.
 
 **Decision: pause is a hold, not a rejection.** While paused, a mutating invocation is accepted into its queue
 and returned as `status: queued` with `paused: true`, reads keep working, and the dequeuers continue on resume.
+
+**Decision: the values of environment variables whose names match TOKEN, SECRET, PASSWORD, API_KEY or
+PRIVATE_KEY are replaced wherever they appear in output.** The environment is snapshotted once at startup,
+longest value first, and values shorter than eight characters are ignored as too likely to be ordinary words.
 
 **Decision: environment variables are never returned in any result, and stdout/stderr previews, `fs_read` text,
 git output and `artifact_read` text are filtered through a small published credential pattern set that replaces
@@ -249,5 +296,9 @@ handles, and `host_capabilities` returns the latest one.** It stores text and gr
   and no mTLS in this slice.
 - **Exactly-once execution is not promised for shell, process or GUI effects.** The ledger prevents a repeated
   effect for a repeated `invocation_id`; it cannot make an unconfirmed effect confirmable.
+- **Adopting a process across a restart is not the same as owning it.** A re-attached persistent process has
+  no readable exit code and no stdin, and whatever it printed while the server was down was captured by nobody.
+- **A cursor is an ordering position, not a snapshot.** A file created between two `fs_list` or `fs_search`
+  pages, sorted before the cursor, does not appear in that listing.
 - **Nothing here has been measured against ChatGPT Pro.** The P0 measurement M-1 to M-8 is still unperformed,
   and no tunnel was opened by this work.

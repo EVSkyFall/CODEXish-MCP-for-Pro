@@ -10,21 +10,26 @@ Actually executed on Windows 11 Pro 10.0.26200 with .NET SDK 10.0.401, PowerShel
 | Command | Result |
 | --- | --- |
 | `dotnet build src/Codexish.Server/Codexish.Server.csproj -c Release` (clean, after deleting bin and obj) | 0 warnings, 0 errors |
-| `dotnet run --project src/Codexish.Server --no-build -c Release -- --self-test` | SELF_TEST_PASSED: 196, no SKIP on this machine |
+| `dotnet run --project src/Codexish.Server --no-build -c Release -- --self-test` | SELF_TEST_PASSED: 235 (234 with CODEXISH_SELFTEST_SHELL=pwsh, which runs the interpreter the Linux job uses) |
 | `dotnet build src/Codexish.P0/Codexish.P0.csproj -c Release` | 0 warnings, 0 errors |
 | `dotnet run --project src/Codexish.P0 --no-build -c Release -- --self-test` | SELF_TEST_PASSED: 97 |
 | `--init` into a throwaway temp directory, then starting the server on 127.0.0.1:38321 | config written, `/healthz` and both OAuth metadata documents served, `/mcp` without a token returned 401 with the `WWW-Authenticate` challenge and logged `rejected mcp reason=missing_bearer` |
 
-The 196 checks use real files, a real SQLite ledger, real `cmd.exe` and `pwsh` children under a real Windows Job
+The 235 checks use real files, a real SQLite ledger, real `cmd.exe` and `pwsh` children under a real Windows Job
 Object, a real git repository booby-trapped with an fsmonitor program, an external diff, a textconv filter, a
 pager, an editor and five hooks, and a real in-process Kestrel listener carrying the full OAuth flow. The git
 test first proves the traps fire when git runs unprotected, then proves the three read-only tools leave the
 marker directory empty. The throwaway `--init` configuration and every temp directory were deleted afterwards.
 
-Not run, and not claimed: GitHub Actions (`.github/workflows/v1.yml` is added but this branch was never pushed,
-so no CI run exists), any tunnel, any ChatGPT connector, any real OAuth client, any desktop capture or input,
-and the P0 M-1 to M-8 measurements. Linux behaviour is untested locally; the workflow's ubuntu-latest job is the
-first thing that would exercise it, and the Windows-only checks print SKIP there.
+The first ubuntu-latest CI run failed at check 32 because `FileMode.CreateNew` was mapped to FILE_CHANGED by
+Windows error number only. That is fixed, together with a full Linux-portability pass; see the Round 2 section
+of `_review/opus-slice1-report.md`. No Linux runtime is available on this machine (no WSL distribution is
+installed and none was installed for this work), so the Linux paths were verified by running the whole suite
+through PowerShell 7 with `CODEXISH_SELFTEST_SHELL=pwsh` and by forcing the no-Job-Object code path that Linux
+always takes. The ubuntu-latest job remains the first real Linux execution.
+
+Not run, and not claimed: any tunnel, any ChatGPT connector, any real OAuth client, any desktop capture or
+input, and the P0 M-1 to M-8 measurements.
 
 
 ## Latest triage follow-up (2026-09-15)

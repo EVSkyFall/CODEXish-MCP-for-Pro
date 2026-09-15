@@ -97,12 +97,22 @@ public static class SelfTest
         }
     }
 
-    // Git marks loose objects read-only, which a plain recursive delete refuses to remove.
+    // Git marks loose objects read-only on both platforms, which a plain recursive delete refuses to remove.
     private static void ForceDelete(string path)
     {
-        foreach (string file in Directory.EnumerateFiles(path, "*", SearchOption.AllDirectories))
-            try { File.SetAttributes(file, FileAttributes.Normal); } catch (IOException) { }
+        foreach (string entry in Directory.EnumerateFileSystemEntries(path, "*", SearchOption.AllDirectories)) Unlock(entry);
+        Unlock(path);
         Directory.Delete(path, true);
+    }
+
+    private static void Unlock(string entry)
+    {
+        try
+        {
+            var attributes = File.GetAttributes(entry);
+            if ((attributes & FileAttributes.ReadOnly) != 0) File.SetAttributes(entry, attributes & ~FileAttributes.ReadOnly);
+        }
+        catch (Exception) { /* an entry that cannot be unlocked is reported by the delete retry loop */ }
     }
 
     private static void Capabilities(CodexishRuntime runtime, CodexishTools tools)
@@ -125,6 +135,27 @@ public static class SelfTest
         Check(Data(tools.HostCapabilities()).GetProperty("checkpoint").GetProperty("checkpoint").GetProperty("goal").GetString()
             == "fix the failing test", "host_capabilities returns the latest checkpoint");
         Check(Error(tools.SessionCheckpoint("", "", [], [], [])) == "INVALID_ARGUMENT", "checkpoint requires an observable goal");
+
+        // Two ids over one directory would give the same files two independent FIFO queues.
+        string root = runtime.Config.Roots[0].Path;
+        var overlapping = new ServerConfig
+        {
+            StateDir = runtime.Config.StateDir + "-overlap",
+            Roots = [new RootConfig { Id = "outer", Path = root }, new RootConfig { Id = "inner", Path = Path.Combine(root, "src") }]
+        };
+        Check(Refused(overlapping.Validate), "a root nested inside another root is refused at startup");
+        var duplicated = new ServerConfig
+        {
+            StateDir = runtime.Config.StateDir + "-overlap",
+            Roots = [new RootConfig { Id = "one", Path = root }, new RootConfig { Id = "two", Path = root }]
+        };
+        Check(Refused(duplicated.Validate), "two ids over the same directory are refused at startup");
+    }
+
+    private static bool Refused(Action action)
+    {
+        try { action(); return false; }
+        catch (ArgumentException) { return true; }
     }
 
     private static void Fences(CodexishRuntime runtime, CodexishTools tools, string root)
@@ -181,10 +212,25 @@ public static class SelfTest
                     .Any(e => e.GetProperty("path").GetString() == "escape" && e.GetProperty("kind").GetString() == "reparse_point"),
                     "fs_list reports a junction as reparse_point without traversing it");
                 Directory.Delete(junction);
+
             }
             else Skip("junction fence: mklink /J unavailable in this session");
         }
         else Skip("junction fence and Windows sharing checks: not Windows");
+
+        // A link whose target does not exist reports Exists == false on both platforms, so an existence check
+        // alone would let it through.
+        string dangling = Path.Combine(root, "dangling.txt");
+        bool created = false;
+        try { File.CreateSymbolicLink(dangling, "missing-target.txt"); created = true; }
+        catch (Exception) { Skip("dangling link fence: this session may not create symbolic links"); }
+        if (created)
+        {
+            Check(!File.Exists(dangling), "the dangling link reports that it does not exist");
+            Check(Error(tools.FsRead("proj", "dangling.txt", null, null, null, null)) == "UNSUPPORTED_CAPABILITY",
+                "a dangling reparse point is refused even though an existence check says it is not there");
+            File.Delete(dangling);
+        }
     }
 
     // A page boundary must neither drop an entry nor return one twice; the fixture is larger than one page
@@ -456,6 +502,41 @@ public static class SelfTest
         Check(Error(cancelledResult) == "CANCELLED" && Effects(cancelledResult) == "none",
             "a cancelled queued operation reports no side effects");
 
+        // Cancelling one queued item must not let a later item overtake the running one: the chain keeps its
+        // acceptance order and the cancelled item simply never runs.
+        var holdGate = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var holdEntered = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        List<string> chainOrder = [];
+        var running = ledger.Invoke("chain-running", "test_hold", new { }, "files:chain", async _ =>
+        {
+            holdEntered.TrySetResult(true);
+            await holdGate.Task;
+            lock (chainOrder) chainOrder.Add("running");
+            return Reply.Ok(new { });
+        }, 0);
+        var doomed = ledger.Invoke("chain-cancelled", "test_doomed", new { }, "files:chain", _ =>
+        {
+            lock (chainOrder) chainOrder.Add("cancelled-ran");
+            return Task.FromResult(Reply.Ok(new { }));
+        }, 15000);
+        var follower = ledger.Invoke("chain-follower", "test_follower", new { }, "files:chain", _ =>
+        {
+            lock (chainOrder) chainOrder.Add("follower");
+            return Task.FromResult(Reply.Ok(new { }));
+        }, 15000);
+        await running;
+        await holdEntered.Task;
+        var cancelQueued = tools.OperationCancel("chain-cancelled");
+        Check(Data(cancelQueued).GetProperty("cancelled").GetBoolean() && chainOrder.Count == 0,
+            "cancelling a queued item while another is running does not start anything early");
+        holdGate.SetResult(true);
+        var doomedResult = await doomed;
+        var followerResult = await follower;
+        Check(Error(doomedResult) == "CANCELLED" && Effects(doomedResult) == "none",
+            "the cancelled queued item reports CANCELLED with no side effects");
+        Check(Status(followerResult) == "succeeded" && chainOrder.SequenceEqual(["running", "follower"]),
+            "the item behind the cancelled one still runs after the running item, in acceptance order");
+
         // D9/M-1: a failure of the final result write must not turn a completed effect into a replayable request.
         string target = Path.Combine(runtime.Config.Roots[0].Path, "persist.txt");
         File.WriteAllText(target, "before\n", new UTF8Encoding(false));
@@ -472,6 +553,21 @@ public static class SelfTest
         var replay = await tools.FsWrite("proj", "persist.txt", "after\n", "replace", "persist-1", hash);
         Check(Reason(replay) == "persist_failed" && File.ReadAllText(target) == "after\n",
             "a retry of an unknown operation returns unknown instead of executing the effect again");
+
+        // The same path again with a real SQLite failure instead of the injected flag: the effect runs, then
+        // the connection is made read-only so the result write genuinely fails.
+        string real = Path.Combine(runtime.Config.Roots[0].Path, "real-persist.txt");
+        var unstored = await ledger.Invoke("persist-2", "test_real_persist", new { }, "files:persist", _ =>
+        {
+            File.WriteAllText(real, "real effect\n", new UTF8Encoding(false));
+            runtime.Store.Pragma("PRAGMA query_only=1");
+            return Task.FromResult(Reply.Ok(new { effect = "applied" }));
+        }, 15000);
+        runtime.Store.Pragma("PRAGMA query_only=0");
+        Check(Error(unstored) == "EXECUTION_UNKNOWN" && Reason(unstored) == "persist_failed" && Effects(unstored) == "applied",
+            "a real read-only database failure after the effect is reported as unknown(persist_failed)");
+        Check(File.ReadAllText(real) == "real effect\n" && Reason(tools.OperationInspect("persist-2")) == "persist_failed",
+            "the effect of the unstored operation is on disk and operation_inspect keeps saying so");
     }
 
     private static void Restart(ServerConfig config)

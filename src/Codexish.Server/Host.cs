@@ -120,8 +120,9 @@ public static class CodexishHost
         app.MapGet("/authorize", (HttpRequest request) =>
         {
             var query = request.Query;
-            var (parsed, failure) = Parse(runtime, query["response_type"], query["client_id"], query["redirect_uri"],
-                query["state"], query["code_challenge"], query["code_challenge_method"], query["scope"], query["resource"], log);
+            var (parsed, failure) = Parse(runtime, Base(runtime, request), query["response_type"], query["client_id"],
+                query["redirect_uri"], query["state"], query["code_challenge"], query["code_challenge_method"],
+                query["scope"], query["resource"], log);
             if (failure is not null) return failure;
             string nonce = runtime.Tokens.IssueNonce();
             return Results.Content(LoginForm(parsed!, nonce, null), "text/html; charset=utf-8");
@@ -132,8 +133,9 @@ public static class CodexishHost
             if (!request.HasFormContentType) return Results.BadRequest(new { error = "invalid_request" });
             var form = await request.ReadFormAsync();
             // Every parameter is revalidated on POST; the hidden fields are not trusted to have stayed constant.
-            var (parsed, failure) = Parse(runtime, form["response_type"], form["client_id"], form["redirect_uri"],
-                form["state"], form["code_challenge"], form["code_challenge_method"], form["scope"], form["resource"], log);
+            var (parsed, failure) = Parse(runtime, Base(runtime, request), form["response_type"], form["client_id"],
+                form["redirect_uri"], form["state"], form["code_challenge"], form["code_challenge_method"],
+                form["scope"], form["resource"], log);
             if (failure is not null) return failure;
             if (!runtime.Tokens.ConsumeNonce(form["nonce"]))
             {
@@ -158,13 +160,16 @@ public static class CodexishHost
             target.Append(parsed.RedirectUri.Contains('?') ? '&' : '?');
             target.Append("code=").Append(Uri.EscapeDataString(code));
             if (parsed.State is { Length: > 0 }) target.Append("&state=").Append(Uri.EscapeDataString(parsed.State));
+            // RFC 9207: the issuer travels with the response so a client cannot be tricked into sending the
+            // code to a different authorization server's token endpoint.
+            target.Append("&iss=").Append(Uri.EscapeDataString(Base(runtime, request)));
             return Results.Redirect(target.ToString());
         });
     }
 
-    private static (AuthorizeRequest?, IResult?) Parse(CodexishRuntime runtime, string? responseType, string? clientId,
-        string? redirectUri, string? state, string? challenge, string? challengeMethod, string? scope, string? resource,
-        Action<string> log)
+    private static (AuthorizeRequest?, IResult?) Parse(CodexishRuntime runtime, string issuer, string? responseType,
+        string? clientId, string? redirectUri, string? state, string? challenge, string? challengeMethod, string? scope,
+        string? resource, Action<string> log)
     {
         var oauth = runtime.Config.OAuth;
         // client_id and redirect_uri are validated before anything is redirected anywhere.
@@ -188,30 +193,37 @@ public static class CodexishHost
         if (!string.Equals(responseType, "code", StringComparison.Ordinal))
         {
             log("rejected oauth stage=authorize reason=unsupported_response_type");
-            return (null, RedirectError(redirectUri, state, "unsupported_response_type", "Only response_type=code is supported."));
+            return (null, RedirectError(issuer, redirectUri, state, "unsupported_response_type", "Only response_type=code is supported."));
         }
         if (!string.IsNullOrEmpty(challenge) && !string.Equals(challengeMethod, "S256", StringComparison.Ordinal))
         {
             log("rejected oauth stage=authorize reason=unsupported_code_challenge_method");
-            return (null, RedirectError(redirectUri, state, "invalid_request", "code_challenge_method must be S256."));
+            return (null, RedirectError(issuer, redirectUri, state, "invalid_request", "code_challenge_method must be S256."));
+        }
+        if (Tokens.NormalizeScope(scope) is null)
+        {
+            log("rejected oauth stage=authorize reason=unsupported_scope");
+            return (null, RedirectError(issuer, redirectUri, state, "invalid_scope",
+                $"Only the '{Tokens.Scope}' scope is issued by this server."));
         }
         string expected = runtime.Config.Resource;
         if (!string.IsNullOrEmpty(resource) && expected.Length > 0 && !string.Equals(resource, expected, StringComparison.Ordinal))
         {
             log("rejected oauth stage=authorize reason=resource_mismatch");
-            return (null, RedirectError(redirectUri, state, "invalid_target", "resource must be this server's MCP endpoint."));
+            return (null, RedirectError(issuer, redirectUri, state, "invalid_target", "resource must be this server's MCP endpoint."));
         }
         return (new AuthorizeRequest(clientId, redirectUri, state, string.IsNullOrEmpty(challenge) ? null : challenge,
-            challengeMethod, string.IsNullOrEmpty(scope) ? "mcp" : scope!, string.IsNullOrEmpty(resource) ? null : resource), null);
+            challengeMethod, Tokens.NormalizeScope(scope)!, string.IsNullOrEmpty(resource) ? null : resource), null);
     }
 
-    private static IResult RedirectError(string redirectUri, string? state, string error, string description)
+    private static IResult RedirectError(string issuer, string redirectUri, string? state, string error, string description)
     {
         var target = new StringBuilder(redirectUri);
         target.Append(redirectUri.Contains('?') ? '&' : '?');
         target.Append("error=").Append(Uri.EscapeDataString(error));
         target.Append("&error_description=").Append(Uri.EscapeDataString(description));
         if (state is { Length: > 0 }) target.Append("&state=").Append(Uri.EscapeDataString(state));
+        target.Append("&iss=").Append(Uri.EscapeDataString(issuer));
         return Results.Redirect(target.ToString());
     }
 
@@ -295,7 +307,7 @@ public static class CodexishHost
                     log("rejected oauth stage=token reason=pkce_verification_failed");
                     return TokenError("invalid_grant", "code_verifier does not match the code_challenge.");
                 }
-                return Issue(runtime, oauth, audience, code.Challenge is not null, code.Scope);
+                return Issue(runtime, oauth, audience, code.Challenge is not null, code.Scope, Tokens.NewFamily());
             }
             if (grant == "refresh_token")
             {
@@ -303,29 +315,47 @@ public static class CodexishHost
                 var (row, reason) = runtime.Tokens.Validate(refresh, "refresh", audience);
                 if (row is null)
                 {
+                    // A refresh token that was already rotated away is a replay: every token issued from the
+                    // same authorization is revoked, not only the one presented.
+                    var replayed = runtime.Tokens.Row(refresh);
+                    if (replayed is { Kind: "refresh", Revoked: true } && replayed.Family.Length > 0)
+                    {
+                        int revoked = runtime.Tokens.RevokeFamily(replayed.Family);
+                        log($"rejected oauth stage=token reason=refresh_replayed family_revoked={revoked}");
+                        return TokenError("invalid_grant",
+                            "This refresh token was already used. Every token from the same authorization is now revoked; sign in again.");
+                    }
                     log($"rejected oauth stage=token reason=refresh_{reason}");
                     return TokenError("invalid_grant", $"The refresh token is {reason}.");
                 }
-                // Rotation: the presented refresh token is revoked before the new pair is issued.
-                runtime.Tokens.Revoke(refresh);
-                return Issue(runtime, oauth, audience, row.PkceUsed, "mcp");
+                // Rotation is one atomic consume-and-revoke: if a concurrent exchange won the race, this one
+                // finds no live row and is refused instead of minting a second valid pair.
+                if (!runtime.Tokens.ConsumeRefresh(refresh))
+                {
+                    log("rejected oauth stage=token reason=refresh_already_consumed");
+                    return TokenError("invalid_grant", "This refresh token was already exchanged.");
+                }
+                return Issue(runtime, oauth, audience, row.PkceUsed, row.Scope, row.Family);
             }
             return TokenError("unsupported_grant_type", "Use authorization_code or refresh_token.");
         });
     }
 
-    private static IResult Issue(CodexishRuntime runtime, OAuthConfig oauth, string audience, bool pkceUsed, string scope)
+    private static IResult Issue(CodexishRuntime runtime, OAuthConfig oauth, string audience, bool pkceUsed,
+        string scope, string family)
     {
         var accessLifetime = TimeSpan.FromHours(oauth.AccessTokenHours);
-        string access = runtime.Tokens.Issue("access", oauth.ClientId, audience, accessLifetime, pkceUsed);
-        string refresh = runtime.Tokens.Issue("refresh", oauth.ClientId, audience, TimeSpan.FromDays(oauth.RefreshTokenDays), pkceUsed);
+        string granted = Tokens.NormalizeScope(scope) ?? Tokens.Scope;
+        string access = runtime.Tokens.Issue("access", oauth.ClientId, audience, accessLifetime, pkceUsed, family, granted);
+        string refresh = runtime.Tokens.Issue("refresh", oauth.ClientId, audience,
+            TimeSpan.FromDays(oauth.RefreshTokenDays), pkceUsed, family, granted);
         return Results.Json(new
         {
             access_token = access,
             token_type = "Bearer",
             expires_in = (int)accessLifetime.TotalSeconds,
             refresh_token = refresh,
-            scope
+            scope = granted
         });
     }
 

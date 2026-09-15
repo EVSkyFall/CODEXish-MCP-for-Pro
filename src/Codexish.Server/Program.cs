@@ -49,6 +49,7 @@ if (args.Contains("--init"))
 var config = ServerConfig.Load(configPath);
 bool noAuth = args.Contains("--no-auth");
 if (noAuth && ServerConfig.NoAuthRefusal(config) is { } refusal) throw new ArgumentException(refusal);
+if (ServerConfig.TransportRefusal(config, noAuth) is { } insecure) throw new ArgumentException(insecure);
 
 using var runtime = new CodexishRuntime(config, noAuth);
 var app = CodexishHost.Build(runtime, config.Port, instructions: !args.Contains("--no-instructions"));

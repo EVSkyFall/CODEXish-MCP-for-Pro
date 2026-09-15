@@ -12,7 +12,7 @@ public sealed record ArtifactRow(string Id, string Mime, long Bytes, string? Sha
     int Complete, int Generation, string CreatedAt);
 
 public sealed record TokenRow(string Hash, string Kind, string ClientId, string Audience, DateTimeOffset ExpiresAt,
-    bool Revoked, bool PkceUsed);
+    bool Revoked, bool PkceUsed, string Family, string Scope);
 
 // D10: one SQLite file in the state directory, WAL, every table the slice needs. All access is serialized on
 // one connection; the ledger relies on the same lock to make acceptance order observable.
@@ -42,23 +42,34 @@ public sealed class Store : IDisposable
             CREATE TABLE IF NOT EXISTS events(seq INTEGER PRIMARY KEY AUTOINCREMENT, utc TEXT NOT NULL, kind TEXT NOT NULL,
                 ref TEXT, json TEXT);
             CREATE TABLE IF NOT EXISTS tokens(hash TEXT PRIMARY KEY, kind TEXT NOT NULL, client_id TEXT NOT NULL,
-                audience TEXT NOT NULL, expires_at TEXT NOT NULL, revoked INTEGER NOT NULL, pkce_used INTEGER NOT NULL DEFAULT 0);
+                audience TEXT NOT NULL, expires_at TEXT NOT NULL, revoked INTEGER NOT NULL, pkce_used INTEGER NOT NULL DEFAULT 0,
+                family TEXT NOT NULL DEFAULT '', scope TEXT NOT NULL DEFAULT '');
             CREATE TABLE IF NOT EXISTS checkpoints(seq INTEGER PRIMARY KEY AUTOINCREMENT, utc TEXT NOT NULL, json TEXT NOT NULL);
             """);
+        // A database written by an earlier build has no family column; adding it is a no-op afterwards.
+        try { Execute("ALTER TABLE tokens ADD COLUMN family TEXT NOT NULL DEFAULT ''"); }
+        catch (SqliteException) { }
+        try { Execute("ALTER TABLE tokens ADD COLUMN scope TEXT NOT NULL DEFAULT ''"); }
+        catch (SqliteException) { }
     }
 
     private static string Now => DateTimeOffset.UtcNow.ToString("o");
 
-    public void Execute(string sql, params (string Key, object? Value)[] args)
+    public void Execute(string sql, params (string Key, object? Value)[] args) => ExecuteCount(sql, args);
+
+    public int ExecuteCount(string sql, params (string Key, object? Value)[] args)
     {
         lock (gate)
         {
             using var command = db.CreateCommand();
             command.CommandText = sql;
             foreach (var (key, value) in args) command.Parameters.AddWithValue(key, value ?? DBNull.Value);
-            command.ExecuteNonQuery();
+            return command.ExecuteNonQuery();
         }
     }
+
+    // Used by the self-test to make a real SQLite write fail instead of only an injected flag.
+    public void Pragma(string pragma) => Execute(pragma);
 
     private T? Read<T>(string sql, Func<SqliteDataReader, T> map, params (string Key, object? Value)[] args) where T : class
     {
@@ -169,16 +180,32 @@ public sealed class Store : IDisposable
                 r.GetString(4), r.GetInt32(5), r.GetInt32(6), r.GetString(7)), ("$id", id));
 
     public void InsertToken(TokenRow row) =>
-        Execute("INSERT INTO tokens(hash,kind,client_id,audience,expires_at,revoked,pkce_used) VALUES($h,$k,$c,$a,$e,0,$p)",
+        Execute("INSERT INTO tokens(hash,kind,client_id,audience,expires_at,revoked,pkce_used,family,scope) VALUES($h,$k,$c,$a,$e,0,$p,$f,$s)",
             ("$h", row.Hash), ("$k", row.Kind), ("$c", row.ClientId), ("$a", row.Audience),
-            ("$e", row.ExpiresAt.ToString("o")), ("$p", row.PkceUsed ? 1 : 0));
+            ("$e", row.ExpiresAt.ToString("o")), ("$p", row.PkceUsed ? 1 : 0), ("$f", row.Family), ("$s", row.Scope));
 
     public TokenRow? Token(string hash) =>
-        Read("SELECT hash,kind,client_id,audience,expires_at,revoked,pkce_used FROM tokens WHERE hash=$h",
+        Read("SELECT hash,kind,client_id,audience,expires_at,revoked,pkce_used,family,scope FROM tokens WHERE hash=$h",
             r => new TokenRow(r.GetString(0), r.GetString(1), r.GetString(2), r.GetString(3),
-                DateTimeOffset.Parse(r.GetString(4)), r.GetInt32(5) != 0, r.GetInt32(6) != 0), ("$h", hash));
+                DateTimeOffset.Parse(r.GetString(4)), r.GetInt32(5) != 0, r.GetInt32(6) != 0, r.GetString(7),
+                r.GetString(8)), ("$h", hash));
+
+    // One atomic consume-and-revoke: two concurrent refreshes cannot both see the token as live.
+    public bool ConsumeRefresh(string hash) =>
+        ExecuteCount("UPDATE tokens SET revoked=1 WHERE hash=$h AND revoked=0 AND kind='refresh'", ("$h", hash)) == 1;
 
     public void RevokeToken(string hash) => Execute("UPDATE tokens SET revoked=1 WHERE hash=$h", ("$h", hash));
+
+    // Replaying a rotated refresh token means the family is compromised: every token issued from that same
+    // authorization is revoked, not just the one presented.
+    public int RevokeFamily(string family)
+    {
+        if (family.Length == 0) return 0;
+        var live = ReadAll("SELECT hash FROM tokens WHERE family=$f AND revoked=0", r => r.GetString(0), ("$f", family));
+        Execute("UPDATE tokens SET revoked=1 WHERE family=$f", ("$f", family));
+        Event("token_family_revoked", family, new { revoked = live.Count });
+        return live.Count;
+    }
 
     public int RevokeAllTokens()
     {

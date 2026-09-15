@@ -7,6 +7,13 @@ public enum Grant { None = 0, Read = 1, Write = 2, Shell = 4 }
 
 public sealed record Target(RootConfig Root, string FullPath, string Relative, string RootFinalPath);
 
+public static class PathRules
+{
+    // Windows paths are case-insensitive and Linux paths are not; the fence uses the platform's own rule.
+    public static readonly StringComparison Compare =
+        OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+}
+
 // D5: inputs are root_id plus a relative path. Resolution normalizes first, then every opened handle is
 // compared against the root's own final path, so a path swapped between the check and the open is caught.
 public sealed class Workspace
@@ -64,8 +71,8 @@ public sealed class Workspace
     }
 
     private static bool Inside(string root, string candidate) =>
-        candidate.Equals(root, StringComparison.OrdinalIgnoreCase) ||
-        candidate.StartsWith(root + System.IO.Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
+        candidate.Equals(root, PathRules.Compare) ||
+        candidate.StartsWith(root + System.IO.Path.DirectorySeparatorChar, PathRules.Compare);
 
     // Walks from the target up to (not past) the root: a junction or symlink inside the root is refused
     // rather than silently followed, exactly as P0 does.
@@ -73,12 +80,33 @@ public sealed class Workspace
     {
         for (string? probe = full; probe is not null && probe.Length >= root.Length; probe = System.IO.Path.GetDirectoryName(probe))
         {
-            if (probe.Equals(root, StringComparison.OrdinalIgnoreCase)) return;
-            if ((File.Exists(probe) || Directory.Exists(probe)) &&
-                (File.GetAttributes(probe) & FileAttributes.ReparsePoint) != 0)
+            if (probe.Equals(root, PathRules.Compare)) return;
+            FileAttributes attributes;
+            // A dangling symlink reports Exists == false, so the attributes are read directly and a missing
+            // entry is the only case that is skipped. Where a platform refuses attributes for a broken link,
+            // the link target is still readable and is treated as proof of a reparse point.
+            try { attributes = File.GetAttributes(probe); }
+            catch (UnauthorizedAccessException)
+            {
+                throw new CodexishFault("PERMISSION_DENIED", "A component of the path cannot be inspected.");
+            }
+            catch (Exception)
+            {
+                if (LinksElsewhere(probe))
+                    throw new CodexishFault("UNSUPPORTED_CAPABILITY",
+                        "Reparse points (symlinks, junctions) inside a root are not followed by file tools.");
+                continue;
+            }
+            if ((attributes & FileAttributes.ReparsePoint) != 0)
                 throw new CodexishFault("UNSUPPORTED_CAPABILITY",
                     "Reparse points (symlinks, junctions) inside a root are not followed by file tools.");
         }
+    }
+
+    private static bool LinksElsewhere(string probe)
+    {
+        try { return new FileInfo(probe).LinkTarget is not null || new DirectoryInfo(probe).LinkTarget is not null; }
+        catch (Exception) { return false; }
     }
 
     private static void VerifyHandle(SafeFileHandle handle, Target target, bool directory)
@@ -88,8 +116,8 @@ public sealed class Workspace
         if (final is null)
             throw new CodexishFault("OUTSIDE_WORKSPACE", "The opened handle's real path could not be verified.");
         final = System.IO.Path.TrimEndingDirectorySeparator(final);
-        bool ok = directory && final.Equals(target.RootFinalPath, StringComparison.OrdinalIgnoreCase);
-        ok |= final.StartsWith(target.RootFinalPath + System.IO.Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
+        bool ok = directory && final.Equals(target.RootFinalPath, PathRules.Compare);
+        ok |= final.StartsWith(target.RootFinalPath + System.IO.Path.DirectorySeparatorChar, PathRules.Compare);
         if (!ok)
             throw new CodexishFault("OUTSIDE_WORKSPACE", "The opened handle resolves outside the granted root.");
     }
@@ -141,12 +169,17 @@ public sealed class Workspace
     private static FileStream Open(Target target, FileMode mode, FileAccess access, FileShare share)
     {
         try { return new FileStream(target.FullPath, mode, access, share); }
-        catch (IOException e) when (mode == FileMode.CreateNew && (e.HResult & 0xffff) is 80 or 183)
+        // A create collision is detected by the target existing, not by a Windows error number: the IOException
+        // from FileMode.CreateNew carries ERROR_FILE_EXISTS/ERROR_ALREADY_EXISTS on Windows and an
+        // EEXIST-derived HResult on Linux.
+        catch (IOException e) when (mode == FileMode.CreateNew &&
+            (File.Exists(target.FullPath) || Directory.Exists(target.FullPath) || (e.HResult & 0xffff) is 80 or 183))
         {
             throw new CodexishFault("FILE_CHANGED",
                 $"'{target.Relative}' already exists. Use mode=replace with expected_sha256 to change it.");
         }
-        catch (IOException e) when ((e.HResult & 0xffff) is 32 or 33)
+        // Share-mode conflicts are a Windows concept; Linux has no mandatory locking, so this never fires there.
+        catch (IOException e) when (OperatingSystem.IsWindows() && (e.HResult & 0xffff) is 32 or 33)
         {
             throw new CodexishFault("FILE_LOCKED",
                 $"Another handle holds '{target.Relative}' with incompatible sharing. Reread after it is released.");

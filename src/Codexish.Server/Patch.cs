@@ -127,6 +127,13 @@ public static class UnifiedDiff
         int cursor = 0;
         foreach (var hunk in file.Hunks)
         {
+            // The header's own counts must match the body, or the patch is describing a different file.
+            int declaredOld = hunk.Lines.Count(l => l.StartsWith(' ') || l.StartsWith('-'));
+            int declaredNew = hunk.Lines.Count(l => l.StartsWith(' ') || l.StartsWith('+'));
+            if (declaredOld != hunk.OldCount || declaredNew != hunk.NewCount)
+                throw new CodexishFault("PATCH_FAILED",
+                    $"Hunk @@ -{hunk.OldStart},{hunk.OldCount} +{hunk.NewStart},{hunk.NewCount} @@ of '{file.Path}' " +
+                    $"declares {hunk.OldCount} old and {hunk.NewCount} new lines but contains {declaredOld} and {declaredNew}.");
             int start = hunk.OldCount == 0 ? hunk.OldStart : hunk.OldStart - 1;
             if (start < cursor || start > original.Count)
                 throw new CodexishFault("PATCH_FAILED", $"Hunk at old line {hunk.OldStart} of '{file.Path}' is out of order or past the end of the file.");

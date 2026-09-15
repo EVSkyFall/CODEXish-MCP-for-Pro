@@ -178,6 +178,7 @@ public sealed class CodexishTools(CodexishRuntime runtime)
         process_id = managed.ProcessId,
         pid = managed.Pid,
         lifetime = managed.Lifetime,
+        supervision = managed.Supervision,
         root_id = managed.RootId,
         command = managed.Display,
         stdout_artifact = managed.StdoutArtifact,

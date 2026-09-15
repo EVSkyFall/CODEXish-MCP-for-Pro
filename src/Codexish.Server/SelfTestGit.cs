@@ -41,7 +41,7 @@ internal static class GitTests
         File.WriteAllText(Path.Combine(root, "untracked.txt"), "untracked content\n", new UTF8Encoding(false));
 
         // Traps are installed only after the setup writes, so setup does not trip them.
-        foreach (string name in new[] { "fsmonitor", "external", "textconv", "pager", "editor" })
+        foreach (string name in new[] { "fsmonitor", "external", "textconv", "pager", "editor", "clean", "smudge" })
             Trap(Path.Combine(traps, name + ".sh"), name);
         string hooks = Path.Combine(root, ".git", "hooks");
         Directory.CreateDirectory(hooks);
@@ -53,13 +53,20 @@ internal static class GitTests
         Raw(git, root, "config", "diff.marker.textconv", Posix(Path.Combine(traps, "textconv.sh")));
         Raw(git, root, "config", "core.pager", Posix(Path.Combine(traps, "pager.sh")));
         Raw(git, root, "config", "core.editor", Posix(Path.Combine(traps, "editor.sh")));
-        File.WriteAllText(Path.Combine(root, ".gitattributes"), "*.txt diff=marker\n", new UTF8Encoding(false));
+        // A clean filter also runs during status and diff, which is why the tools read the declared filter
+        // names and disable them before the real query.
+        Raw(git, root, "config", "filter.marker.clean", Posix(Path.Combine(traps, "clean.sh")));
+        Raw(git, root, "config", "filter.marker.smudge", Posix(Path.Combine(traps, "smudge.sh")));
+        Raw(git, root, "config", "filter.marker.required", "true");
+        File.WriteAllText(Path.Combine(root, ".gitattributes"), "*.txt diff=marker filter=marker\n", new UTF8Encoding(false));
 
         // Control: the same repository without the fixed options must actually execute the trap.
         Raw(git, root, "status", "--porcelain=v2");
         Raw(git, root, "diff");
-        int tripped = Directory.GetFiles(markers).Length;
-        Check(tripped > 0, $"the repository traps really execute when git runs unprotected ({tripped} marker(s))");
+        var tripped = Directory.GetFiles(markers).Select(Path.GetFileName).OrderBy(n => n, StringComparer.Ordinal).ToArray();
+        Check(tripped.Length > 0, $"the repository traps really execute when git runs unprotected ({string.Join(", ", tripped)})");
+        Check(tripped.Contains("clean.marker"),
+            "the clean filter declared by .gitattributes really runs during an unprotected status or diff");
         foreach (string file in Directory.GetFiles(markers)) File.Delete(file);
 
         var status = await tools.GitStatus("proj");
@@ -68,7 +75,7 @@ internal static class GitTests
         var head = await tools.GitDiff("proj", "HEAD", "tracked.txt", false);
         var log = await tools.GitLog("proj", 10, null);
         Check(Directory.GetFiles(markers).Length == 0,
-            "git_status, git_diff and git_log executed no hook, fsmonitor, external diff, textconv, pager or editor");
+            "git_status, git_diff and git_log executed no hook, fsmonitor, external diff, textconv, clean filter, pager or editor");
 
         var entries = Data(status).GetProperty("entries").EnumerateArray().ToArray();
         Check(Data(status).GetProperty("branch").GetString() == "main" && Data(status).GetProperty("head").GetString()!.Length == 40,

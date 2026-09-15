@@ -20,13 +20,37 @@ public sealed class Tokens(Store store, ServerConfig config)
     public static string HashToken(string token) =>
         Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(token))).ToLowerInvariant();
 
-    public string Issue(string kind, string clientId, string audience, TimeSpan lifetime, bool pkceUsed)
+    public const string Scope = "mcp";
+
+    public string Issue(string kind, string clientId, string audience, TimeSpan lifetime, bool pkceUsed,
+        string family, string scope)
     {
         string token = ServerConfig.NewSecret();
-        store.InsertToken(new TokenRow(HashToken(token), kind, clientId, audience, DateTimeOffset.UtcNow + lifetime, false, pkceUsed));
-        store.Event("token_issued", kind, new { client_id = clientId, audience, pkce_used = pkceUsed, expires_in = (int)lifetime.TotalSeconds });
+        store.InsertToken(new TokenRow(HashToken(token), kind, clientId, audience, DateTimeOffset.UtcNow + lifetime,
+            false, pkceUsed, family, scope));
+        store.Event("token_issued", kind, new { client_id = clientId, audience, pkce_used = pkceUsed, family, scope,
+            expires_in = (int)lifetime.TotalSeconds });
         return token;
     }
+
+    // Only the mcp scope exists in this slice; anything else is refused at /authorize rather than downgraded.
+    public static string? NormalizeScope(string? requested)
+    {
+        string[] parts = (requested ?? "").Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length == 0) return Scope;
+        return parts.All(p => p == Scope) ? Scope : null;
+    }
+
+    public static bool Grants(TokenRow row, string scope) =>
+        row.Scope.Split(' ', StringSplitOptions.RemoveEmptyEntries).Contains(scope, StringComparer.Ordinal);
+
+    public bool ConsumeRefresh(string token) => store.ConsumeRefresh(HashToken(token));
+
+    public static string NewFamily() => ServerConfig.NewSecret(16);
+
+    public TokenRow? Row(string token) => store.Token(HashToken(token));
+
+    public int RevokeFamily(string family) => store.RevokeFamily(family);
 
     public (TokenRow? Row, string Reason) Validate(string token, string kind, string audience)
     {
@@ -37,6 +61,8 @@ public sealed class Tokens(Store store, ServerConfig config)
         if (row.ExpiresAt <= DateTimeOffset.UtcNow) return (null, "expired");
         // Resource indicators default to <public_url>/mcp; a token minted for something else is not accepted here.
         if (audience.Length > 0 && !string.Equals(row.Audience, audience, StringComparison.Ordinal)) return (null, "wrong_audience");
+        // A token that does not carry the mcp scope cannot be used on /mcp, whatever else it may carry.
+        if (kind == "access" && !Grants(row, Scope)) return (null, "insufficient_scope");
         return (row, "ok");
     }
 

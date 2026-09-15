@@ -26,7 +26,10 @@ dotnet run --project src/Codexish.Server -c Release -- --init `
 
 `--init` writes `%LOCALAPPDATA%\Codexish\codexish.json` (override with `--config <path>`), generates the client
 secret and the loopback control token with `RandomNumberGenerator`, stores the password as a PBKDF2-SHA256 hash,
-and puts the hostname from `--public-url` into `allow_hosts`. Repeat `--root id=path` for more roots; each root
+and puts the hostname from `--public-url` into `allow_hosts` and its origin into `allow_origins` (the tunnel
+terminates TLS, so the login form's own POST arrives with an https Origin over an http connection).
+`--public-url` must be https unless you run with `--no-auth`, because the access token would otherwise cross
+the tunnel in clear text. Roots may not overlap: one root per directory tree. Repeat `--root id=path` for more roots; each root
 grants read, write and shell unless you edit the file afterwards. `--state-dir` moves the ledger, artifacts and
 backups; it must stay outside every root or the server refuses to start. Add `--redirect-uri <uri>` (repeatable)
 if your connector's callback differs from the default ChatGPT one. **`--init` prints the client secret and the
@@ -52,7 +55,7 @@ loopback development.
 | Token URL | `<public_url>/token` |
 | Client ID | `codexish-chatgpt` (from `codexish.json`) |
 | Client secret | printed by `--init`, stored in `codexish.json` |
-| Scope | `mcp` |
+| Scope | `mcp` (the only scope this server issues) |
 | PKCE | S256, required whenever the client sends a `code_challenge` |
 
 Signing in opens a single password form served by this server. If the connector's callback is refused, the

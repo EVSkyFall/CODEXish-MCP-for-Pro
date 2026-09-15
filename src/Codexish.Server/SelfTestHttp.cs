@@ -29,6 +29,9 @@ internal static partial class HttpTests
             await Protocol(http, access, rejected);
             await Control(http, runtime, config);
             await TokenLifecycle(http, runtime, config, access, password);
+            await TunnelOrigin(http, config, password);
+            await Scopes(http, runtime, config, password);
+            await ConcurrentRefresh(http, config, password);
             Configuration(config);
             Check(ServerConfig.NoAuthRefusal(config) is { Length: > 0 },
                 "--no-auth is refused while a public host is allowed");
@@ -41,6 +44,92 @@ internal static partial class HttpTests
 
     // Delta 5: --init derives the Host allowlist from public_url and keeps the documented ChatGPT callback
     // alongside any connector-specific one the user supplies.
+    // A tunnel terminates TLS, so the browser's Origin is https while Kestrel sees an http request. The
+    // login form's own POST must not be rejected as cross-origin.
+    private static async Task TunnelOrigin(HttpClient http, ServerConfig config, string password)
+    {
+        Check(config.AllowOrigins.Contains(config.PublicUrl, StringComparer.OrdinalIgnoreCase),
+            "the public_url origin is allowed automatically so the login form can post to itself");
+        string redirect = config.OAuth.RedirectUris[0];
+        using var request = new HttpRequestMessage(HttpMethod.Post, "/authorize");
+        request.Headers.Host = config.AllowHosts[0];
+        request.Headers.Add("Origin", config.PublicUrl);
+        request.Content = new FormUrlEncodedContent(new Dictionary<string, string>
+        {
+            ["response_type"] = "code", ["client_id"] = config.OAuth.ClientId, ["redirect_uri"] = redirect,
+            ["state"] = "s", ["scope"] = "mcp", ["nonce"] = "stale", ["password"] = password
+        });
+        using var response = await http.SendAsync(request);
+        Check(response.StatusCode != HttpStatusCode.Forbidden,
+            "a login POST arriving through the tunnel with its https Origin is not rejected as cross-origin");
+        Check(ServerConfig.TransportRefusal(config, false) is null,
+            "an https public_url is accepted with authentication enabled");
+        var insecure = SelfTest.BuildConfig(Path.Combine(Path.GetDirectoryName(config.StateDir)!, "insecure"),
+            ServerConfig.NewSecret(12));
+        insecure.PublicUrl = "http://tunnel.example";
+        insecure.Validate();
+        Check(ServerConfig.TransportRefusal(insecure, false) is { Length: > 0 } &&
+              ServerConfig.TransportRefusal(insecure, true) is null,
+            "a plain http public_url is refused with authentication enabled and allowed only with --no-auth");
+    }
+
+    // Only the mcp scope exists; a foreign scope is refused at authorization, not silently downgraded.
+    private static async Task Scopes(HttpClient http, CodexishRuntime runtime, ServerConfig config, string password)
+    {
+        string redirect = config.OAuth.RedirectUris[0];
+        using (var foreign = await http.GetAsync($"/authorize?response_type=code&client_id={Uri.EscapeDataString(config.OAuth.ClientId)}" +
+            $"&redirect_uri={Uri.EscapeDataString(redirect)}&state=s&scope=admin"))
+        {
+            Check(foreign.StatusCode is HttpStatusCode.Redirect or HttpStatusCode.Found, "a foreign scope is reported to the client");
+            var parsed = QueryHelpers.ParseQuery(foreign.Headers.Location!.Query);
+            Check(parsed["error"].ToString() == "invalid_scope" && parsed["iss"].ToString() == config.PublicUrl,
+                "an unsupported scope is refused as invalid_scope with the issuer identifier");
+        }
+        string code = await Authorize(http, config, password, redirect, null);
+        using var exchanged = await http.PostAsync("/token", new FormUrlEncodedContent(new Dictionary<string, string>
+        {
+            ["grant_type"] = "authorization_code", ["code"] = code, ["redirect_uri"] = redirect,
+            ["client_id"] = config.OAuth.ClientId, ["client_secret"] = config.OAuth.ClientSecret
+        }));
+        var body = JsonDocument.Parse(await exchanged.Content.ReadAsStringAsync()).RootElement;
+        string token = body.GetProperty("access_token").GetString()!;
+        Check(body.GetProperty("scope").GetString() == Tokens.Scope &&
+              runtime.Store.Token(Tokens.HashToken(token))!.Scope == Tokens.Scope,
+            "the granted scope is returned and stored on the token row");
+        string scopeless = ServerConfig.NewSecret();
+        runtime.Store.InsertToken(new TokenRow(Tokens.HashToken(scopeless), "access", config.OAuth.ClientId,
+            config.Resource, DateTimeOffset.UtcNow.AddHours(1), false, true, "", ""));
+        Check(await McpStatus(http, scopeless) == HttpStatusCode.Unauthorized,
+            "a token without the mcp scope cannot be used on /mcp");
+    }
+
+    // Two clients presenting the same refresh token must not both walk away with a valid pair.
+    private static async Task ConcurrentRefresh(HttpClient http, ServerConfig config, string password)
+    {
+        string redirect = config.OAuth.RedirectUris[0];
+        string code = await Authorize(http, config, password, redirect, null);
+        string refresh;
+        using (var exchanged = await http.PostAsync("/token", new FormUrlEncodedContent(new Dictionary<string, string>
+        {
+            ["grant_type"] = "authorization_code", ["code"] = code, ["redirect_uri"] = redirect,
+            ["client_id"] = config.OAuth.ClientId, ["client_secret"] = config.OAuth.ClientSecret
+        })))
+            refresh = JsonDocument.Parse(await exchanged.Content.ReadAsStringAsync()).RootElement
+                .GetProperty("refresh_token").GetString()!;
+
+        Dictionary<string, string> Body() => new()
+        {
+            ["grant_type"] = "refresh_token", ["refresh_token"] = refresh,
+            ["client_id"] = config.OAuth.ClientId, ["client_secret"] = config.OAuth.ClientSecret
+        };
+        var first = http.PostAsync("/token", new FormUrlEncodedContent(Body()));
+        var second = http.PostAsync("/token", new FormUrlEncodedContent(Body()));
+        var responses = await Task.WhenAll(first, second);
+        int accepted = responses.Count(r => r.StatusCode == HttpStatusCode.OK);
+        foreach (var response in responses) response.Dispose();
+        Check(accepted == 1, $"exactly one of two concurrent refreshes is accepted (accepted {accepted})");
+    }
+
     private static void Configuration(ServerConfig existing)
     {
         string temp = Path.Combine(Path.GetDirectoryName(existing.StateDir)!, "init-check");
@@ -136,6 +225,9 @@ internal static partial class HttpTests
             code = parsed["code"].ToString();
             Check(location.GetLeftPart(UriPartial.Path) == redirect && parsed["state"].ToString() == "xyz123" && code.Length > 20,
                 "the redirect carries a single-use code and the original state");
+            // RFC 9207
+            Check(parsed["iss"].ToString() == config.PublicUrl,
+                "the authorization response carries the issuer identifier");
         }
 
         Dictionary<string, string> Exchange(string theCode, string theVerifier, string? secret = null) => new()
@@ -325,9 +417,9 @@ internal static partial class HttpTests
             "the queued write completes by itself after resume");
         Check(Status(tools.OperationInspect("pause-1")) == "succeeded", "the held operation keeps its original id and result");
 
-        if (OperatingSystem.IsWindows())
+        if (Shells.Preferred is { } shell)
         {
-            var child = await tools.ShellRun("proj", "control-child", command: "ping -n 30 127.0.0.1 >nul", shell: "cmd",
+            var child = await tools.ShellRun("proj", "control-child", command: Shells.Sleep(shell, 30), shell: shell,
                 wait_ms: 300, lifetime: "session");
             int pid = Data(child).GetProperty("pid").GetInt32();
             using var request = new HttpRequestMessage(HttpMethod.Post, "/control/kill-children");
@@ -338,23 +430,23 @@ internal static partial class HttpTests
             bool gone = false;
             for (int attempt = 0; attempt < 30 && !gone; attempt++)
             {
-                try { using var process = System.Diagnostics.Process.GetProcessById(pid); gone = process.HasExited; }
-                catch (ArgumentException) { gone = true; }
+                gone = !ProcessTests.Alive(pid);
                 if (!gone) await Task.Delay(100);
             }
             Check(gone, "kill-children actually ended the running session child");
         }
+        else Skip("kill-children check: no interpreter is available to start a session child");
     }
 
     private static async Task TokenLifecycle(HttpClient http, CodexishRuntime runtime, ServerConfig config, string access, string password)
     {
         string expired = ServerConfig.NewSecret();
         runtime.Store.InsertToken(new TokenRow(Tokens.HashToken(expired), "access", config.OAuth.ClientId,
-            config.Resource, DateTimeOffset.UtcNow.AddMinutes(-5), false, true));
+            config.Resource, DateTimeOffset.UtcNow.AddMinutes(-5), false, true, "", Tokens.Scope));
         Check(await McpStatus(http, expired) == HttpStatusCode.Unauthorized, "an expired access token is refused");
         string foreign = ServerConfig.NewSecret();
         runtime.Store.InsertToken(new TokenRow(Tokens.HashToken(foreign), "access", config.OAuth.ClientId,
-            "https://elsewhere.invalid/mcp", DateTimeOffset.UtcNow.AddHours(1), false, true));
+            "https://elsewhere.invalid/mcp", DateTimeOffset.UtcNow.AddHours(1), false, true, "", Tokens.Scope));
         Check(await McpStatus(http, foreign) == HttpStatusCode.Unauthorized, "a token minted for another resource is refused");
         Check(await McpStatus(http, ServerConfig.NewSecret()) == HttpStatusCode.Unauthorized, "an invented token is refused");
 
@@ -392,11 +484,45 @@ internal static partial class HttpTests
             Check(response.StatusCode == HttpStatusCode.OK, "a refresh token exchanges for a new access token");
             rotated = JsonDocument.Parse(await response.Content.ReadAsStringAsync()).RootElement.Clone();
         }
+        string rotatedAccess = rotated.GetProperty("access_token").GetString()!;
+        string rotatedRefresh = rotated.GetProperty("refresh_token").GetString()!;
+        Check(await McpStatus(http, rotatedAccess) == HttpStatusCode.OK, "the rotated access token works on /mcp");
+        string family = runtime.Store.Token(Tokens.HashToken(rotatedAccess))!.Family;
+        Check(family.Length > 0 && family == runtime.Store.Token(Tokens.HashToken(rotatedRefresh))!.Family,
+            "a rotated pair stays in the family of the authorization that created it");
+
+        // Replaying a refresh token that was already rotated away is treated as theft of the whole family.
         using (var replay = await http.PostAsync("/token", new FormUrlEncodedContent(Refresh(refresh))))
             Check(JsonDocument.Parse(await replay.Content.ReadAsStringAsync()).RootElement.GetProperty("error").GetString() == "invalid_grant",
                 "refresh rotation revokes the presented refresh token");
-        string rotatedAccess = rotated.GetProperty("access_token").GetString()!;
-        Check(await McpStatus(http, rotatedAccess) == HttpStatusCode.OK, "the rotated access token works on /mcp");
+        Check(await McpStatus(http, rotatedAccess) == HttpStatusCode.Unauthorized,
+            "replaying a rotated refresh token revokes every token of that family, including the current access token");
+        using (var afterFamily = await http.PostAsync("/token", new FormUrlEncodedContent(Refresh(rotatedRefresh))))
+            Check(JsonDocument.Parse(await afterFamily.Content.ReadAsStringAsync()).RootElement.GetProperty("error").GetString() == "invalid_grant",
+                "the rotated refresh token of a revoked family is refused as well");
+        var revocations = runtime.Store.Events("token_family_revoked");
+        Check(revocations.Count >= 1 &&
+              JsonDocument.Parse(revocations[0].Json!).RootElement.GetProperty("revoked").GetInt32() >= 2,
+            "the family revocation is recorded in the events table and took more than one token with it");
+        Check(JsonDocument.Parse(revocations[^1].Json!).RootElement.GetProperty("revoked").GetInt32() == 0,
+            "replaying again after the family is already revoked takes no further tokens");
+
+        // A fresh authorization still works after the compromised family was revoked.
+        string freshVerifier = ServerConfig.NewSecret(48);
+        string freshChallenge = ServerConfig.Base64Url(SHA256.HashData(Encoding.UTF8.GetBytes(freshVerifier)));
+        string freshCode = await Authorize(http, config, password, redirect, freshChallenge);
+        using (var reissued = await http.PostAsync("/token", new FormUrlEncodedContent(new Dictionary<string, string>
+        {
+            ["grant_type"] = "authorization_code", ["code"] = freshCode, ["redirect_uri"] = redirect,
+            ["client_id"] = config.OAuth.ClientId, ["client_secret"] = config.OAuth.ClientSecret, ["code_verifier"] = freshVerifier
+        })))
+        {
+            var body = JsonDocument.Parse(await reissued.Content.ReadAsStringAsync()).RootElement;
+            rotatedAccess = body.GetProperty("access_token").GetString()!;
+            Check(reissued.StatusCode == HttpStatusCode.OK &&
+                  runtime.Store.Token(Tokens.HashToken(rotatedAccess))!.Family != family,
+                "a new sign-in after a family revocation issues a token in a new family");
+        }
 
         using (var request = new HttpRequestMessage(HttpMethod.Post, "/control/revoke-tokens"))
         {

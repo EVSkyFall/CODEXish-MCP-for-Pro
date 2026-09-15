@@ -281,7 +281,12 @@ public sealed class FileService(Workspace workspace, Artifacts artifacts, Store 
                 if (child is DirectoryInfo)
                 {
                     found.Add(new Entry(childPath, "directory", null, child.LastWriteTimeUtc));
-                    if (level < depth) Recurse(child.FullName, childPath, level + 1);
+                    if (level >= depth) continue;
+                    // Re-read immediately before descending: the entry may have been replaced by a link
+                    // between the enumeration and this step.
+                    child.Refresh();
+                    if ((child.Attributes & FileAttributes.ReparsePoint) != 0) continue;
+                    Recurse(child.FullName, childPath, level + 1);
                 }
                 else if (child is FileInfo file)
                     found.Add(new Entry(childPath, "file", file.Length, file.LastWriteTimeUtc));

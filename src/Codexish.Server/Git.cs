@@ -41,8 +41,49 @@ public sealed partial class GitService(ServerConfig config, Workspace workspace,
         "-c", "core.pager=cat",
         "-c", "diff.external=",
         "-c", "core.editor=true",
+        // A signature check shells out to gpg, and either maintenance task can start a background process.
+        "-c", "log.showSignature=false",
+        "-c", "maintenance.auto=false",
+        "-c", "gc.auto=0",
         "--no-optional-locks"
     ];
+
+    // --no-lazy-fetch keeps a read of a partial clone from starting a network fetch, which would run the
+    // remote helper and any credential helper. It does not exist in older git (2.40 rejects it), so support is
+    // probed once and the flag is only used where it is understood.
+    private int lazyFetch = -1;
+
+    private async Task<bool> SupportsNoLazyFetch(RootConfig root, CancellationToken token)
+    {
+        if (lazyFetch >= 0) return lazyFetch == 1;
+        var probe = BaseArguments();
+        probe.AddRange(["--no-lazy-fetch", "--version"]);
+        var (exitCode, _, _) = await Run(root, probe, token);
+        lazyFetch = exitCode == 0 ? 1 : 0;
+        store.Event("git_capability", root.Id, new { no_lazy_fetch = lazyFetch == 1 });
+        return lazyFetch == 1;
+    }
+
+    // A clean or process filter declared by .gitattributes also runs during status and diff, so the filters the
+    // repository declares are read by NAME (never by value) and then disabled for the real query. git config
+    // exits 1 when nothing matches, which is not an error here.
+    private async Task<List<string>> Arguments(RootConfig root, CancellationToken token)
+    {
+        var arguments = BaseArguments();
+        if (await SupportsNoLazyFetch(root, token)) arguments.Add("--no-lazy-fetch");
+        var query = BaseArguments();
+        query.AddRange(["config", "--null", "--name-only", "--get-regexp", @"^filter\..*\.(clean|process|required)$"]);
+        var (exitCode, stdout, _) = await Run(root, query, token);
+        if (exitCode is not (0 or 1)) return arguments;
+        foreach (string name in stdout.Split('\0', StringSplitOptions.RemoveEmptyEntries))
+        {
+            string key = name.Trim();
+            if (key.Length == 0 || key.Contains('=') || key.Any(char.IsControl)) continue;
+            arguments.Add("-c");
+            arguments.Add(key + (key.EndsWith(".required", StringComparison.OrdinalIgnoreCase) ? "=false" : "="));
+        }
+        return arguments;
+    }
 
     private async Task<(int ExitCode, string Stdout, string Stderr)> Run(RootConfig root, List<string> arguments, CancellationToken token)
     {
@@ -90,7 +131,7 @@ public sealed partial class GitService(ServerConfig config, Workspace workspace,
     public async Task<CallToolResult> Status(string rootId, CancellationToken token)
     {
         var target = workspace.Resolve(rootId, null, Grant.Read);
-        var arguments = BaseArguments();
+        var arguments = await Arguments(target.Root, token);
         arguments.AddRange(["status", "--porcelain=v2", "--branch", "--untracked-files=all"]);
         var (exitCode, stdout, stderr) = await Run(target.Root, arguments, token);
         if (exitCode != 0) return Failed("status", exitCode, stderr);
@@ -176,11 +217,13 @@ public sealed partial class GitService(ServerConfig config, Workspace workspace,
             if (relative.Length == 0)
                 throw new CodexishFault("INVALID_ARGUMENT", "path must name a file or directory inside the root, not the root itself.");
         }
-        var arguments = BaseArguments();
+        // Model-supplied values are validated before any git process starts, including the filter query.
+        string? checkedRef = string.IsNullOrWhiteSpace(reference) ? null : CheckRef(reference);
+        var arguments = await Arguments(target.Root, token);
         arguments.AddRange(["diff", "--no-ext-diff", "--no-textconv"]);
         if (staged) arguments.Add("--cached");
         arguments.Add("--end-of-options");
-        if (!string.IsNullOrWhiteSpace(reference)) arguments.Add(CheckRef(reference));
+        if (checkedRef is not null) arguments.Add(checkedRef);
         arguments.Add("--");
         if (relative is not null) arguments.Add(relative);
         var (exitCode, stdout, stderr) = await Run(target.Root, arguments, token);
@@ -215,10 +258,11 @@ public sealed partial class GitService(ServerConfig config, Workspace workspace,
         var target = workspace.Resolve(rootId, null, Grant.Read);
         if (maxCount is < 1 or > 1000)
             throw new CodexishFault("INVALID_ARGUMENT", "max_count must be between 1 and 1000; page with an older ref for more.");
-        var arguments = BaseArguments();
-        arguments.AddRange(["log", "--format=%H%x1f%an%x1f%aI%x1f%s", "-n", maxCount.ToString()]);
+        string? checkedRef = string.IsNullOrWhiteSpace(reference) ? null : CheckRef(reference);
+        var arguments = await Arguments(target.Root, token);
+        arguments.AddRange(["log", "--no-show-signature", "--format=%H%x1f%an%x1f%aI%x1f%s", "-n", maxCount.ToString()]);
         arguments.Add("--end-of-options");
-        if (!string.IsNullOrWhiteSpace(reference)) arguments.Add(CheckRef(reference));
+        if (checkedRef is not null) arguments.Add(checkedRef);
         var (exitCode, stdout, stderr) = await Run(target.Root, arguments, token);
         if (exitCode != 0) return Failed("log", exitCode, stderr);
         List<object> commits = [];
@@ -238,8 +282,10 @@ public sealed partial class GitService(ServerConfig config, Workspace workspace,
 
     public const string Execution =
         "The configured git binary ran with core.hooksPath pointing at an empty directory and with " +
-        "core.fsmonitor, core.pager, diff.external, core.editor, --no-ext-diff and --no-textconv fixed, so this " +
-        "read did not execute repository-supplied code. Git writes are not tools; run them through shell_run.";
+        "core.fsmonitor, core.pager, diff.external, core.editor, log.showSignature, maintenance.auto, gc.auto, " +
+        "--no-optional-locks, --no-ext-diff and --no-textconv fixed (plus --no-lazy-fetch where git supports it), and every clean or process " +
+        "filter the repository declares was read by name and disabled, so this read did not execute " +
+        "repository-supplied code. Git writes are not tools; run them through shell_run.";
 
     public bool Available => File.Exists(config.Git.Path) || !Path.IsPathRooted(config.Git.Path);
 }

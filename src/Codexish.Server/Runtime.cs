@@ -30,6 +30,8 @@ public sealed class CodexishRuntime : IDisposable
     {
         Config = config;
         AuthDisabled = authDisabled;
+        // The environment is snapshotted once here so its secret-looking values can be stripped from output.
+        Redaction.RefreshEnvironment();
         Directory.CreateDirectory(config.StateDir);
         HooksDirectory = Path.Combine(config.StateDir, "git-hooks-empty");
         Directory.CreateDirectory(HooksDirectory);

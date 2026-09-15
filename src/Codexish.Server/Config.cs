@@ -93,6 +93,16 @@ public sealed class ServerConfig
                 StateDir.Equals(root.Path, StringComparison.OrdinalIgnoreCase))
                 throw new ArgumentException($"state_dir must lie outside every root; '{root.Id}' overlaps {StateDir}.");
         }
+        // Two ids on one directory would give the same files two independent FIFO queues, so overlapping
+        // roots are refused rather than silently serialized apart.
+        for (int outer = 0; outer < Roots.Length; outer++)
+            for (int inner = outer + 1; inner < Roots.Length; inner++)
+            {
+                string a = Roots[outer].Path, b = Roots[inner].Path;
+                if (a.Equals(b, StringComparison.OrdinalIgnoreCase) || Contains(a, b) || Contains(b, a))
+                    throw new ArgumentException(
+                        $"Roots '{Roots[outer].Id}' and '{Roots[inner].Id}' are the same directory or nested; give one root per directory tree.");
+            }
         if (Shell.Allowed.Length == 0) throw new ArgumentException("shell.allowed must list at least one interpreter.");
         foreach (string name in Shell.Allowed)
             if (name is not ("pwsh" or "cmd")) throw new ArgumentException($"shell.allowed supports pwsh and cmd only; found '{name}'.");
@@ -103,6 +113,10 @@ public sealed class ServerConfig
             if (!Uri.TryCreate(PublicUrl, UriKind.Absolute, out var url) || url.Scheme is not ("http" or "https"))
                 throw new ArgumentException("public_url must be an absolute http(s) URL.");
             PublicUrl = url.GetLeftPart(UriPartial.Authority);
+            // The tunnel terminates TLS, so the browser sends Origin: https://<host> while Kestrel sees
+            // scheme http. Without this the login form's own POST would be rejected as cross-origin.
+            if (!AllowOrigins.Contains(PublicUrl, StringComparer.OrdinalIgnoreCase))
+                AllowOrigins = [.. AllowOrigins, PublicUrl];
         }
         foreach (string redirect in OAuth.RedirectUris)
             if (!Uri.TryCreate(redirect, UriKind.Absolute, out var uri) || uri.Scheme is not ("http" or "https") || uri.Fragment.Length != 0)
@@ -111,6 +125,13 @@ public sealed class ServerConfig
 
     // D12: --no-auth is only for a pure loopback configuration. ProbeAccessPolicy always allows loopback hosts,
     // so an empty allow_hosts list really does mean nothing but 127.0.0.1 and localhost can reach the server.
+    // A bearer token must not travel over plain http; only a loopback development run may use one.
+    public static string? TransportRefusal(ServerConfig config, bool noAuth) =>
+        noAuth || config.PublicUrl.Length == 0 || config.PublicUrl.StartsWith("https://", StringComparison.OrdinalIgnoreCase)
+            ? null
+            : $"public_url is {config.PublicUrl}. Authentication requires https, because the access token would " +
+              "otherwise cross the tunnel in clear text. Use an https tunnel URL, or run loopback-only with --no-auth.";
+
     public static string? NoAuthRefusal(ServerConfig config) => config.AllowHosts.Length == 0 ? null :
         "--no-auth is accepted only for pure loopback development. This configuration allows the public host(s) " +
         string.Join(", ", config.AllowHosts) + "; remove them from allow_hosts or start without --no-auth.";

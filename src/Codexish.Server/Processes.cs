@@ -22,6 +22,10 @@ public sealed class ManagedProcess
     public volatile string State = "running";
     public int? ExitCode { get; set; }
     public bool StdinClosed { get; set; }
+    // A process adopted from a previous run of this server: its streams belong to nobody and its exit code
+    // cannot be read, but it can still be inspected and stopped.
+    public bool Reattached { get; init; }
+    public string Supervision { get; set; } = "job_object";
 }
 
 // D7. One supervisor for shell_run and process_start. wait_ms only bounds the response; nothing here kills a
@@ -30,6 +34,9 @@ public sealed class ProcessSupervisor(Store store, Artifacts artifacts, ServerCo
 {
     private readonly ConcurrentDictionary<string, ManagedProcess> processes = new(StringComparer.Ordinal);
     private bool disposed;
+
+    // Self-test switch that forces the no-job path so the fallback is exercised on Windows too.
+    public static bool DisableJobObjects { get; set; }
 
     public IReadOnlyCollection<ManagedProcess> Live => processes.Values.ToArray();
 
@@ -94,11 +101,17 @@ public sealed class ProcessSupervisor(Store store, Artifacts artifacts, ServerCo
         // The job is assigned immediately after Start. A grandchild spawned inside this very short window
         // could escape supervision; that race is not closed here (CREATE_SUSPENDED would be needed).
         nint job = 0;
-        if (lifetime == "session")
+        string supervision = lifetime == "session" ? "process_tree_fallback" : "not_supervised_persistent";
+        if (lifetime == "session" && !DisableJobObjects)
         {
             job = Native.CreateKillOnCloseJob();
             if (job != 0 && !Native.AssignProcess(job, process.Handle)) { Native.CloseJob(job); job = 0; }
+            if (job != 0) supervision = "job_object";
         }
+        // A job that could not be created is reported, never a reason to refuse the user's command: the child
+        // keeps running and its tree is ended with Process.Kill(entireProcessTree) instead.
+        if (lifetime == "session" && job == 0)
+            store.Event("job_object_unavailable", null, new { supervision, platform = Environment.OSVersion.Platform.ToString() });
         long startTime;
         try { startTime = process.StartTime.ToUniversalTime().Ticks; }
         catch (Exception) { startTime = DateTime.UtcNow.Ticks; }
@@ -117,7 +130,8 @@ public sealed class ProcessSupervisor(Store store, Artifacts artifacts, ServerCo
             StderrArtifact = stderr.Id,
             Display = display,
             StartedUtc = DateTimeOffset.UtcNow,
-            JobHandle = job
+            JobHandle = job,
+            Supervision = supervision
         };
         processes[managed.ProcessId] = managed;
         Persist(managed);
@@ -187,25 +201,34 @@ public sealed class ProcessSupervisor(Store store, Artifacts artifacts, ServerCo
     // A PID alone is not an identity: a stable handle is the GUID bound to PID and process start time.
     public static bool SameProcess(ProcessRow row, int pid, long startTime) => row.Pid == pid && row.StartTime == startTime;
 
-    public static string Cursor(long stdout, long stderr) =>
-        ServerConfig.Base64Url(Encoding.UTF8.GetBytes($"p1.{stdout}.{stderr}"));
+    // The cursor carries a tag derived from the process id, so a cursor from one process cannot be replayed
+    // against another process's streams.
+    private static string Tag(string processId) => Convert.ToHexString(
+        System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(processId))).ToLowerInvariant()[..8];
 
-    public static (long Stdout, long Stderr) ParseCursor(string cursor)
+    public static string Cursor(string processId, long stdout, long stderr) =>
+        ServerConfig.Base64Url(Encoding.UTF8.GetBytes($"p1.{Tag(processId)}.{stdout}.{stderr}"));
+
+    public static (long Stdout, long Stderr) ParseCursor(string processId, string cursor)
     {
         string padded = cursor.Replace('-', '+').Replace('_', '/');
         padded += new string('=', (4 - padded.Length % 4) % 4);
         string[] parts;
         try { parts = Encoding.UTF8.GetString(Convert.FromBase64String(padded)).Split('.'); }
         catch (FormatException) { throw new CodexishFault("CURSOR_INVALID", "The cursor is not a cursor issued by this server."); }
-        if (parts.Length != 3 || parts[0] != "p1" || !long.TryParse(parts[1], out long stdout) || !long.TryParse(parts[2], out long stderr))
+        if (parts.Length != 4 || parts[0] != "p1" || !long.TryParse(parts[2], out long stdout) || !long.TryParse(parts[3], out long stderr))
             throw new CodexishFault("CURSOR_INVALID", "The cursor is not a process cursor issued by this server.");
+        if (!string.Equals(parts[1], Tag(processId), StringComparison.Ordinal))
+            throw new CodexishFault("CURSOR_INVALID",
+                "This cursor was issued for a different process; poll that process, or start again without a cursor.");
         return (stdout, stderr);
     }
 
     public async Task<CallToolResult> Poll(string processId, string? cursor, int waitMs, CancellationToken token)
     {
         var managed = Lookup(processId);
-        var (stdoutAt, stderrAt) = cursor is { Length: > 0 } ? ParseCursor(cursor) : (0L, 0L);
+        Refresh(managed);
+        var (stdoutAt, stderrAt) = cursor is { Length: > 0 } ? ParseCursor(processId, cursor) : (0L, 0L);
         long stdoutLength = artifacts.Length(managed.StdoutArtifact), stderrLength = artifacts.Length(managed.StderrArtifact);
         if (stdoutAt > stdoutLength || stderrAt > stderrLength)
             throw new CodexishFault("CURSOR_INVALID",
@@ -234,6 +257,9 @@ public sealed class ProcessSupervisor(Store store, Artifacts artifacts, ServerCo
             running = managed.State == "running",
             exit_code = managed.ExitCode,
             lifetime = managed.Lifetime,
+            supervision = managed.Supervision,
+            reattached = managed.Reattached,
+            output_since_restart = managed.Reattached ? "not_captured" : null,
             stdout = outText,
             stderr = errText,
             stdout_bytes = outBytes.Length,
@@ -247,12 +273,17 @@ public sealed class ProcessSupervisor(Store store, Artifacts artifacts, ServerCo
             stream_order = "bytes are preserved in order within each stream; the two streams are not interleaved",
             limits_source = Limits.Source,
             next_tool = managed.State == "running" ? "process_poll with next_cursor" : "artifact_read for the full output"
-        }, new { text = outText, next_cursor = Cursor(nextOut, nextErr), complete = drained && managed.State != "running", artifact_id = managed.StdoutArtifact });
+        }, new { text = outText, next_cursor = Cursor(managed.ProcessId, nextOut, nextErr),
+            complete = drained && managed.State != "running", artifact_id = managed.StdoutArtifact });
     }
 
     public CallToolResult WriteStdin(string processId, string text)
     {
         var managed = Lookup(processId);
+        if (managed.Reattached)
+            throw new CodexishFault("UNSUPPORTED_CAPABILITY",
+                $"Process '{processId}' was adopted after a server restart, so its stdin belongs to nobody. " +
+                "It can still be polled and stopped.");
         if (managed.State != "running")
             throw new CodexishFault("PROCESS_EXITED", $"Process '{processId}' has exited; read its output with artifact_read.");
         if (managed.StdinClosed)
@@ -272,6 +303,7 @@ public sealed class ProcessSupervisor(Store store, Artifacts artifacts, ServerCo
     public async Task<CallToolResult> Stop(string processId, string mode)
     {
         var managed = Lookup(processId);
+        Refresh(managed);
         if (mode is not ("graceful" or "kill_tree"))
             throw new CodexishFault("INVALID_ARGUMENT", "mode must be graceful or kill_tree.");
         if (managed.State != "running")
@@ -279,7 +311,17 @@ public sealed class ProcessSupervisor(Store store, Artifacts artifacts, ServerCo
                 stopped = false, reason = "already_exited" });
         if (mode == "graceful")
         {
-            try { managed.Process.StandardInput.Close(); managed.StdinClosed = true; } catch (IOException) { }
+            if (managed.Reattached)
+                return Reply.Ok(new
+                {
+                    process_id = processId, mode, state = managed.State, stopped = false,
+                    reason = "reattached_after_restart",
+                    note = "This process was adopted after a server restart, so there is no stdin to close. Use kill_tree.",
+                    next_tool = "process_stop with mode=kill_tree"
+                });
+            try { managed.Process.StandardInput.Close(); managed.StdinClosed = true; }
+            catch (IOException) { }
+            catch (InvalidOperationException) { }
             store.Event("process_stop", processId, new { mode });
             await Task.WhenAny(managed.Collection ?? Task.CompletedTask, Task.Delay(500));
             return Reply.Ok(new
@@ -290,6 +332,8 @@ public sealed class ProcessSupervisor(Store store, Artifacts artifacts, ServerCo
                 next_tool = "process_poll"
             });
         }
+        // The job object is the Windows mechanism; elsewhere, and for persistent children that never get a
+        // job, the runtime's own process-tree termination is used and the result says which one ran.
         bool viaJob = Native.TerminateJob(managed.JobHandle);
         if (!viaJob)
         {
@@ -315,6 +359,8 @@ public sealed class ProcessSupervisor(Store store, Artifacts artifacts, ServerCo
         state = managed.State,
         exit_code = managed.ExitCode,
         lifetime = managed.Lifetime,
+        supervision = managed.Supervision,
+        reattached = managed.Reattached,
         root_id = managed.RootId,
         started_utc = managed.StartedUtc,
         command = managed.Display,
@@ -329,7 +375,7 @@ public sealed class ProcessSupervisor(Store store, Artifacts artifacts, ServerCo
         List<object> recovered = [];
         foreach (var row in store.Processes("running"))
         {
-            if (row.Lifetime == "persistent" && Alive(row.Pid, row.StartTime))
+            if (row.Lifetime == "persistent" && Alive(row.Pid, row.StartTime) && Reattach(row))
             {
                 store.UpsertProcess(row with { State = "running" });
                 recovered.Add(new { process_id = row.ProcessId, pid = row.Pid, state = "running", reattached = true,
@@ -342,6 +388,42 @@ public sealed class ProcessSupervisor(Store store, Artifacts artifacts, ServerCo
         }
         if (recovered.Count > 0) store.Event("process_recovery", null, new { processes = recovered });
         return recovered;
+    }
+
+    // The adopted process object is not a child of this server: its streams are gone and its exit code is not
+    // readable, so the entry reports what can still be observed and refuses what cannot.
+    private bool Reattach(ProcessRow row)
+    {
+        try
+        {
+            var process = System.Diagnostics.Process.GetProcessById(row.Pid);
+            processes[row.ProcessId] = new ManagedProcess
+            {
+                ProcessId = row.ProcessId,
+                Process = process,
+                Pid = row.Pid,
+                StartTime = row.StartTime,
+                Lifetime = row.Lifetime,
+                RootId = row.RootId,
+                StdoutArtifact = row.StdoutArtifact ?? "",
+                StderrArtifact = row.StderrArtifact ?? "",
+                Display = "(re-attached after a server restart)",
+                StartedUtc = new DateTimeOffset(new DateTime(row.StartTime, DateTimeKind.Utc)),
+                Reattached = true,
+                Supervision = "process_tree_fallback"
+            };
+            return true;
+        }
+        catch (Exception) { return false; }
+    }
+
+    // A re-attached process has no collection task to update its state, so liveness is re-read on demand.
+    private void Refresh(ManagedProcess managed)
+    {
+        if (!managed.Reattached || managed.State != "running") return;
+        if (Alive(managed.Pid, managed.StartTime)) return;
+        managed.State = "exited_unknown_code";
+        Persist(managed);
     }
 
     private static bool Alive(int pid, long startTime)
@@ -374,9 +456,15 @@ public sealed class ProcessSupervisor(Store store, Artifacts artifacts, ServerCo
         disposed = true;
         foreach (var managed in processes.Values)
         {
-            // Closing the job handle ends lifetime=session trees. Persistent children never get a job and
-            // keep running by design.
-            Native.CloseJob(managed.JobHandle);
+            // Closing the job handle ends a lifetime=session tree on Windows. Where no job exists (Linux, or a
+            // job that could not be created) the same contract is kept by terminating the tree directly.
+            // Persistent children never get a job and keep running by design.
+            if (managed.Lifetime == "session")
+            {
+                if (managed.JobHandle != 0) Native.CloseJob(managed.JobHandle);
+                else if (managed.State == "running")
+                    try { managed.Process.Kill(entireProcessTree: true); } catch (Exception) { }
+            }
             try { managed.Process.Dispose(); } catch (Exception) { }
         }
     }
