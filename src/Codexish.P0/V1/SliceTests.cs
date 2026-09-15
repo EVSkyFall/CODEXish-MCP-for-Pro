@@ -188,13 +188,19 @@ public static class SliceTests
         release.SetResult(true); await first;
         for (int i = 0; i < 2; i++) await r.Operations.Invoke("test", "fifo" + (i + 2), "fifo", new { n = i + 2 }, ["fifo"], _ => throw new InvalidOperationException("replay"), 10000);
         Check(order.SequenceEqual([1, 2, 3]), "FIFO execution follows acceptance order");
+        var alias = r.Config.Roots[0] with { Id = "alias" }; r.Config.Roots = r.Config.Roots.Append(alias).ToArray();
+        string aliasPath = Path.Combine(alias.Path, "alias.txt");
+        var a = t.Write("work", "alias.txt", "first", "alias-create", mode: "create");
+        var b = t.Write("alias", "alias.txt", "second", "alias-replace", ProbeRuntime.Hash(Encoding.UTF8.GetBytes("first")));
+        await Task.WhenAll(a, b);
+        Check(Error(await b) is null && File.ReadAllText(aliasPath) == "second", "root aliases share acceptance-order FIFO");
         r.Operations.Pause(true);
         var paused = await t.Write("work", "paused.txt", "x", "paused-id", mode: "create");
         Check(VReply.Status(paused) == "paused" && paused.IsError == false && !File.Exists(Path.Combine(r.Config.Roots[0].Path, "paused.txt")), "pause returns normal PAUSED without accepting mutation");
         r.Operations.Pause(false);
         Check(Error(await t.Write("work", "paused.txt", "x", "paused-id", mode: "create")) is null, "same unaccepted paused request executes after resume");
         var held = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-        Task<CallToolResult> blocker = r.Operations.Invoke("test", "context-block", "block", new { }, ["root:work"], ct => held.Task.WaitAsync(ct).ContinueWith(_ => VReply.Ok(new { })), 10000);
+        Task<CallToolResult> blocker = r.Operations.Invoke("test", "context-block", "block", new { }, ["path:" + (OperatingSystem.IsWindows() ? r.Config.Roots[0].Path.ToUpperInvariant() : r.Config.Roots[0].Path)], ct => held.Task.WaitAsync(ct).ContinueWith(_ => VReply.Ok(new { })), 10000);
         var pending = t.Write("work", "captured-session.txt", "ok", "capture-session", mode: "create");
         context.HttpContext = null; held.SetResult(true); await blocker;
         Check(Error(await pending) is null && File.Exists(Path.Combine(r.Config.Roots[0].Path, "captured-session.txt")), "queued tool captures authenticated session before HTTP context ends");
@@ -254,12 +260,16 @@ public static class SliceTests
         await Exec(git, ["config", "core.fsmonitor", hook], root);
         await Exec(git, ["config", "core.pager", hookCommand], root);
         await Exec(git, ["config", "core.hooksPath", root], root);
+        await Exec(git, ["config", "filter.fixture.clean", hookCommand], root);
+        await Exec(git, ["config", "filter.fixture.process", hookCommand], root);
+        await Exec(git, ["config", "filter.fixture.required", "true"], root);
         File.WriteAllText(Path.Combine(root, ".gitattributes"), "tracked.txt diff=fixture\n");
         File.WriteAllText(Path.Combine(root, "tracked.txt"), "after\n");
         File.WriteAllText(Path.Combine(root, "untracked.txt"), "new\n");
         // Demonstrate that the malicious fixture would run without the disabled textconv path.
         await Exec(git, ["-c", "core.fsmonitor=false", "-c", "diff.external=", "diff", "--textconv", "--no-ext-diff", "--", "tracked.txt"], root);
         Check(File.Exists(marker), "malicious textconv fixture positive control actually executes"); File.Delete(marker);
+        File.WriteAllText(Path.Combine(root, ".gitattributes"), "tracked.txt diff=fixture filter=fixture\n");
         r.Config.Roots = [r.Config.Roots[0] with { Shell = false }];
         var status = await r.Git("git", "work", "", "status");
         var diff = await r.Git("git", "work", "", "diff");
@@ -267,7 +277,7 @@ public static class SliceTests
         Check(D(status).GetProperty("exit_code").GetInt32() == 0 && D(status).GetProperty("stdout").GetProperty("text").GetString()!.Contains("untracked.txt"), "git.status includes untracked paths without shell grant");
         Check(D(diff).GetProperty("exit_code").GetInt32() == 0 && D(diff).GetProperty("stdout").GetProperty("text").GetString()!.Contains("+after"), "git.diff returns tracked real diff with textconv disabled");
         Check(D(log).GetProperty("exit_code").GetInt32() == 0 && D(log).GetProperty("stdout").GetProperty("text").GetString()!.Contains("fixture"), "git.log fixed format returns actual commit");
-        Check(!File.Exists(marker), "read-only Git queries do not execute configured hook/fsmonitor/textconv/pager/external diff fixture");
+        Check(!File.Exists(marker), "read-only Git queries do not execute configured hook/fsmonitor/textconv/pager/external diff/clean/process filter fixture");
     }
     private static async Task Exec(string exe, string[] args, string cwd)
     {

@@ -50,8 +50,18 @@ public sealed class Runtime : IDisposable
     {
         Files.Grant(rootId); if (Config.GitExecutable.Length == 0) return VReply.Error("UNSUPPORTED_CAPABILITY", "Set git_executable to a fixed absolute path.");
         if (count < 1) return VReply.Error("INVALID_ARGUMENT", "log count must be positive.");
-        List<string> args = ["--no-pager", "--no-optional-locks", "-c", "core.hooksPath=" + (OperatingSystem.IsWindows() ? "NUL" : "/dev/null"),
+        List<string> args = ["--no-pager", "--no-optional-locks", "--no-lazy-fetch", "-c", "core.hooksPath=" + (OperatingSystem.IsWindows() ? "NUL" : "/dev/null"),
             "-c", "core.fsmonitor=false", "-c", "core.pager=cat", "-c", "diff.external=", "-c", "log.showSignature=false", "-c", "maintenance.auto=false", "-c", "gc.auto=0"];
+        // clean/process filters can also run during status/diff. Read NAMES only, never config values.
+        var filterQuery = await Processes.Run(session, rootId, cwd, Config.GitExecutable,
+            args.Concat(["config", "--null", "--name-only", "--get-regexp", "^filter\\..*\\.(clean|process|required)$"]).ToArray(), CancellationToken.None, true);
+        if (VReply.Data(filterQuery).GetProperty("exit_code").GetInt32() is not (0 or 1)) return filterQuery;
+        string artifact = VReply.Data(filterQuery).GetProperty("process").GetProperty("stdout_artifact").GetString()!;
+        using (var names = new FileStream(Artifacts.Locate(session, artifact).path, FileMode.Open, FileAccess.Read, FileShare.Read))
+            foreach (string key in Encoding.UTF8.GetString(FileFence.Bytes(names)).Split('\0', StringSplitOptions.RemoveEmptyEntries))
+            {
+                args.Add("-c"); args.Add(key + (key.EndsWith(".required", StringComparison.OrdinalIgnoreCase) ? "=false" : "="));
+            }
         if (command == "status") args.AddRange(["status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=all"]);
         else if (command == "diff") { args.AddRange(["diff", "--no-textconv", "--no-ext-diff", "--ignore-submodules=all"]); if (staged) args.Add("--cached"); }
         else if (command == "log") args.AddRange(["log", "--no-show-signature", "--no-textconv", "--no-ext-diff", "-n", count.ToString(System.Globalization.CultureInfo.InvariantCulture), "--format=%H%x09%an%x09%s"]);

@@ -13,7 +13,15 @@ public sealed class Tools(Runtime runtime, IHttpContextAccessor context)
     {
         // Capture the principal before HTTP completion; queued work must not access HttpContext later.
         string session = Session;
-        return runtime.Operations.Invoke(session, id, name, args, [resource], ct => effect(session, ct), wait, recovery);
+        return runtime.Operations.Invoke(session, id, name, args, Resources(resource), ct => effect(session, ct), wait, recovery);
+    }
+    private string[] Resources(string resource)
+    {
+        if (!resource.StartsWith("root:", StringComparison.Ordinal)) return [resource];
+        var root = runtime.Config.Roots.SingleOrDefault(r => r.Id == resource[5..]);
+        if (root is null) return [resource]; // The adapter reports unknown-root before effects.
+        return runtime.Config.Roots.Where(r => FileFence.Within(r.Path, root.Path) || FileFence.Within(root.Path, r.Path))
+            .Select(r => "path:" + (OperatingSystem.IsWindows() ? r.Path.ToUpperInvariant() : r.Path)).Distinct().ToArray();
     }
     [McpServerTool(Name = "host.capabilities", ReadOnly = true)]
     [Description("Start here. Lists real tools, root grants, session ID, execution boundary, unsupported functions and last checkpoint. Use workspace.info and fs.read next.")]
@@ -97,7 +105,7 @@ public sealed class Tools(Runtime runtime, IHttpContextAccessor context)
     [Description("Request cancellation of this session's operation. Available while paused. Started effects are not rolled back. Inspect the original operation until terminal; use process.stop for a process whose start operation already completed.")]
     public Task<CallToolResult> Cancel(string operation_id, string invocation_id) =>
         Change(invocation_id, "operation.cancel", new { operation_id }, "cancel:" + operation_id,
-            (s, _) => Task.FromResult(runtime.Operations.Cancel(s, operation_id)), recovery: true);
+            (s, _) => Task.FromResult(VReply.Ok(new { cancellation_requested = true, operation_id, target = runtime.Operations.Cancel(s, operation_id).StructuredContent })), recovery: true);
     [McpServerTool(Name = "session.checkpoint", ReadOnly = false, Destructive = false)]
     [Description("Persist goal, completion condition, remaining steps and handles for resume; no permission changes. host.capabilities returns the last checkpoint. Use observed facts only, not hidden reasoning or a claim of completed work.")]
     public Task<CallToolResult> Checkpoint(string goal, string completion_condition, string[] remaining_steps, string[] handles, string invocation_id) =>

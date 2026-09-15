@@ -171,6 +171,7 @@ public sealed class Files(ServerConfig config, Store store, Artifacts artifacts)
     {
         if (startLine < 1 || lineCount is <= 0 or > 200) throw new ProbeFault("INVALID_ARGUMENT", "Line pages use start_line >= 1 and line_count 1..200.");
         using var f = FileFence.Open(Grant(rootId), path); byte[] bytes = FileFence.Bytes(f);
+        store.Event(session, "fs.read", new { root_id = rootId, path, bytes = bytes.Length });
         try
         {
             var d = ProbeRuntime.Decode(bytes); string redacted = Redaction.Text(d.text); var lines = redacted.Split('\n');
