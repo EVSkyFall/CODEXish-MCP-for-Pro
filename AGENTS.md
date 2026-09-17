@@ -1,15 +1,19 @@
 # CODEXish development
 
-Read README.md, IMPLEMENTATION_STATUS.md and docs/review-response.md first.
+Read IMPLEMENTATION_STATUS.md, docs/continuation-20260917.md, docs/desktop-corrections.md, README.md, docs/v1-design.md and docs/v1-plan.md first.
 
-v1 implementers start from docs/v1-design.md. It is the decision record for src/Codexish.Server and it wins over the older v0.1 documents wherever they disagree about v1 code; docs/v1-plan.md gives the slice order. Slice 1, the coding core with 21 underscore-named tools, is implemented. Do not add a computer_*, browser or LSP tool to it, do not add Git write tools (Git writes go through shell_run under the root's shell grant), and do not introduce confirmation prompts, rate or time caps, or BUSY/ALREADY_RUNNING rejections: contention is expressed as queued or running with a handle, and the only limits are protocol frame and page sizes reported with their source. src/Codexish.P0 stays unchanged until M-1 through M-8 are recorded.
+## Current user decision
 
-The design review of 8cecfc7 remains CHANGES_REQUESTED for full v1 until M-1–M-8. The newer verification §6a accepts F-1/F-2 after reviewer-reported Windows build and 96/96 tests. The user supplied the Codex read-only review and Claude triage and asked to proceed. Publish F-1/F-2 plus the triage's L-1 PID-error mapping and H-1/H-2/H-3 measurement procedure changes on PR #2. Record constructor-test coverage separately from the statically reviewed live-exit branch. Keep C-1–C-7 and the triaged persistence/FIFO/partial-key findings for v1. P0 resource exclusion is mutual exclusion, not acceptance-order FIFO; do not call its tests ordered-queue tests.
+Mainline A is PR #4 (`feat/v1-slice1-opus`). PR #4 is Ready for review; PR #3 is closed as a reference with its branch preserved. The user asked for continuous implementation, not a new choice of baseline. Do not merge PRs or delete branches; merge remains the user's action.
 
-Build one C#/.NET 10 application. Chat Pro performs reasoning; this server provides tools, not another model. Do not rebuild the proposed TypeScript Gateway, custom WSS, mTLS enrollment or broker split for v1.
+Desktop continuation is Draft PR #5 (`feat/v1-slice2-desktop`). Current product source is 05ae9e2. S2-01–S2-03 are implemented and covered by 11 passing regressions; older statements that they are unimplemented are historical. Both source CI jobs passed. Broader desktop acceptance is not complete: the latest own-window live run failed when Windows did not confirm focus, before keyboard/mouse delivery. Do not replace that failure with a prior successful run.
 
-Keep request/operation/process lifetimes distinct; reuse invocation IDs on retry; never replay unknown effects; serialize conflicting effects rather than returning BUSY (P0 does not promise FIFO). Observe before and after GUI input. Report actual tests and saved files, not inferred success.
+## Follow-up and blocked writes
 
-Do not confuse a fixed P0 fixture with arbitrary shell execution or a complete coding agent. Source existence is not a successful build. Linux/headless CI is not interactive Windows or Pro Chat evidence. Use README Measurement: another device for ChatGPT, fresh fixture per trial, unsaved Notepad tab with image-only nonce, and a same-tool reference run. Record M-1 through M-8 honestly.
+Browser integration and a separate HTTP-desktop test CLI entry were blocked before execution by tool safety decisions. They were not published or executed through another route. Their unintegrated drafts were preserved outside the temporary repository. Do not claim browser tools, a tray or HTTP desktop acceptance now exist in the product. Record the exact scope of any subsequently allowed work and actual results; never weaken tests or protections just to obtain a pass.
 
-Preserve the original v0.1 documents as historical proposals pending consolidation after measurements. New code follows the P0 review exception and docs/review-response.md. Do not mark the whole design APPROVED or merge without authorization.
+The current code still has 24 underscore-named tools: 21 coding/checkpoint and computer_observe, computer_query_ui, computer_act. P0 remains unchanged. The single C# server, root grants, unconfined_user disclosure, ledger/FIFO and existing control contract remain the mainline decisions. Do not rebuild a Gateway/Agent split, external model, WSS or mTLS layer.
+
+Keep request/operation/process lifetimes distinct. Reuse invocation IDs only for identical retries; inspect uncertain effects without replay. Conflicting mutations queue, reads stay independent. Do not add task time/call caps or repeated action approvals. No credential-store reading, clipboard, elevation, user security-setting changes, or deployment/safeguard script edits.
+
+Tests must identify their environment and source. Default --self-test does not inject desktop input. --self-test-desktop controls only its own newly created fixture process. Preserve failed and stopped runs alongside successful ones. CI/mock/WPF results do not fill the unrecorded Pro/Thinking M-1–M-8 table. New source alone is not a successful build or a completed feature.

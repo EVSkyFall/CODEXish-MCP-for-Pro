@@ -120,9 +120,9 @@ public static class SelfTest
         var capabilities = Data(tools.HostCapabilities());
         Check(capabilities.GetProperty("schema_version").GetString() == "v1.0", "envelope reports schema_version v1.0");
         Check(capabilities.GetProperty("execution_boundary").GetString() == "unconfined_user", "capabilities state the unconfined execution boundary");
-        Check(capabilities.GetProperty("tools").EnumerateArray().Count() == 21, "capabilities list the 21 slice-1 tools");
-        Check(capabilities.GetProperty("unsupported").EnumerateArray().Any(u => u.GetProperty("feature").GetString()!.Contains("computer_observe")),
-            "capabilities name desktop control as unimplemented with a reason");
+        Check(capabilities.GetProperty("tools").EnumerateArray().Count() == 24, "capabilities list 21 coding and 3 desktop tools");
+        Check(capabilities.GetProperty("desktop").GetProperty("native_available").GetBoolean() == OperatingSystem.IsWindows(),
+            "capabilities report the actual desktop platform");
         Check(capabilities.GetProperty("limits").GetProperty("source").GetString()!.Contains("frame budget"),
             "frame and page limits are reported with their source");
         var workspace = Data(tools.WorkspaceInfo());
