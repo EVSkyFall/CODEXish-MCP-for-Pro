@@ -161,7 +161,8 @@ public static class DesktopHttpAcceptance
                 byte[] saved = await File.ReadAllBytesAsync(savedPath);
                 Check(saved.SequenceEqual(Encoding.UTF8.GetBytes(expected)), "HTTP-driven Unicode input saved exactly once with exact UTF-8 bytes");
                 var read = await Call(http, "fs_read", new { root_id = "fixture", path = "fixture/saved.txt" }); Require(read, "fs verification");
-                Check(Data(read).GetProperty("text").GetString() == expected, "HTTP fs_read independently verifies GUI output");
+                // fs_read returns the file text in the envelope's output block, not in data.
+                Check(read.StructuredContent!.Value.GetProperty("output").GetProperty("text").GetString() == expected, "HTTP fs_read independently verifies GUI output");
                 Console.WriteLine($"DESKTOP_HTTP_SAVED bytes={saved.Length} sha256={Convert.ToHexString(SHA256.HashData(saved))}");
                 Check(Directory.GetFiles(fixtureDirectory).Select(Path.GetFileName).Order().SequenceEqual(new[] { "ready.json", "saved.txt" }), "fixture contains only ready record and saved text");
                 Console.WriteLine($"DESKTOP_HTTP_PASSED: {passed}; own WPF window and synthetic OAuth only; not ChatGPT or Notepad Save As.");

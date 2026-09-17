@@ -91,3 +91,16 @@ The browser-mount and HTTP desktop acceptance drafts that were blocked in the ea
 ## Earlier evidence retained
 
 For recovery source `0c2b2e9`, run `35183820986` passed Windows 236+37 and Ubuntu 226+38 assertions. A prior local `resume-live-1` passed six self-owned WPF checks and saved `CODEXish desktop verification - 한글` as 38 UTF-8 bytes, SHA256 `65AE6CAA2D4F4DFBFAE6DD1E858FD5D9FDF028B8DCDD8EBDE3CF3077BE42912A`. That evidence remains historical; the new focus failure is recorded above. Earlier source and procedure records remain in Git history, `docs/desktop-corrections.md`, and [IMPLEMENTATION_STATUS.slice1.md](IMPLEMENTATION_STATUS.slice1.md).
+
+## Live desktop acceptance on the user's Windows 11 desktop (lead, 2026-09-17, commit after 306b68d)
+
+Run at the user's request with the Claude app in the foreground and no game running. Only self-owned WPF fixture windows were driven.
+
+| Run | Result |
+| --- | --- |
+| `--self-test-desktop` | DESKTOP_LIVE_PASSED 8: capture, UIA tab, focus, maximize/restore, semantic lookup, semantic click + Unicode typing, CTRL+S saved 38 UTF-8 bytes (SHA256 65AE6CAA...), focus from minimized, focus from behind another process window |
+| `--self-test-desktop-http` | DESKTOP_HTTP_PASSED 14: synthetic OAuth, authenticated initialize, PNG + window identity over HTTP, cursor replay, native input with post-action image, stored retry result, exactly-once save (34 bytes), fs_read verification |
+
+Observed `focus_window` activation methods: first focus `attach_thread_input` (after `set_foreground` was not confirmed; the pre-fix code would have returned EXECUTION_UNKNOWN here), from minimized `restore` then `already_foreground`, second fixture `already_foreground`, from behind another process `set_foreground`. `alt_tap` was never needed; `activation_inputs_sent` stayed 0.
+
+Two test-harness bugs were fixed before these runs: the first focus now acts on a settled observation instead of the capture taken while the new window was still activating, and the HTTP acceptance reads `fs_read` text from `output.text`. An earlier attempt the same day was stopped because a game was in the foreground; live desktop tests must only run when no other application is in front and the user is idle.
