@@ -1,76 +1,39 @@
 # CODEXish v1 slice plan
 
-v1 is delivered in five slices. Each one ends with a build that has zero warnings, a self-test that passes on
-Windows, and a documented list of what it still does not do. A slice is not started before the previous one is
-green, and no slice is marked done on the strength of source existing.
+Updated 2026-09-17 after user approval of mainline A / PR #4. Follow [current implementation status](../IMPLEMENTATION_STATUS.md) for actual evidence; source existence or CI alone does not establish real ChatGPT completion.
 
-| Slice | Content | State |
+| Slice | Scope | Current state |
 | --- | --- | --- |
-| 1 | Coding core | Implemented; see `docs/v1-design.md` |
-| 2 | `computer_*` desktop control | Not started |
-| 3 | External browser MCP mount | Not started |
-| 4 | Tray application | Not started |
-| 5 | Remaining deferrals | Not started |
+| 1 | Coding core, 21 underscore tools including checkpoint, embedded OAuth and local control | Mainline A, PR #4 Ready for review; not merged |
+| 2 | computer_observe, computer_query_ui, computer_act | Draft PR #5; recovered implementation and tests, open findings S2-01–03 |
+| 3 | Existing browser MCP server mount | Not started |
+| 4 | Tray and installation/lifecycle UX | Not started |
+| 5 | Remaining independent extensions | Deferred |
 
-## Slice 1 — coding core (this slice)
+## Slice 1
 
-The 21 tools listed in `docs/v1-design.md`: capabilities and workspace, the `fs_*` family including
-`fs_apply_patch`, `shell_run` and the `process_*` family under a Windows Job Object, read-only `git_*`, the
-artifact store with cursors, the invocation ledger with per-resource FIFO chains and persist-failure handling,
-`operation_inspect`/`operation_cancel`, `session_checkpoint`, the built-in OAuth authorization server, and the
-loopback `/control` API.
+Preserve A's files, shell/process execution and Windows Job supervision, fixed Git reads, artifacts/cursors, SQLite invocation recovery, per-resource FIFO, root grants, OAuth and local control. Git writes stay under shell_run, not new Git write tools. PR #3 remains a reference with selected improvements already ported; its branch is retained.
 
-Deliberately excluded: any desktop capture or input tool, any browser tool, any LSP tool, git write tools,
-`fs_mkdir`/`fs_move`/`fs_delete`, an approval UI, and clipboard access.
+## Slice 2
 
-## Slice 2 — `computer_*`
+Promote the P0 desktop concepts without changing P0 itself. Current implementation includes virtual-desktop physical pixels, window/cursor/focus metadata, scaled/cropped PNG, observation-bound coordinates, selected-window UIA, active tabs, focus recovery, mouse/keyboard/window actions and default action-plus-observation. Partial input cleanup releases only delivered outstanding key-downs. InputTick is metadata.
 
-Promote the P0 desktop code into the server and finish the gaps the P0 review recorded.
+Actual evidence is 272 local Windows assertions plus six self-owned live fixture checks; exact source CI reports 273 Windows and 264 Linux assertions. Counts differ because of OS/privilege-specific checks. Keep the live fixture separate from fake-backend and HTTP registration tests.
 
-- `computer_observe`: screenshot plus window list, focus, cursor and a UIA summary in one observation, with the
-  F-2 geometry (default 1280 px wide, `max_width=0` for native, per-observation immutable transform, explicit
-  `coordinate_space`).
-- `focus_window`: the H-1 gap. P0 had no way to bring its target back to the foreground, which is why the P0
-  measurement has to be driven from a second device.
-- `computer_query_ui`: UIA element search by role, name and text, bound to an observation, with cursor paging;
-  the focused control and the active tab title become part of the observation metadata (P0 verification §6b).
-- `computer_act`: click, double click, right click, drag, move, scroll, type text, key press and key combination,
-  each validated against the observation immediately before delivery, with the observation after the action in
-  the same result.
-- Key release on partial input: Codex finding L-2. After a partial `SendInput`, release the key-downs that were
-  actually delivered, and never replay the action.
-- Multi-monitor and mixed DPI acceptance testing, which P0 declared out of scope.
+Completion still requires closing the findings in [desktop-slice2.md](desktop-slice2.md), validating re-query/replay behavior, and recording broader actual target-app and physical display tests. Passing one WPF fixture journey does not satisfy Notepad Save As, all actions, multi-monitor/mixed-DPI or Pro/Thinking measurements. Do not mark the slice complete or start advertising later browser/tray work as implemented.
 
-## Slice 3 — external browser MCP mount
+## Slice 3
 
-Mount an existing browser MCP server rather than reimplementing CDP. The server proxies its tools under the
-same envelope, the same grants and the same ledger, and `host_capabilities` reports which browser backend is
-mounted and what it is allowed to touch. A dedicated browser profile is the default; attaching to the user's
-own profile is an explicit opt-in, and the debugging endpoint is never exposed beyond loopback.
+Mount an existing Playwright/Chrome DevTools MCP rather than implementing CDP. Proxy names, descriptions, permissions and results explicitly, with a dedicated browser profile by default. Report the mounted backend and its boundaries. Personal-profile attachment is an explicit selection, not an implicit fallback.
 
-## Slice 4 — tray application
+## Slice 4
 
-A Windows tray app that owns the lifecycle the CLI currently leaves to the user: start and stop the server,
-start and stop the tunnel, show the current roots and grants, show live processes and queued work, expose the
-`/control` actions (pause, resume, kill children, revoke tokens) as menu items, and surface the rejection log so
-a failed connector attempt is visible without reading stdout. Grants stay file-backed; the tray edits the file,
-it does not invent a second policy store.
+Wrap the existing control/lifecycle in a Windows tray: start/stop, roots/grants, live processes and queued work, pause/resume/kill-children/revoke tokens, and visible connection diagnostics. Keep grants file-backed; do not introduce a second permission store or repeated action approval UI.
 
-## Slice 5 — remaining deferrals
+## Slice 5
 
-- `fs_mkdir`, `fs_move`, `fs_delete` with explicit scope and expected state.
-- `workspace_list_worktrees`, `workspace_create_worktree`, `workspace_remove_worktree`.
-- `session_journal` as a cursor-paged view over the `events` table.
-- LSP diagnostics and symbols, once the execution boundary for language servers is decided.
-- The P0 C-1 to C-7 follow-ups that are not already covered by slice 1.
-- Closing the Job Object assignment race with `CREATE_SUSPENDED`, if measurement shows it matters.
-- A second identity model (per-device keys or mTLS) if single-user password plus OAuth proves insufficient.
+Deferred items include scoped fs_mkdir/fs_move/fs_delete, worktree operations, a paged session journal, LSP diagnostics/symbols, remaining process/native robustness work, browser batching and optional tunnel integration. These are not part of the present desktop completion claim. No new identity architecture, privileges or policy limits are approved merely by this list.
 
-## Ordering rationale
+## Review and merge
 
-The coding core comes first because it is what a Chat model needs to do useful work at all, and because it is
-the part that can be verified without a human at the keyboard: files, processes, git and the protocol are all
-testable in CI. Desktop control comes second because it needs an interactive Windows session and a human to
-watch it, so it cannot gate the parts that do not. The browser mount is third because it depends on choosing a
-backend, the tray is fourth because it is a lifecycle convenience over an already working server, and the
-remaining deferrals are last because each is independently useful but none of them blocks a full coding loop.
+A is the approved development line; P0 precedes A for the user's eventual merge. PR #5 is stacked on A so its desktop diff remains separate. Keep branches and reviewer history. A green build supports review, not automatic merge or fabricated model measurements.

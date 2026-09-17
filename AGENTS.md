@@ -1,15 +1,21 @@
 # CODEXish development
 
-Read README.md, IMPLEMENTATION_STATUS.md and docs/review-response.md first.
+Read IMPLEMENTATION_STATUS.md, docs/desktop-slice2.md, README.md, docs/v1-design.md and docs/v1-plan.md first.
 
-v1 implementers start from docs/v1-design.md. It is the decision record for src/Codexish.Server and it wins over the older v0.1 documents wherever they disagree about v1 code; docs/v1-plan.md gives the slice order. Slice 1, the coding core with 21 underscore-named tools, is implemented. Do not add a computer_*, browser or LSP tool to it, do not add Git write tools (Git writes go through shell_run under the root's shell grant), and do not introduce confirmation prompts, rate or time caps, or BUSY/ALREADY_RUNNING rejections: contention is expressed as queued or running with a handle, and the only limits are protocol frame and page sizes reported with their source. src/Codexish.P0 stays unchanged until M-1 through M-8 are recorded.
+## Current user decision and branch
 
-The design review of 8cecfc7 remains CHANGES_REQUESTED for full v1 until M-1–M-8. The newer verification §6a accepts F-1/F-2 after reviewer-reported Windows build and 96/96 tests. The user supplied the Codex read-only review and Claude triage and asked to proceed. Publish F-1/F-2 plus the triage's L-1 PID-error mapping and H-1/H-2/H-3 measurement procedure changes on PR #2. Record constructor-test coverage separately from the statically reviewed live-exit branch. Keep C-1–C-7 and the triaged persistence/FIFO/partial-key findings for v1. P0 resource exclusion is mutual exclusion, not acceptance-order FIFO; do not call its tests ordered-queue tests.
+The user approved mainline A / PR #4 (`feat/v1-slice1-opus`). PR #4 is Ready for review; PR #3 is closed as reference/ported implementation with its branch retained. Do not reopen the choice, merge PRs, delete branches or replace A with the reference implementation without a new user request.
 
-Build one C#/.NET 10 application. Chat Pro performs reasoning; this server provides tools, not another model. Do not rebuild the proposed TypeScript Gateway, custom WSS, mTLS enrollment or broker split for v1.
+Current continuation is Draft PR #5, `feat/v1-slice2-desktop`, based on A at `3cb4676`. Recovery source is `0c2b2e9`. It registers 24 underscore-named tools: 21 coding/checkpoint plus computer_observe, computer_query_ui and computer_act. The earlier slice-1 prohibition on adding computer tools applied to that first slice, not this expressly requested continuation. P0 remains unchanged.
 
-Keep request/operation/process lifetimes distinct; reuse invocation IDs on retry; never replay unknown effects; serialize conflicting effects rather than returning BUSY (P0 does not promise FIFO). Observe before and after GUI input. Report actual tests and saved files, not inferred success.
+## Completion and review
 
-Do not confuse a fixed P0 fixture with arbitrary shell execution or a complete coding agent. Source existence is not a successful build. Linux/headless CI is not interactive Windows or Pro Chat evidence. Use README Measurement: another device for ChatGPT, fresh fixture per trial, unsaved Notepad tab with image-only nonce, and a same-tool reference run. Record M-1 through M-8 honestly.
+Slice 2 is IN_PROGRESS, not complete. Read S2-01 through S2-03 in docs/desktop-slice2.md. Passing tests do not close UI cursor replay, element-reference rebinding or post-capture option findings. A proposed correction was blocked before execution and not rerouted; do not report it as applied. Preserve the recovered source and evidence rather than silently overwriting an interrupted working tree.
 
-Preserve the original v0.1 documents as historical proposals pending consolidation after measurements. New code follows the P0 review exception and docs/review-response.md. Do not mark the whole design APPROVED or merge without authorization.
+The existing docs/v1-design.md remains the mainline A coding decision record, above superseded v0.1 proposals. The desktop preview supplements it. Browser MCP mounting is slice 3, tray is slice 4; no extra model/API key, Gateway/Agent split, custom WSS, mTLS enrollment or broker split.
+
+Keep request/operation/process lifetimes distinct. Reuse invocation IDs only for identical retries. Inspect unknown effects and never blindly replay input. Conflicting work uses the resource queue rather than BUSY; reads remain independent. Do not add task time/call caps or repeated approvals. Keep root grants, the disclosed unconfined_user boundary and the existing control contract. No clipboard, elevation or security-setting changes.
+
+Record actual commands, exit codes, source hashes and environment. Windows fixture evidence is not Notepad Save As, multi-monitor hardware acceptance, HTTP desktop E2E or ChatGPT/Pro M-1–M-8. Default --self-test uses a deterministic desktop backend and does not inject input; explicit --self-test-desktop controls only its own newly created fixture process. Do not use an existing user document as a test fixture.
+
+The root README describes the coding base. Desktop preview usage/status is docs/desktop-slice2.md. Historical evidence is preserved in IMPLEMENTATION_STATUS.slice1.md and the existing review documents. Merge remains the user's action.
