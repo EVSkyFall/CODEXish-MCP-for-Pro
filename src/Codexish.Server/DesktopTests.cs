@@ -57,26 +57,62 @@ public static class DesktopTests
         }
         public static readonly WindowActionResult Confirmed = new(true, "set_foreground", 0, ["set_foreground"]);
         public WindowActionResult Activation = Confirmed;
+        public Func<WindowActionResult>? Activate;
         public WindowActionResult WindowAction(DesktopWindow window, string action)
         {
-            if (action == "focus_window" && Activation.Confirmed) Foreground = Window.Id;
-            return Activation;
+            var result = action == "focus_window" && Activate is not null ? Activate() : Activation;
+            if (action == "focus_window" && result.Confirmed) Foreground = Window.Id;
+            return result;
         }
     }
-    // Scripted activation primitives: records the order of calls and confirms only at the named step.
-    private sealed class Steps(bool minimized, string? confirmsAt, bool restores = true) : IForegroundSteps
+    // Scripted activation primitives: records every call, reaches the foreground only after the request of the named
+    // step, and can inject SendInput and detach failures or a late or flickering confirmation.
+    private sealed class Steps : IForegroundSteps
     {
         public readonly List<string> Calls = [];
-        private bool foreground = confirmsAt == "already_foreground";
-        public int AltEvents;
-        public bool Minimized { get; private set; } = minimized;
-        public bool Foreground => foreground && !Minimized;
-        public void Restore() { Calls.Add("restore"); if (restores) Minimized = false; }
-        public void SetForeground() { Calls.Add("set_foreground"); foreground |= confirmsAt == "set_foreground"; }
-        public void AttachThreadInputAndSetForeground() { Calls.Add("attach_thread_input"); foreground |= confirmsAt == "attach_thread_input"; }
-        public int AltTapAndSetForeground() { Calls.Add("alt_tap"); AltEvents += 2; foreground |= confirmsAt == "alt_tap"; return 2; }
-        public bool Confirm(Func<bool> state) => state();
+        public bool IsMinimized, RestoreWorks = true, Flicker;
+        public int LateSamples, Pauses;
+        public Func<int> AltDown = () => 1;
+        public Func<int, int> AltUp = _ => 1;       // receives the 1-based key-up call number
+        public Func<uint, bool> Detach = _ => true; // receives the detached thread
+        private readonly string? confirmsAt;
+        private string phase = "set_foreground";
+        private bool reached;
+        private int reads, keyUps;
+        public Steps(bool minimized = false, string? confirmsAt = null)
+        {
+            IsMinimized = minimized;
+            this.confirmsAt = confirmsAt;
+            reached = confirmsAt == "already_foreground";
+        }
+        public bool Minimized => IsMinimized;
+        public bool Foreground
+        {
+            get
+            {
+                if (IsMinimized || !reached) return false;
+                reads++;
+                return reads > LateSamples && (!Flicker || reads % 2 == 1);
+            }
+        }
+        public void Restore() { Calls.Add("restore"); if (RestoreWorks) IsMinimized = false; }
+        public void SetForeground() { Calls.Add("set_foreground"); reached |= confirmsAt == phase; }
+        public void BringToTop() => Calls.Add("bring_to_top");
+        public (uint Self, uint Foreground, uint Target) InputThreads() { phase = "attach_thread_input"; Calls.Add("threads"); return (1, 2, 3); }
+        public bool AttachInput(uint thread, uint other, bool attach)
+        {
+            Calls.Add((attach ? "attach:" : "detach:") + other);
+            return attach || Detach(other);
+        }
+        public int SendAlt(bool up)
+        {
+            if (!up) { phase = "alt_tap"; Calls.Add("alt_down"); return AltDown(); }
+            Calls.Add("alt_up");
+            return AltUp(++keyUps);
+        }
+        public void Pause() => Pauses++;
     }
+    private static readonly string[] AttachCalls = ["set_foreground", "threads", "attach:2", "attach:3", "bring_to_top", "set_foreground", "detach:3", "detach:2"];
     private static Task<CallToolResult> Act(DesktopService service, string id, string action, string space = "none",
         int? x = null, int? y = null, string? element = null, string? text = null, string? key = null, bool after = true) =>
         service.Act(id, action, space, x, y, null, null, element, text, key, -120, after);
@@ -103,28 +139,55 @@ public static class DesktopTests
             var unicode = DesktopInputPlan.Text("한글🙂");
             Check(unicode.Length == 8 && DesktopInputPlan.Releases(unicode, 1).Single() == unicode[0] with { Up = true }, "UTF16 input and partial Unicode cleanup preserve code units");
             Fault(() => DesktopInputPlan.Combo("CTRL+CTRL"), "INVALID_ARGUMENT");
-            var already = new Steps(false, "already_foreground"); var alreadyResult = ForegroundActivation.Run(already);
+            var already = new Steps(confirmsAt: "already_foreground"); var alreadyResult = ForegroundActivation.Run(already);
             Check(alreadyResult is { Confirmed: true, Method: "already_foreground", ActivationInputsSent: 0 } && alreadyResult.Attempted.Length == 0 && already.Calls.Count == 0,
                 "activation of the current foreground window stops before any foreground request");
-            var direct = new Steps(false, "set_foreground"); var directResult = ForegroundActivation.Run(direct);
+            var direct = new Steps(confirmsAt: "set_foreground"); var directResult = ForegroundActivation.Run(direct);
             Check(directResult is { Confirmed: true, Method: "set_foreground", ActivationInputsSent: 0 } && direct.Calls.SequenceEqual(["set_foreground"]) && directResult.Attempted.SequenceEqual(["set_foreground"]),
                 "activation stops at a confirmed SetForegroundWindow without attaching input or sending ALT");
-            var attached = new Steps(false, "attach_thread_input"); var attachedResult = ForegroundActivation.Run(attached);
-            Check(attachedResult is { Confirmed: true, Method: "attach_thread_input", ActivationInputsSent: 0 } && attached.Calls.SequenceEqual(["set_foreground", "attach_thread_input"]) && attached.AltEvents == 0,
-                "activation stops at confirmed AttachThreadInput and never sends ALT after it");
-            var tapped = new Steps(false, "alt_tap"); var tappedResult = ForegroundActivation.Run(tapped);
-            Check(tappedResult is { Confirmed: true, Method: "alt_tap" } && tapped.Calls.SequenceEqual(["set_foreground", "attach_thread_input", "alt_tap"]) &&
-                tappedResult.Attempted.SequenceEqual(tapped.Calls) && tappedResult.ActivationInputsSent == tapped.AltEvents && tapped.AltEvents == 2,
+            var attached = new Steps(confirmsAt: "attach_thread_input"); var attachedResult = ForegroundActivation.Run(attached);
+            Check(attachedResult is { Confirmed: true, Method: "attach_thread_input", ActivationInputsSent: 0 } && attached.Calls.SequenceEqual(AttachCalls) && attachedResult.Failures!.Length == 0,
+                "activation stops at confirmed AttachThreadInput, detaches both queues and never sends ALT after it");
+            var tapped = new Steps(confirmsAt: "alt_tap"); var tappedResult = ForegroundActivation.Run(tapped);
+            Check(tappedResult is { Confirmed: true, Method: "alt_tap", ActivationInputsSent: 2, CleanupInputsSent: 0, CleanupConfirmed: true } &&
+                tapped.Calls.SequenceEqual([.. AttachCalls, "alt_down", "set_foreground", "alt_up"]) && tappedResult.Attempted.SequenceEqual(["set_foreground", "attach_thread_input", "alt_tap"]),
                 "the ALT tap runs only after SetForegroundWindow and AttachThreadInput both failed, and its events are counted exactly");
-            var refused = new Steps(false, null); var refusedResult = ForegroundActivation.Run(refused);
-            Check(refusedResult is { Confirmed: false, Method: null, ActivationInputsSent: 2 } && refusedResult.Attempted.SequenceEqual(["set_foreground", "attach_thread_input", "alt_tap"]),
+            var refused = new Steps(); var refusedResult = ForegroundActivation.Run(refused);
+            Check(refusedResult is { Confirmed: false, Method: null, ActivationInputsSent: 2, CleanupConfirmed: true } && refusedResult.Attempted.SequenceEqual(["set_foreground", "attach_thread_input", "alt_tap"]),
                 "an activation Windows never confirms is reported unconfirmed with every attempted method and its ALT events");
-            var iconic = new Steps(true, "set_foreground"); var iconicResult = ForegroundActivation.Run(iconic);
+            var iconic = new Steps(minimized: true, confirmsAt: "set_foreground"); var iconicResult = ForegroundActivation.Run(iconic);
             Check(iconicResult is { Confirmed: true, Method: "set_foreground" } && iconic.Calls.SequenceEqual(["restore", "set_foreground"]) && iconicResult.Attempted.SequenceEqual(["restore", "set_foreground"]),
                 "a minimized target is restored and confirmed before any foreground request");
-            var stuck = new Steps(true, "set_foreground", restores: false); var stuckResult = ForegroundActivation.Run(stuck);
-            Check(stuckResult is { Confirmed: false, ActivationInputsSent: 0 } && stuck.Calls.SequenceEqual(["restore"]) && stuck.AltEvents == 0,
+            var stuck = new Steps(minimized: true, confirmsAt: "set_foreground") { RestoreWorks = false }; var stuckResult = ForegroundActivation.Run(stuck);
+            Check(stuckResult is { Confirmed: false, ActivationInputsSent: 0 } && stuck.Calls.SequenceEqual(["restore"]),
                 "an unconfirmed restore stops activation without foreground requests or ALT input");
+            var upRefused = new Steps(confirmsAt: "alt_tap") { AltUp = call => call == 1 ? 0 : 1 }; var upRefusedResult = ForegroundActivation.Run(upRefused);
+            Check(upRefusedResult is { Confirmed: true, Method: "alt_tap", ActivationInputsSent: 1, CleanupInputsSent: 1, CleanupConfirmed: true } &&
+                upRefused.Calls.TakeLast(4).SequenceEqual(["alt_down", "set_foreground", "alt_up", "alt_up"]) && upRefusedResult.Failures!.SequenceEqual(["alt_up: SendInput accepted 0 of 1 events"]),
+                "a key-up SendInput that accepts nothing is followed by exactly one cleanup key-up, counted apart from the tap");
+            var held = new Steps(confirmsAt: "alt_tap") { AltUp = _ => 0 }; var heldResult = ForegroundActivation.Run(held);
+            Check(heldResult is { Confirmed: false, Method: null, ActivationInputsSent: 1, CleanupInputsSent: 0, CleanupConfirmed: false } &&
+                held.Calls.Count(c => c == "alt_up") == 2 && heldResult.Failures!.Length == 2,
+                "an ALT key-down that cannot be confirmed released is never reported as a confirmed activation, even in the foreground");
+            var upThrows = new Steps(confirmsAt: "alt_tap") { AltUp = call => call == 1 ? throw new InvalidOperationException("synthetic") : 1 };
+            var upThrowsResult = ForegroundActivation.Run(upThrows);
+            Check(upThrowsResult is { Confirmed: true, Method: "alt_tap", ActivationInputsSent: 1, CleanupInputsSent: 1, CleanupConfirmed: true } &&
+                upThrowsResult.Failures!.SequenceEqual(["alt_up: InvalidOperationException"]),
+                "a key-up exception keeps the counts, releases the key with one cleanup key-up and records the failure");
+            var downRefused = new Steps(confirmsAt: "alt_tap") { AltDown = () => 0 }; var downRefusedResult = ForegroundActivation.Run(downRefused);
+            Check(downRefusedResult is { Confirmed: true, Method: "alt_tap", ActivationInputsSent: 0, CleanupInputsSent: 0, CleanupConfirmed: true } && !downRefused.Calls.Contains("alt_up"),
+                "a key-down SendInput that accepts nothing sends no key-up and reports zero ALT events");
+            var detachFails = new Steps(confirmsAt: "attach_thread_input") { Detach = thread => thread == 3 ? throw new InvalidOperationException("synthetic") : false };
+            var detachFailsResult = ForegroundActivation.Run(detachFails);
+            Check(detachFailsResult is { Confirmed: true, Method: "attach_thread_input" } && detachFails.Calls.SequenceEqual(AttachCalls) &&
+                detachFailsResult.Failures!.SequenceEqual(["detach_target: InvalidOperationException", "detach_foreground: AttachThreadInput returned false"]),
+                "a failing detach never skips the other detach, and both failures are reported");
+            var late = new Steps(confirmsAt: "set_foreground") { LateSamples = 1 }; var lateResult = ForegroundActivation.Run(late);
+            Check(lateResult is { Confirmed: true, Method: "set_foreground" } && late.Calls.SequenceEqual(["set_foreground"]) && late.Pauses >= 2,
+                "a foreground that appears one sample late still confirms the step that caused it");
+            var flicker = new Steps(confirmsAt: "set_foreground") { Flicker = true }; var flickerResult = ForegroundActivation.Run(flicker);
+            Check(flickerResult is { Confirmed: false, Method: null, ActivationInputsSent: 2, CleanupConfirmed: true } && flickerResult.Attempted.Length == 3,
+                "a foreground that flickers between samples is never confirmed");
             var fake = new Fake(); using var desktop = new DesktopService(fake);
             var observation = await desktop.Observe(fake.Window.Id);
             Check(Reply.CodeOf(observation) is null && observation.Content.OfType<ImageContentBlock>().Count() == 1, "observation carries image and structured metadata");
@@ -164,7 +227,33 @@ public static class DesktopTests
                 unconfirmedActivation.GetProperty("activation_inputs_sent").GetInt32() == 2 && unconfirmedError.GetProperty("details").GetProperty("delivered").GetInt32() == 0 &&
                 fake.Sent == beforeActivation && fake.Foreground == "other-window",
                 "unconfirmed activation is EXECUTION_UNKNOWN with delivered=0, its ALT events reported and no keyboard input sent to the target");
-            fake.Foreground = fake.Window.Id; fake.Activation = Fake.Confirmed;
+            fake.Foreground = "other-window";
+            fake.Activate = () => ForegroundActivation.Run(new Steps(confirmsAt: "alt_tap") { AltUp = _ => 0 });
+            var heldFocus = await Act(desktop, id, "focus_window");
+            var heldError = heldFocus.StructuredContent!.Value.GetProperty("error");
+            var heldActivation = heldError.GetProperty("details").GetProperty("activation");
+            Check(Reply.CodeOf(heldFocus) == "EXECUTION_UNKNOWN" && heldError.GetProperty("details").GetProperty("delivered").GetInt32() == 0 &&
+                !heldActivation.GetProperty("confirmed").GetBoolean() && !heldActivation.GetProperty("cleanup_confirmed").GetBoolean() &&
+                heldActivation.GetProperty("activation_inputs_sent").GetInt32() == 1 && heldActivation.GetProperty("cleanup_inputs_sent").GetInt32() == 0 &&
+                heldActivation.GetProperty("failures").GetArrayLength() == 2 && heldError.GetProperty("message").GetString()!.Contains("ALT", StringComparison.Ordinal) &&
+                fake.Sent == beforeActivation && fake.Foreground == "other-window",
+                "a possibly held ALT key-down ends focus_window as EXECUTION_UNKNOWN with delivered=0 and its cleanup failure reported");
+            fake.Activate = () => ForegroundActivation.Run(new Steps(confirmsAt: "set_foreground") { Flicker = true });
+            var flickerFocus = await Act(desktop, id, "focus_window");
+            var flickerError = flickerFocus.StructuredContent!.Value.GetProperty("error");
+            var flickerActivation = flickerError.GetProperty("details").GetProperty("activation");
+            Check(Reply.CodeOf(flickerFocus) == "EXECUTION_UNKNOWN" && flickerError.GetProperty("details").GetProperty("delivered").GetInt32() == 0 &&
+                !flickerActivation.GetProperty("confirmed").GetBoolean() && flickerActivation.GetProperty("attempted").GetArrayLength() == 3 &&
+                flickerActivation.GetProperty("cleanup_confirmed").GetBoolean() && fake.Sent == beforeActivation,
+                "a flickering foreground ends focus_window as EXECUTION_UNKNOWN with delivered=0");
+            fake.Activate = () => ForegroundActivation.Run(new Steps(confirmsAt: "alt_tap") { AltUp = call => call == 1 ? 0 : 1 });
+            var cleanedFocus = await Act(desktop, id, "focus_window");
+            var cleanedActivation = Data(cleanedFocus).GetProperty("activation");
+            Check(Reply.CodeOf(cleanedFocus) is null && cleanedActivation.GetProperty("method").GetString() == "alt_tap" &&
+                cleanedActivation.GetProperty("activation_inputs_sent").GetInt32() == 1 && cleanedActivation.GetProperty("cleanup_inputs_sent").GetInt32() == 1 &&
+                cleanedActivation.GetProperty("cleanup_confirmed").GetBoolean() && Data(cleanedFocus).GetProperty("delivered").GetInt32() == 0 && fake.Sent == beforeActivation,
+                "a confirmed cleanup key-up lets focus_window succeed and reports the cleanup input apart from delivered");
+            fake.Activate = null; fake.Foreground = fake.Window.Id; fake.Activation = Fake.Confirmed;
             fake.Window = fake.Window with { StartTicks = 790 };
             Check(Reply.CodeOf(await Act(desktop, id, "type_text", text: "no")) == "STALE_OBSERVATION", "PID/window reuse with changed process start identity is stale");
             fake.Window = fake.Window with { StartTicks = 789, Dpi = 144 };

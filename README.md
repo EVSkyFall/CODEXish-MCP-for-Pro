@@ -125,7 +125,8 @@ tools directory, add this to `codexish.json`:
   profile handling.
 - Tools appear as `browser_<id>_<backend tool>`, for example `browser_pw_browser_navigate`. A name that is not
   `^[a-zA-Z0-9_-]+$` or would exceed 64 characters is shortened and given a short hash suffix. Every mounted tool
-  takes the backend's own inputs inside `arguments`. Tools listed in `read_only_tools` run directly; every other
+  takes the backend's own inputs inside `arguments`. Tools listed in `read_only_tools` run directly and bypass the
+  ledger because your configuration says so; CODEXish does not check that they are free of side effects. Every other
   tool is treated as a change: it needs an `invocation_id`, runs through the ledger (an identical retry returns the
   stored result), and its `wait_ms` is a response wait only.
 - Starting a mount and calling a read-only tool need read and shell grants on `root_id`; other tools also need write.
@@ -133,8 +134,11 @@ tools directory, add this to `codexish.json`:
   Variables whose names look like credentials are never passed, and proxy variables are not passed either.
 - A mount that fails to start does not stop the server. `host_capabilities` reports each mount's `state`
   (`connected`, `unavailable`, `invalid_config`, `exited`) with its error and the last lines of its stderr. Mounts
-  are read when the server starts. The backend runs unconfined as you; the root is its grant and working directory,
-  not a browser network or filesystem sandbox.
+  are read when the server starts.
+- Mounted tools run unconfined as you and are not contained by the root or its grants. Tools such as
+  `browser_file_upload`, `browser_evaluate` or `browser_run_code_unsafe` can read files or run code anywhere your
+  account can; the grants only decide whether CODEXish forwards a call, and the root is the backend's working
+  directory, not a filesystem, network or code sandbox.
 
 ### Tray (slice 4, Windows)
 
@@ -157,7 +161,10 @@ or exiting the tray stops it:
 "tunnel": { "command": "C:\\Tools\\cloudflared.exe", "args": ["tunnel", "--url", "http://127.0.0.1:{port}"] }
 ```
 
-The tray exists only in the Windows build; elsewhere `--tray` prints a message and exits with code 2.
+The tunnel process inherits the tray's environment, so a tunnel tool can read its own settings from environment
+variables. Its output appears in the connection log with the control token, client secret and password hash from
+`codexish.json` replaced by redaction markers. The tray exists only in the Windows build; elsewhere `--tray` prints a
+message and exits with code 2.
 
 ### Tests
 

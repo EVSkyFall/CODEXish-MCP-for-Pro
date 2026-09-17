@@ -29,6 +29,18 @@ internal static class GitTests
         Directory.CreateDirectory(traps);
         emptyGlobalConfig = Path.Combine(temp, "empty-global.gitconfig");
         File.WriteAllText(emptyGlobalConfig, "");
+        var probe = new ProcessStartInfo(git);
+        probe.Environment["GIT_CONFIG_COUNT"] = "1";
+        probe.Environment["GIT_PAGER"] = "inherited";
+        probe.Environment["GIT_OPTIONAL_LOCKS"] = "1";
+        PrepareEnvironment(probe, false);
+        Check(probe.Environment.Keys.Where(k => k.StartsWith("GIT_", StringComparison.OrdinalIgnoreCase)).Order(StringComparer.Ordinal)
+                .SequenceEqual(["GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_TERMINAL_PROMPT"]),
+            "the git fixture helper removes every inherited GIT_* variable and sets only its own");
+        string[] stall = FormatStall([(10, 1, "git.exe", "git fetch origin"), (11, 10, "sh", "sh -c sleep"), (20, 2, "git.exe", "git push https://user@elsewhere.invalid")], 10);
+        Check(stall.Length == 3 && stall[0].EndsWith("stalled_tree git fetch origin", StringComparison.Ordinal) && stall[1].EndsWith("stalled_tree sh -c sleep", StringComparison.Ordinal) &&
+            stall[2] == "pid=20 parent=2 other_git name=git.exe",
+            "stall diagnostics print command lines only for the stalled git process tree");
 
         if (Setup(git, root, "init", "-b", "main") != 0)
         {
@@ -144,10 +156,7 @@ internal static class GitTests
                 start.ArgumentList.Add(option);
             }
         foreach (string argument in arguments) start.ArgumentList.Add(argument);
-        start.Environment["GIT_TERMINAL_PROMPT"] = "0";
-        start.Environment["GIT_CONFIG_NOSYSTEM"] = "1";
-        start.Environment["GIT_CONFIG_GLOBAL"] = emptyGlobalConfig;
-        if (hermetic) start.Environment["GIT_OPTIONAL_LOCKS"] = "0";
+        PrepareEnvironment(start, hermetic);
         using var process = Process.Start(start)!;
         process.StandardInput.Close();
         var stdout = process.StandardOutput.ReadToEndAsync();
@@ -167,7 +176,37 @@ internal static class GitTests
         return process.ExitCode;
     }
 
-    // Lists the stalled process's descendants and every git process, with command lines, for the stall report.
+    // Inherited GIT_* variables (GIT_CONFIG_COUNT/KEY/VALUE, GIT_DIR, pager or diff settings) would change what the
+    // fixture builds and what the control run proves, so only the variables set here reach git.
+    private static void PrepareEnvironment(ProcessStartInfo start, bool hermetic)
+    {
+        foreach (string name in start.Environment.Keys.Where(k => k.StartsWith("GIT_", StringComparison.OrdinalIgnoreCase)).ToArray())
+            start.Environment.Remove(name);
+        start.Environment["GIT_TERMINAL_PROMPT"] = "0";
+        start.Environment["GIT_CONFIG_NOSYSTEM"] = "1";
+        start.Environment["GIT_CONFIG_GLOBAL"] = emptyGlobalConfig;
+        if (hermetic) start.Environment["GIT_OPTIONAL_LOCKS"] = "0";
+    }
+
+    // Command lines are printed only for the stalled process tree; an unrelated git process's command line can carry
+    // credentials, so only its identity is printed.
+    private static string[] FormatStall(IReadOnlyList<(int Pid, int Parent, string Name, string CommandLine)> rows, int stalled)
+    {
+        var tree = new HashSet<int> { stalled };
+        for (bool grew = true; grew; )
+        {
+            grew = false;
+            foreach (var row in rows)
+                if (tree.Contains(row.Parent) && tree.Add(row.Pid)) grew = true;
+        }
+        return rows.Where(r => tree.Contains(r.Pid) || r.Name.StartsWith("git", StringComparison.OrdinalIgnoreCase))
+            .Select(r => tree.Contains(r.Pid)
+                ? $"pid={r.Pid} parent={r.Parent} stalled_tree {Redaction.Apply(r.CommandLine).Text}"
+                : $"pid={r.Pid} parent={r.Parent} other_git name={r.Name}")
+            .ToArray();
+    }
+
+    // Lists the stalled process's descendants with command lines and other git processes by name, for the stall report.
     private static IEnumerable<string> ProcessDiagnostics(int stalled)
     {
         var rows = new List<(int Pid, int Parent, string Name, string CommandLine)>();
@@ -218,15 +257,6 @@ internal static class GitTests
             }
         }
         catch (Exception e) { return [$"process listing failed: {e.GetType().Name}"]; }
-        var tree = new HashSet<int> { stalled };
-        for (bool grew = true; grew; )
-        {
-            grew = false;
-            foreach (var row in rows)
-                if (tree.Contains(row.Parent) && tree.Add(row.Pid)) grew = true;
-        }
-        return rows.Where(r => tree.Contains(r.Pid) || r.Name.StartsWith("git", StringComparison.OrdinalIgnoreCase))
-            .Select(r => $"pid={r.Pid} parent={r.Parent} {(tree.Contains(r.Pid) ? "stalled_tree" : "other_git")} {Redaction.Apply(r.CommandLine).Text}")
-            .ToArray();
+        return FormatStall(rows, stalled);
     }
 }

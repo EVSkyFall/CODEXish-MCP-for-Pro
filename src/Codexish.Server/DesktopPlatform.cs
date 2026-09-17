@@ -155,55 +155,25 @@ internal sealed class WindowsDesktopPlatform(int? fixturePid = null) : IDesktopP
         return new(submitted, submitted ? "show_window_async" : null, 0, ["show_window_async"]);
     }
     // A background server loses to the Windows foreground lock, so SetForegroundWindow alone is not enough.
-    // No system parameter, lock timeout, other process's permission or privilege is changed by these steps.
+    // These are the Win32 calls only; ForegroundActivation owns their order, confirmation and cleanup. No system
+    // parameter, lock timeout, other process's permission or privilege is changed.
     private sealed class ForegroundSteps(nint handle) : IForegroundSteps
     {
-        // Confirms an OS state transition that normally lands within milliseconds; it is not a deadline for the request.
-        private static readonly TimeSpan ConfirmationPoll = TimeSpan.FromMilliseconds(500);
         public bool Minimized => IsIconic(handle);
         public bool Foreground => GetForegroundWindow() == handle && !IsIconic(handle);
         public void Restore() => ShowWindow(handle, 9);
         public void SetForeground() => SetForegroundWindow(handle);
-        public void AttachThreadInputAndSetForeground()
+        public void BringToTop() => BringWindowToTop(handle);
+        public (uint Self, uint Foreground, uint Target) InputThreads()
         {
-            uint self = GetCurrentThreadId();
             nint foreground = GetForegroundWindow();
-            uint foregroundThread = foreground == 0 ? 0 : GetWindowThreadProcessId(foreground, out _);
-            uint targetThread = GetWindowThreadProcessId(handle, out _);
-            bool toForeground = false, toTarget = false;
-            try
-            {
-                if (foregroundThread != 0 && foregroundThread != self) toForeground = AttachThreadInput(self, foregroundThread, true);
-                if (targetThread != 0 && targetThread != self && targetThread != foregroundThread) toTarget = AttachThreadInput(self, targetThread, true);
-                BringWindowToTop(handle);
-                SetForegroundWindow(handle);
-            }
-            finally
-            {
-                if (toTarget) AttachThreadInput(self, targetThread, false);
-                if (toForeground) AttachThreadInput(self, foregroundThread, false);
-            }
+            return (GetCurrentThreadId(), foreground == 0 ? 0 : GetWindowThreadProcessId(foreground, out _), GetWindowThreadProcessId(handle, out _));
         }
+        public bool AttachInput(uint thread, uint other, bool attach) => AttachThreadInput(thread, other, attach);
         // Windows permits SetForegroundWindow after the calling process generated the last input event.
-        public int AltTapAndSetForeground()
-        {
-            int size = Marshal.SizeOf<Input>();
-            int sent = checked((int)SendInput(1, [Alt(false)], size));
-            try { SetForegroundWindow(handle); }
-            finally { if (sent > 0) sent += checked((int)SendInput(1, [Alt(true)], size)); }
-            return sent;
-        }
-        private static Input Alt(bool up) => new() { Type = 1, Data = new() { Key = new() { Vk = 0x12, Flags = up ? 2u : 0 } } };
-        public bool Confirm(Func<bool> state)
-        {
-            var elapsed = Stopwatch.StartNew();
-            while (!state())
-            {
-                if (elapsed.Elapsed >= ConfirmationPoll) return false;
-                Thread.Sleep(15);
-            }
-            return true;
-        }
+        public int SendAlt(bool up) => checked((int)SendInput(1,
+            [new Input { Type = 1, Data = new() { Key = new() { Vk = 0x12, Flags = up ? 2u : 0 } } }], Marshal.SizeOf<Input>()));
+        public void Pause() => Thread.Sleep(15);
     }
     // Read security labels only; never elevate or change another process token.
     private static void VerifyIntegrity(nint window)

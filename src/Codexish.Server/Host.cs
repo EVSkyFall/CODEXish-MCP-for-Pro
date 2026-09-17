@@ -26,6 +26,9 @@ public static class CodexishHost
         }).WithHttpTransport(o => o.SessionMode = HttpServerSessionMode.Stateless)
           .WithTools<CodexishTools>().WithTools<DesktopTools>().WithTools(runtime.Browsers.Tools);
         var app = builder.Build();
+        // In-flight browser calls are cancelled as soon as the host starts stopping, so its request drain is not held
+        // by a backend that never answers.
+        app.Lifetime.ApplicationStopping.Register(runtime.Browsers.Stop);
 
         app.Use(async (context, next) =>
         {

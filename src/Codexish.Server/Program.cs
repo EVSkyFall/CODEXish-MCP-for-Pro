@@ -2,7 +2,7 @@ using Codexish.Server;
 
 if (args.Contains("--tray-smoke-test")) return await TrayApplication.Run("", smoke: true);
 if (args.Contains("--tray-tests")) return await TrayTests.Run();
-if (args.Contains("--browser-fixture")) return await BrowserTests.Fixture(CommandLine.Values(args, "--browser-fixture")[0]);
+if (args.Contains("--browser-fixture")) return await BrowserTests.Fixture(CommandLine.Values(args, "--browser-fixture")[0], args.Contains("--ignore-stdin-eof"));
 if (args.Contains("--browser-tests")) return await BrowserTests.Run();
 if (args.Contains("--browser-live-test"))
 {

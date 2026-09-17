@@ -33,6 +33,17 @@ Not run and not claimed: `--self-test-desktop` and `--self-test-desktop-http` (b
 
 Found and fixed during these runs: one early live browser run left a `chrome_url_fetcher_*` directory in the user TEMP, so the live test now gives the backend a TEMP inside its own trial directory. One of eight `--browser-tests` runs before that fix left an emptied test directory, because a recursive delete on Windows returns while a deleted file is still held open elsewhere; test cleanup now repeats until the directory is gone, and the ten runs after the fix left nothing behind. The unchanged P0 self-test showed the same effect once with an empty `CODEXish-P0-*.state` directory; P0 was not modified.
 
+### Review round 2 (on top of 97bfd10)
+
+The review findings adopted by the lead were implemented while the PC was in use, so local runs were kept to two Release builds and the suites the changes touch. No live desktop, tray icon or live browser test ran in this round.
+
+| Change | Local result |
+| --- | --- |
+| ALT tap: key-down and key-up results are checked separately, one cleanup key-up releases a delivered key-down whose key-up was not accepted, and a key that may still be held is never reported as a confirmed activation. Detaches run in nested `finally` blocks, a confirmation needs two consecutive samples, and counts survive exceptions. | Both builds 0 warnings, 0 errors; `--desktop-core-test` DESKTOP_CORE_PASSED 56 (46 + 10); `--desktop-regression-test` 11 passed, 0 failed |
+| Browser mounts: shutdown terminates the Job Object or process tree before any wait and bounds every wait; a backend that exits on its own releases its session and job; null configuration fields are normalized; ids are unique without case; embedded resources and resource links are redacted; `host_capabilities` states that mounted tools are not contained by the root or its grants. | `--browser-tests` BROWSER_TESTS_PASSED 40 (33 + 7); disposing a backend that ignores end of input took 5.1 s |
+| Tray: browser calls are cancelled before the host stops; the control token, client secret and password hash are redacted from tunnel output. | `--tray-tests` TRAY_CONTROLLER_PASSED 13 (12 + 1) |
+| Git fixture helper: inherited `GIT_*` variables are removed; the stall report prints command lines only for the stalled process tree. | `--self-test` SELF_TEST_PASSED 237 (235 + 2), DESKTOP_CORE_PASSED 56, DESKTOP_REGRESSIONS 11 passed, 0 failed |
+
 ## Current source and completed corrections
 
 Product source: `05ae9e2aaa23833b5e089d73b18dfa0a4f24d8ab` (tree `8f56a9707e08eda023456abb1890321e21b941c6`). This commit was already on the desktop branch when the latest continuation resumed. It supersedes the earlier open-finding statements for S2-01–S2-03; the current continuation verified it rather than recreating its changes.

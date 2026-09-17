@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -29,13 +30,15 @@ public sealed class BrowserMounts(CodexishRuntime runtime) : IAsyncDisposable
 {
     public const int MaxToolName = 64;
     private const int StderrTailLines = 20;
-    // Mirrors the SDK's stdio default: the backend gets this long to close its browser after stdin closes.
+    // Shutdown-only bound, mirroring the SDK's stdio default: how long the backend gets to close its browser after
+    // stdin closes, and how long each later shutdown wait may take before the exit is reported as unconfirmed.
     private static readonly TimeSpan ShutdownGrace = TimeSpan.FromSeconds(5);
     private static readonly string[] ProfileFlags = ["--user-data-dir", "--cdp-endpoint", "--extension", "--storage-state", "--config"];
 
     private sealed class Connection(BrowserMountConfig config)
     {
         public BrowserMountConfig Config { get; } = config;
+        public readonly object Sync = new();
         public McpClient? Client;
         public Process? Process;
         public nint Job;
@@ -66,11 +69,12 @@ public sealed class BrowserMounts(CodexishRuntime runtime) : IAsyncDisposable
             tools = c.Tools.Select(t => t.ProtocolTool.Name).ToArray(),
             stderr_tail = c.State == "connected" ? null : Tail(c)
         }).ToArray(),
-        configured = owner.Config.BrowserMounts.Length,
+        configured = owner.Config.BrowserMounts?.Length ?? 0,
         transport = "stdio child process driven by the official MCP client; CODEXish opens no browser debugging listener",
         profile = "dedicated: CODEXish passes --user-data-dir under state_dir to a Playwright backend; existing: the configured arguments select the browser state",
         limits_source = "Action and navigation limits are the backend's own options and defaults; CODEXish adds no action deadline.",
-        boundary = "The backend runs unconfined as the logged-in user with the root as working directory; it is not a browser network or filesystem sandbox.",
+        boundary = "Mounted backend tools, for example file upload, script evaluation or run_code_unsafe, run as the logged-in user and are not contained by the root or its grants: the grants only decide whether CODEXish forwards a call, and the root is the backend's working directory, not a filesystem, network or code sandbox.",
+        read_only_tools = "Tools listed in read_only_tools are forwarded without an invocation_id and bypass the ledger because the local configuration says so; CODEXish does not verify that they are free of side effects.",
         reload = "Mount configuration is read at server start."
     };
 
@@ -107,14 +111,35 @@ public sealed class BrowserMounts(CodexishRuntime runtime) : IAsyncDisposable
         return environment;
     }
 
+    // JSON null for a field or collection becomes an empty value, so a malformed entry fails its own validation
+    // instead of throwing out of initialization.
+    internal static BrowserMountConfig Normalize(BrowserMountConfig? mount)
+    {
+        mount ??= new BrowserMountConfig { Id = "", Kind = "", ProfileMode = "" };
+        mount.Id ??= "";
+        mount.RootId ??= "";
+        mount.Kind ??= "";
+        mount.Command ??= "";
+        mount.ProfileMode ??= "";
+        mount.Args ??= [];
+        mount.ReadOnlyTools ??= [];
+        return mount;
+    }
+
+    // Ids are compared without case on every platform, as root ids are: a dedicated profile directory is named after
+    // the id, and on Windows "pw" and "PW" would share it.
+    internal static ISet<string> NewIdSet() => new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
     internal static string? Invalid(BrowserMountConfig mount, ISet<string> ids)
     {
         if (!Regex.IsMatch(mount.Id, "^[A-Za-z0-9_-]{1,24}$")) return "id must be 1-24 ASCII letters, digits, underscores or hyphens.";
-        if (!ids.Add(mount.Id)) return $"id '{mount.Id}' is already used by an earlier mount.";
+        if (!ids.Add(mount.Id)) return $"id '{mount.Id}' is already used by an earlier mount (ids are compared without case).";
         if (string.IsNullOrWhiteSpace(mount.Command)) return "command is required.";
         if (string.IsNullOrWhiteSpace(mount.RootId)) return "root_id is required.";
         if (mount.Kind is not ("playwright" or "custom")) return "kind must be playwright or custom.";
         if (mount.ProfileMode is not ("dedicated" or "existing")) return "profile_mode must be dedicated or existing.";
+        if (mount.Args.Any(a => a is null)) return "args must not contain null.";
+        if (mount.ReadOnlyTools.Any(t => t is null)) return "read_only_tools must not contain null.";
         if (mount.Kind == "playwright" && mount.ProfileMode == "dedicated" &&
             mount.Args.Any(a => ProfileFlags.Any(flag => a == flag || a.StartsWith(flag + "=", StringComparison.Ordinal))))
             return "Profile, CDP endpoint, extension, storage-state and config flags select existing browser state; use profile_mode=existing for them. A dedicated profile directory is supplied by CODEXish.";
@@ -125,13 +150,17 @@ public sealed class BrowserMounts(CodexishRuntime runtime) : IAsyncDisposable
     public async Task InitializeAsync(CancellationToken cancellation = default)
     {
         if (Interlocked.Exchange(ref initialized, 1) != 0) return;
-        var ids = new HashSet<string>(StringComparer.Ordinal);
+        var ids = NewIdSet();
         var names = new HashSet<string>(CodexishRuntime.ToolNames, StringComparer.Ordinal);
-        foreach (var mount in owner.Config.BrowserMounts)
+        foreach (var entry in owner.Config.BrowserMounts ?? [])
         {
+            var mount = Normalize(entry);
             var connection = new Connection(mount);
             connections.Add(connection);
-            if (Invalid(mount, ids) is { } problem)
+            string? problem;
+            try { problem = entry is null ? "the browser_mounts entry is null." : Invalid(mount, ids); }
+            catch (Exception error) { problem = "the entry could not be validated: " + error.GetType().Name; }
+            if (problem is not null)
             {
                 connection.State = "invalid_config";
                 connection.Error = problem;
@@ -151,12 +180,12 @@ public sealed class BrowserMounts(CodexishRuntime runtime) : IAsyncDisposable
             }
             catch (Exception error)
             {
-                bool exited = connection.Process is { } process && Exited(process);
-                string exit = exited ? $"; backend exited with code {connection.Process!.ExitCode}" : "";
-                await StopConnection(connection);
+                string exit = connection.Process is { } process && Exited(process) ? $"; backend exited with code {ExitCode(process)}" : "";
+                bool ended = await StopConnection(connection);
                 connection.Tools.Clear();
                 connection.State = "unavailable";
-                connection.Error = error.GetType().Name + ": " + Redaction.Apply(error.Message).Text + exit;
+                connection.Error = error.GetType().Name + ": " + Redaction.Apply(error.Message).Text + exit +
+                    (ended ? "" : "; the backend process exit could not be confirmed");
                 Report(connection);
             }
         }
@@ -196,12 +225,7 @@ public sealed class BrowserMounts(CodexishRuntime runtime) : IAsyncDisposable
         }
         _ = Drain(connection, process.StandardError);
         process.EnableRaisingEvents = true;
-        process.Exited += (_, _) =>
-        {
-            if (connection.State != "connected") return;
-            connection.State = "exited";
-            connection.Error = "The backend process exited; restart the server to reconnect.";
-        };
+        process.Exited += (_, _) => OnExited(connection, process);
         var transport = new StreamClientTransport(process.StandardInput.BaseStream, process.StandardOutput.BaseStream);
         connection.Client = await McpClient.CreateAsync(transport, new McpClientOptions
         {
@@ -216,18 +240,48 @@ public sealed class BrowserMounts(CodexishRuntime runtime) : IAsyncDisposable
         names.UnionWith(mapped);
         connection.Tools.AddRange(proxies);
         connection.Version = connection.Client.ServerInfo?.Version;
-        connection.State = "connected";
-        if (Exited(process))
-        {
-            connection.State = "exited";
-            connection.Error = "The backend process exited; restart the server to reconnect.";
-        }
+        lock (connection.Sync) connection.State = "connected";
+        // An exit during the handshake raised Exited while the mount was still starting, so it is handled here.
+        if (Exited(process)) OnExited(connection, process);
     }
 
     private static bool Exited(Process process)
     {
         try { return process.HasExited; }
         catch (InvalidOperationException) { return true; }
+    }
+
+    private static string ExitCode(Process process)
+    {
+        try { return process.ExitCode.ToString(CultureInfo.InvariantCulture); }
+        catch (Exception) { return "unknown"; }
+    }
+
+    // A backend that exits on its own releases its session and job at once, so its tools answer BROWSER_UNAVAILABLE
+    // and closing the kill-on-close job ends any browser it left behind.
+    private void OnExited(Connection connection, Process process)
+    {
+        lock (connection.Sync)
+        {
+            if (connection.State != "connected") return;
+            connection.State = "exited";
+            connection.Error = $"The backend process exited with code {ExitCode(process)}; its tools answer BROWSER_UNAVAILABLE until the server restarts.";
+        }
+        _ = CloseSession(connection);
+        CloseJob(connection);
+        Report(connection);
+    }
+
+    // For tests: whether a mount still holds a session, a job handle and a process object.
+    internal (string State, bool Session, bool Job, int? ProcessId) Resources(string id)
+    {
+        var connection = connections.Single(c => c.Config.Id == id);
+        lock (connection.Sync)
+        {
+            int? pid = null;
+            try { pid = connection.Process?.Id; } catch (Exception) { }
+            return (connection.State, connection.Client is not null, connection.Job != 0, pid);
+        }
     }
 
     private static string[] Tail(Connection connection)
@@ -260,38 +314,68 @@ public sealed class BrowserMounts(CodexishRuntime runtime) : IAsyncDisposable
         catch (Exception) { /* the diagnostic stream ends with the process */ }
     }
 
-    private static async Task StopConnection(Connection connection)
+    private static Task CloseSession(Connection connection)
     {
-        if (connection.Client is { } client)
+        var client = Interlocked.Exchange(ref connection.Client, null);
+        return client is null ? Task.CompletedTask : Task.Run(async () =>
         {
-            connection.Client = null;
             try { await client.DisposeAsync().ConfigureAwait(false); } catch (Exception) { }
-        }
-        if (connection.Process is { } process)
+        });
+    }
+
+    private static void CloseJob(Connection connection)
+    {
+        nint job = Interlocked.Exchange(ref connection.Job, (nint)0);
+        if (job != 0) Native.CloseJob(job);
+    }
+
+    private static async Task<bool> ExitsWithin(Process process, TimeSpan bound)
+    {
+        try
         {
-            try
+            using var timeout = new CancellationTokenSource(bound);
+            await process.WaitForExitAsync(timeout.Token).ConfigureAwait(false);
+            return true;
+        }
+        catch (Exception) { return Exited(process); }
+    }
+
+    // Ends one backend without an unbounded wait: the session is cancelled first, the backend gets the grace period to
+    // close its browser after end of input, then its Job Object is terminated (or its process tree killed), and the
+    // remaining waits are bounded. Returns false when the process exit could not be confirmed.
+    private static async Task<bool> StopConnection(Connection connection)
+    {
+        var closing = CloseSession(connection);
+        Process? process;
+        lock (connection.Sync) process = connection.Process;
+        bool exited = true;
+        if (process is not null)
+        {
+            try { process.StandardInput.Close(); } catch (Exception) { }
+            exited = await ExitsWithin(process, ShutdownGrace).ConfigureAwait(false);
+            if (!exited)
             {
-                if (!Exited(process))
+                nint job = Interlocked.Exchange(ref connection.Job, (nint)0);
+                if (job != 0)
                 {
-                    // End of input lets the backend close its browser before anything is killed.
-                    try { process.StandardInput.Close(); } catch (Exception) { }
-                    using var grace = new CancellationTokenSource(ShutdownGrace);
-                    try { await process.WaitForExitAsync(grace.Token).ConfigureAwait(false); }
-                    catch (OperationCanceledException) { try { process.Kill(entireProcessTree: true); } catch (Exception) { } }
+                    Native.TerminateJob(job);
+                    Native.CloseJob(job);
                 }
-                await process.WaitForExitAsync().ConfigureAwait(false);
+                try { process.Kill(entireProcessTree: true); } catch (Exception) { }
             }
-            catch (Exception) { /* the process is gone or no longer ours */ }
         }
-        if (connection.Job != 0)
+        // Closing the kill-on-close job also ends children the backend left behind, such as its browser.
+        CloseJob(connection);
+        await Task.WhenAny(closing, Task.Delay(ShutdownGrace)).ConfigureAwait(false);
+        if (process is not null)
         {
-            // Closing the kill-on-close job ends anything the backend left behind, such as a browser child.
-            Native.CloseJob(connection.Job);
-            connection.Job = 0;
+            if (!exited) exited = await ExitsWithin(process, ShutdownGrace).ConfigureAwait(false);
+            lock (connection.Sync)
+                if (ReferenceEquals(connection.Process, process)) connection.Process = null;
+            // Disposing also ends the stderr drain; it is not awaited because an inherited pipe must not hold shutdown.
+            process.Dispose();
         }
-        // Disposing also ends the stderr drain; it is not awaited because an inherited pipe must not hold shutdown.
-        connection.Process?.Dispose();
-        connection.Process = null;
+        return exited;
     }
 
     // Cancels in-flight backend calls so shutdown does not wait on a browser that never answers.
@@ -303,8 +387,19 @@ public sealed class BrowserMounts(CodexishRuntime runtime) : IAsyncDisposable
         Stop();
         foreach (var connection in connections)
         {
-            await StopConnection(connection).ConfigureAwait(false);
-            if (connection.State is "connected" or "exited") connection.State = "stopped";
+            bool active;
+            lock (connection.Sync)
+            {
+                active = connection.State == "connected";
+                // A stop in progress is not a backend exiting on its own.
+                if (active) connection.State = "stopping";
+            }
+            bool exited = await StopConnection(connection).ConfigureAwait(false);
+            lock (connection.Sync)
+            {
+                if (active) connection.State = exited ? "stopped" : "exited_unknown";
+                else if (!exited) connection.State = "exited_unknown";
+            }
         }
     }
 
@@ -379,6 +474,55 @@ public sealed class BrowserMounts(CodexishRuntime runtime) : IAsyncDisposable
             _ => JsonNode.Parse(e.GetRawText())
         };
         return JsonSerializer.SerializeToElement(Clean(element));
+    }
+
+    // Text blocks travel as data.text. Every other block except binary image and audio is redacted string by string,
+    // so embedded text resources, resource links, their URIs, names and descriptions and any later block type are
+    // covered; base64 payloads ("data" of image/audio, "blob" of binary resources) are left intact.
+    internal static IEnumerable<ContentBlock> PassThrough(IEnumerable<ContentBlock> content)
+    {
+        foreach (var block in content)
+        {
+            if (block is TextContentBlock) continue;
+            yield return block is ImageContentBlock or AudioContentBlock ? block : RedactedBlock(block);
+        }
+    }
+
+    private static ContentBlock RedactedBlock(ContentBlock block)
+    {
+        try
+        {
+            var node = JsonSerializer.SerializeToNode(block, McpJsonUtilities.DefaultOptions);
+            Scrub(node);
+            return node.Deserialize<ContentBlock>(McpJsonUtilities.DefaultOptions)
+                ?? throw new JsonException("The redacted content block could not be read back.");
+        }
+        catch (Exception error) when (error is JsonException or NotSupportedException or InvalidOperationException)
+        {
+            return new TextContentBlock { Text = $"[CODEXish omitted a '{block.Type}' content block it could not redact: {error.GetType().Name}]" };
+        }
+    }
+
+    private static void Scrub(JsonNode? node)
+    {
+        if (node is JsonObject obj)
+        {
+            bool binary = obj["type"] is JsonValue kind && kind.TryGetValue<string>(out var type) && type is "image" or "audio";
+            foreach (var (name, child) in obj.ToArray())
+            {
+                if (name == "blob" || (binary && name == "data")) continue;
+                if (child is JsonValue value && value.TryGetValue<string>(out var text)) obj[name] = Redaction.Apply(text).Text;
+                else Scrub(child);
+            }
+        }
+        else if (node is JsonArray array)
+        {
+            for (int i = 0; i < array.Count; i++)
+            {
+                if (array[i] is JsonValue value && value.TryGetValue<string>(out var text)) array[i] = Redaction.Apply(text).Text;
+                else Scrub(array[i]);
+            }
+        }
     }
 
     private sealed class MountedTool : McpServerTool
@@ -458,11 +602,10 @@ public sealed class BrowserMounts(CodexishRuntime runtime) : IAsyncDisposable
                 var envelope = result.IsError == true
                     ? Reply.Error("BROWSER_BACKEND_ERROR", "The backend returned a tool error; read its text before another action.", uncertain, data: detail)
                     : Reply.Ok(detail);
-                // Images and other non-text content are passed through unchanged after the envelope.
                 return new CallToolResult
                 {
                     IsError = envelope.IsError, StructuredContent = envelope.StructuredContent,
-                    Content = [.. envelope.Content, .. result.Content.Where(c => c is not TextContentBlock)]
+                    Content = [.. envelope.Content, .. PassThrough(result.Content)]
                 };
             }
             catch (CodexishFault fault) { return Reply.Fault(fault); }

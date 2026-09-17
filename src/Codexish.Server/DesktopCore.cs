@@ -107,47 +107,163 @@ public interface IDesktopPlatform
     WindowActionResult WindowAction(DesktopWindow window, string action);
 }
 
-// ActivationInputsSent counts the synthetic foreground-lock release events. They are never folded into an action's
-// delivered/planned input counters, and Method is null whenever the request was not confirmed.
-public sealed record WindowActionResult(bool Confirmed, string? Method, int ActivationInputsSent, string[] Attempted);
+// ActivationInputsSent counts the synthetic foreground-lock release events and CleanupInputsSent the extra key-ups
+// that released a delivered key-down whose own key-up was not accepted; neither is folded into an action's
+// delivered/planned input. CleanupConfirmed is false while a delivered ALT key-down may still be held, and such a
+// result is never Confirmed. Method is null whenever the request was not confirmed; Failures names primitive errors.
+public sealed record WindowActionResult(bool Confirmed, string? Method, int ActivationInputsSent, string[] Attempted,
+    int CleanupInputsSent = 0, bool CleanupConfirmed = true, string[]? Failures = null);
 
+// Thin native primitives; the order, cleanup and confirmation rules around them live in ForegroundActivation.
 public interface IForegroundSteps
 {
     bool Minimized { get; }
     bool Foreground { get; }
     void Restore();
     void SetForeground();
-    void AttachThreadInputAndSetForeground();
-    int AltTapAndSetForeground();
-    bool Confirm(Func<bool> state);
+    void BringToTop();
+    (uint Self, uint Foreground, uint Target) InputThreads();
+    bool AttachInput(uint thread, uint other, bool attach);
+    // One synthetic ALT key event; returns the number of events SendInput accepted.
+    int SendAlt(bool up);
+    // One confirmation sampling interval.
+    void Pause();
 }
 
-// The order and stop rules of foreground activation live here, apart from the native calls, so they are
-// verified without a desktop: each step runs only after every earlier step failed to confirm.
+// The order, stop and cleanup rules of foreground activation live here, apart from the native calls, so they are
+// verified without a desktop: each step runs only after every earlier step failed to confirm, and the chain returns
+// its counts on every path instead of throwing them away.
 public static class ForegroundActivation
 {
+    // A state counts only when two consecutive samples show it, so a foreground that flickers back is not reported.
+    // At the native 15 ms interval this is about half a second per step: it confirms an OS transition and is not a
+    // deadline for the request.
+    public const int ConfirmationSamples = 34;
+
     public static WindowActionResult Run(IForegroundSteps steps)
     {
         var attempted = new List<string>();
-        if (steps.Minimized)
+        var failures = new List<string>();
+        int inputs = 0, cleanup = 0;
+        bool released = true;
+        WindowActionResult Result(bool confirmed, string? method)
         {
-            attempted.Add("restore");
-            steps.Restore();
-            if (!steps.Confirm(() => !steps.Minimized)) return new(false, null, 0, [.. attempted]);
+            // A key-down that may still be held is never reported as a confirmed activation.
+            bool ok = confirmed && released;
+            return new(ok, ok ? method : null, inputs, [.. attempted], cleanup, released, [.. failures]);
         }
-        if (steps.Foreground) return new(true, "already_foreground", 0, [.. attempted]);
-        attempted.Add("set_foreground");
-        steps.SetForeground();
-        if (steps.Confirm(() => steps.Foreground)) return new(true, "set_foreground", 0, [.. attempted]);
-        attempted.Add("attach_thread_input");
-        steps.AttachThreadInputAndSetForeground();
-        if (steps.Confirm(() => steps.Foreground)) return new(true, "attach_thread_input", 0, [.. attempted]);
-        attempted.Add("alt_tap");
-        int inputs = steps.AltTapAndSetForeground();
-        return steps.Confirm(() => steps.Foreground)
-            ? new(true, "alt_tap", inputs, [.. attempted])
-            : new(false, null, inputs, [.. attempted]);
+        try
+        {
+            if (steps.Minimized)
+            {
+                attempted.Add("restore");
+                steps.Restore();
+                if (!Settled(steps, () => !steps.Minimized, ConfirmationSamples)) return Result(false, null);
+            }
+            if (Settled(steps, () => steps.Foreground, 2)) return Result(true, "already_foreground");
+            attempted.Add("set_foreground");
+            steps.SetForeground();
+            if (Settled(steps, () => steps.Foreground, ConfirmationSamples)) return Result(true, "set_foreground");
+            attempted.Add("attach_thread_input");
+            AttachAndSetForeground(steps, failures);
+            if (Settled(steps, () => steps.Foreground, ConfirmationSamples)) return Result(true, "attach_thread_input");
+            attempted.Add("alt_tap");
+            (inputs, cleanup, released) = AltTap(steps, failures);
+            return Result(released && Settled(steps, () => steps.Foreground, ConfirmationSamples), "alt_tap");
+        }
+        catch (Exception error)
+        {
+            failures.Add(Failure("activation", error));
+            return Result(false, null);
+        }
     }
+
+    private static bool Settled(IForegroundSteps steps, Func<bool> state, int samples)
+    {
+        bool previous = false;
+        for (int sample = 0; sample < samples; sample++)
+        {
+            if (sample > 0) steps.Pause();
+            bool current = state();
+            if (current && previous) return true;
+            previous = current;
+        }
+        return false;
+    }
+
+    private static void AttachAndSetForeground(IForegroundSteps steps, List<string> failures)
+    {
+        try
+        {
+            var (self, foreground, target) = steps.InputThreads();
+            bool toForeground = false, toTarget = false;
+            try
+            {
+                if (foreground != 0 && foreground != self) toForeground = steps.AttachInput(self, foreground, true);
+                if (target != 0 && target != self && target != foreground) toTarget = steps.AttachInput(self, target, true);
+                steps.BringToTop();
+                steps.SetForeground();
+            }
+            finally
+            {
+                // Each detach runs even when the other fails, so no input queue stays joined to the worker thread.
+                try { if (toTarget) Detach(steps, self, target, "detach_target", failures); }
+                catch (Exception error) { failures.Add(Failure("detach_target", error)); }
+                finally
+                {
+                    try { if (toForeground) Detach(steps, self, foreground, "detach_foreground", failures); }
+                    catch (Exception error) { failures.Add(Failure("detach_foreground", error)); }
+                }
+            }
+        }
+        catch (Exception error) { failures.Add(Failure("attach_thread_input", error)); }
+    }
+
+    private static void Detach(IForegroundSteps steps, uint self, uint other, string label, List<string> failures)
+    {
+        if (!steps.AttachInput(self, other, false)) failures.Add(label + ": AttachThreadInput returned false");
+    }
+
+    // ALT down, SetForegroundWindow, ALT up. When the key-down may have been delivered but its key-up was not
+    // accepted, one more key-up releases it; that is cleanup of delivered input, not a replay of the tap.
+    private static (int Sent, int Cleanup, bool Released) AltTap(IForegroundSteps steps, List<string> failures)
+    {
+        int sent = 0, cleanup = 0;
+        bool mayBeHeld;
+        try
+        {
+            int down = steps.SendAlt(false);
+            sent += down;
+            mayBeHeld = down > 0;
+        }
+        catch (Exception error)
+        {
+            failures.Add(Failure("alt_down", error));
+            mayBeHeld = true; // Delivery is unknown, so the key is treated as possibly held.
+        }
+        try { steps.SetForeground(); }
+        catch (Exception error) { failures.Add(Failure("set_foreground", error)); }
+        if (!mayBeHeld) return (sent, cleanup, true);
+        try
+        {
+            int up = steps.SendAlt(true);
+            sent += up;
+            if (up > 0) return (sent, cleanup, true);
+            failures.Add("alt_up: SendInput accepted 0 of 1 events");
+        }
+        catch (Exception error) { failures.Add(Failure("alt_up", error)); }
+        try
+        {
+            int release = steps.SendAlt(true);
+            cleanup += release;
+            if (release > 0) return (sent, cleanup, true);
+            failures.Add("alt_cleanup: SendInput accepted 0 of 1 events");
+        }
+        catch (Exception error) { failures.Add(Failure("alt_cleanup", error)); }
+        return (sent, cleanup, false);
+    }
+
+    private static string Failure(string step, Exception error) => step + ": " + error.GetType().Name;
 }
 
 public sealed class DesktopService : IDisposable
@@ -298,7 +414,9 @@ public sealed class DesktopService : IDisposable
                 var outcome = platform.WindowAction(target, action);
                 if (action == "focus_window") activation = outcome;
                 if (!outcome.Confirmed)
-                    throw new CodexishFault("EXECUTION_UNKNOWN", "Windows did not confirm this window request; reobserve instead of forcing focus.", "unknown");
+                    throw new CodexishFault("EXECUTION_UNKNOWN", outcome.CleanupConfirmed
+                        ? "Windows did not confirm this window request; reobserve instead of forcing focus."
+                        : "Windows did not confirm this window request, and a synthetic ALT key-down could not be confirmed released; reobserve and check the keyboard state before sending input.", "unknown");
                 windowSubmitted = true; plan = [];
             }
             else if (action is "type_text" or "key_combo" or "key_press")
@@ -378,7 +496,8 @@ public sealed class DesktopService : IDisposable
     private static object? Activation(WindowActionResult? result) => result is null ? null : new
     {
         method = result.Method, confirmed = result.Confirmed, attempted = result.Attempted,
-        activation_inputs_sent = result.ActivationInputsSent
+        activation_inputs_sent = result.ActivationInputsSent, cleanup_inputs_sent = result.CleanupInputsSent,
+        cleanup_confirmed = result.CleanupConfirmed, failures = result.Failures ?? Array.Empty<string>()
     };
     private static CallToolResult WithImage(CallToolResult result, byte[] png) => new()
     {

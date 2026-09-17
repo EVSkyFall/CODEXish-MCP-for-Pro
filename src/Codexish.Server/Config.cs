@@ -80,6 +80,12 @@ public sealed class ServerConfig
         if (OAuth.AccessTokenHours <= 0 || OAuth.RefreshTokenDays <= 0)
             throw new ArgumentException("access_token_hours and refresh_token_days must be positive.");
         if (string.IsNullOrWhiteSpace(StateDir)) throw new ArgumentException("state_dir is required.");
+        // JSON null for these optional sections means none configured; each browser mount entry is validated on its
+        // own when the mounts start, so one malformed entry cannot stop the server.
+        BrowserMounts ??= [];
+        Tunnel ??= new();
+        Tunnel.Command ??= "";
+        Tunnel.Args ??= [];
         StateDir = System.IO.Path.TrimEndingDirectorySeparator(System.IO.Path.GetFullPath(StateDir));
         if (Roots.Length == 0) throw new ArgumentException("Configure at least one root with --root id=path.");
         var ids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);

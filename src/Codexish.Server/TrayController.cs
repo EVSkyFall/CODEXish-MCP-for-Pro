@@ -28,8 +28,17 @@ public sealed class TrayController(ServerConfig config) : IAsyncDisposable
 
     private void Log(string value)
     {
-        string line = DateTimeOffset.UtcNow.ToString("O") + " " + Redaction.Apply(value).Text;
+        string line = DateTimeOffset.UtcNow.ToString("O") + " " + Scrub(value);
         lock (diagnostics) diagnostics.Add(line);
+    }
+
+    // The configuration's own secrets are not environment variables, so the shared redaction cannot know them; they
+    // are replaced first, before the published patterns run, so a pattern match cannot split them.
+    internal string Scrub(string value)
+    {
+        foreach (var (secret, kind) in new[] { (config.ControlToken, "control_token"), (config.OAuth.ClientSecret, "client_secret"), (config.OAuth.PasswordHash, "password_hash") })
+            if (!string.IsNullOrEmpty(secret)) value = value.Replace(secret, $"[REDACTED:{kind}]", StringComparison.Ordinal);
+        return Redaction.Apply(value).Text;
     }
 
     public async Task StartAsync()
@@ -79,7 +88,8 @@ public sealed class TrayController(ServerConfig config) : IAsyncDisposable
         finally { gate.Release(); }
     }
 
-    // Only an explicit menu action starts the tunnel; starting the server never does.
+    // Only an explicit menu action starts the tunnel; starting the server never does. The tunnel inherits the tray's
+    // environment on purpose, because tunnel tools commonly read their settings from environment variables.
     public async Task StartTunnelAsync()
     {
         await gate.WaitAsync();
@@ -125,6 +135,9 @@ public sealed class TrayController(ServerConfig config) : IAsyncDisposable
         {
             await StopTunnelCore();
             if (app is null) return;
+            // Browser calls in flight are cancelled before the host drains its requests, so a backend that never
+            // answers cannot hold the stop.
+            runtime?.Browsers.Stop();
             await app.StopAsync();
             await app.DisposeAsync();
             app = null;
@@ -181,6 +194,20 @@ public static class TrayTests
             Check(!controller.Running && !controller.TunnelRunning, "stop disposes the host and runtime");
             await controller.StartAsync();
             Check(controller.Running && !controller.TunnelRunning, "the same controller restarts with the existing local state and still no tunnel");
+            // A tunnel that prints the configuration's secrets leaves only redaction markers in the diagnostics.
+            config.Tunnel = OperatingSystem.IsWindows()
+                ? new TunnelConfig { Command = Path.Combine(Environment.SystemDirectory, "cmd.exe"), Args = ["/c", "echo", "tunnel", config.ControlToken, config.OAuth.ClientSecret, config.OAuth.PasswordHash, "{port}"] }
+                : new TunnelConfig { Command = "/bin/sh", Args = ["-c", "echo tunnel \"$1\" \"$2\" \"$3\" {port}", "sh", config.ControlToken, config.OAuth.ClientSecret, config.OAuth.PasswordHash] };
+            await controller.StartTunnelAsync();
+            // The echo ends by itself; stopping earlier would kill it before it printed anything.
+            var tunnelWatch = Stopwatch.StartNew();
+            while (controller.TunnelRunning && tunnelWatch.Elapsed < TimeSpan.FromSeconds(30)) await Task.Delay(50);
+            await controller.StopTunnelAsync();
+            string? echoed = controller.Diagnostics.FirstOrDefault(x => x.Contains("Tunnel: tunnel", StringComparison.Ordinal));
+            Check(echoed is not null && echoed.Contains("[REDACTED:control_token]", StringComparison.Ordinal) && echoed.Contains("[REDACTED:client_secret]", StringComparison.Ordinal) &&
+                echoed.Contains("[REDACTED:password_hash]", StringComparison.Ordinal) && controller.Diagnostics.All(x => !x.Contains(config.ControlToken, StringComparison.Ordinal) &&
+                !x.Contains(config.OAuth.ClientSecret, StringComparison.Ordinal) && !x.Contains(config.OAuth.PasswordHash, StringComparison.Ordinal)),
+                "tunnel output that repeats the control token, client secret or password hash is redacted in the diagnostics");
             await controller.StopAsync();
             Check(controller.Diagnostics.Length > 0 && controller.Diagnostics.All(x => !x.Contains(config.ControlToken) && !x.Contains(config.OAuth.ClientSecret)),
                 "diagnostics do not contain control or client secrets");
