@@ -28,7 +28,7 @@ public static class DesktopPlatform
         public DesktopUi Query(DesktopWindow window) => throw Missing();
         public long HitTest(int x, int y) => throw Missing();
         public int Send(DesktopInput[] inputs, DesktopRect desktop) => throw Missing();
-        public bool WindowAction(DesktopWindow window, string action) => throw Missing();
+        public WindowActionResult WindowAction(DesktopWindow window, string action) => throw Missing();
     }
 #endif
 }
@@ -146,12 +146,64 @@ internal sealed class WindowsDesktopPlatform(int? fixturePid = null) : IDesktopP
             X = i.Kind == "move" ? (int)((((long)i.X - desktop.X) * 65536 + 32768) / desktop.Width) : 0,
             Y = i.Kind == "move" ? (int)((((long)i.Y - desktop.Y) * 65536 + 32768) / desktop.Height) : 0 } } };
     }
-    public bool WindowAction(DesktopWindow window, string action)
+    public WindowActionResult WindowAction(DesktopWindow window, string action)
     {
         Ready(); nint handle = (nint)window.Handle; VerifyIntegrity(handle);
-        if (action == "focus_window") { if (GetForegroundWindow() == handle && !IsIconic(handle)) return true; if (IsIconic(handle)) ShowWindowAsync(handle, 9); return SetForegroundWindow(handle); }
+        if (action == "focus_window") return ForegroundActivation.Run(new ForegroundSteps(handle));
         int mode = action switch { "minimize_window" => 6, "maximize_window" => 3, "restore_window" => 9, _ => throw new ArgumentException("Unknown window action") };
-        return ShowWindowAsync(handle, mode);
+        bool submitted = ShowWindowAsync(handle, mode);
+        return new(submitted, submitted ? "show_window_async" : null, 0, ["show_window_async"]);
+    }
+    // A background server loses to the Windows foreground lock, so SetForegroundWindow alone is not enough.
+    // No system parameter, lock timeout, other process's permission or privilege is changed by these steps.
+    private sealed class ForegroundSteps(nint handle) : IForegroundSteps
+    {
+        // Confirms an OS state transition that normally lands within milliseconds; it is not a deadline for the request.
+        private static readonly TimeSpan ConfirmationPoll = TimeSpan.FromMilliseconds(500);
+        public bool Minimized => IsIconic(handle);
+        public bool Foreground => GetForegroundWindow() == handle && !IsIconic(handle);
+        public void Restore() => ShowWindow(handle, 9);
+        public void SetForeground() => SetForegroundWindow(handle);
+        public void AttachThreadInputAndSetForeground()
+        {
+            uint self = GetCurrentThreadId();
+            nint foreground = GetForegroundWindow();
+            uint foregroundThread = foreground == 0 ? 0 : GetWindowThreadProcessId(foreground, out _);
+            uint targetThread = GetWindowThreadProcessId(handle, out _);
+            bool toForeground = false, toTarget = false;
+            try
+            {
+                if (foregroundThread != 0 && foregroundThread != self) toForeground = AttachThreadInput(self, foregroundThread, true);
+                if (targetThread != 0 && targetThread != self && targetThread != foregroundThread) toTarget = AttachThreadInput(self, targetThread, true);
+                BringWindowToTop(handle);
+                SetForegroundWindow(handle);
+            }
+            finally
+            {
+                if (toTarget) AttachThreadInput(self, targetThread, false);
+                if (toForeground) AttachThreadInput(self, foregroundThread, false);
+            }
+        }
+        // Windows permits SetForegroundWindow after the calling process generated the last input event.
+        public int AltTapAndSetForeground()
+        {
+            int size = Marshal.SizeOf<Input>();
+            int sent = checked((int)SendInput(1, [Alt(false)], size));
+            try { SetForegroundWindow(handle); }
+            finally { if (sent > 0) sent += checked((int)SendInput(1, [Alt(true)], size)); }
+            return sent;
+        }
+        private static Input Alt(bool up) => new() { Type = 1, Data = new() { Key = new() { Vk = 0x12, Flags = up ? 2u : 0 } } };
+        public bool Confirm(Func<bool> state)
+        {
+            var elapsed = Stopwatch.StartNew();
+            while (!state())
+            {
+                if (elapsed.Elapsed >= ConfirmationPoll) return false;
+                Thread.Sleep(15);
+            }
+            return true;
+        }
     }
     // Read security labels only; never elevate or change another process token.
     private static void VerifyIntegrity(nint window)
@@ -212,6 +264,10 @@ internal sealed class WindowsDesktopPlatform(int? fixturePid = null) : IDesktopP
     [DllImport("user32.dll", SetLastError = true)] private static extern uint SendInput(uint count, Input[] input, int size);
     [DllImport("user32.dll")] private static extern bool SetForegroundWindow(nint window);
     [DllImport("user32.dll")] private static extern bool ShowWindowAsync(nint window, int command);
+    [DllImport("user32.dll")] private static extern bool ShowWindow(nint window, int command);
+    [DllImport("user32.dll")] private static extern bool BringWindowToTop(nint window);
+    [DllImport("user32.dll")] private static extern bool AttachThreadInput(uint attach, uint attachTo, bool on);
+    [DllImport("kernel32.dll")] private static extern uint GetCurrentThreadId();
     [DllImport("user32.dll")] private static extern nint SetThreadDpiAwarenessContext(nint context);
     [DllImport("user32.dll")] private static extern nint OpenInputDesktop(uint flags, bool inherit, uint access);
     [DllImport("user32.dll")] private static extern bool CloseDesktop(nint desktop);

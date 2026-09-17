@@ -47,6 +47,8 @@ public sealed class ServerConfig
     [JsonPropertyName("git")] public GitConfig Git { get; set; } = new();
     [JsonPropertyName("oauth")] public OAuthConfig OAuth { get; set; } = new();
     [JsonPropertyName("control_token")] public string ControlToken { get; set; } = "";
+    [JsonPropertyName("browser_mounts")] public BrowserMountConfig[] BrowserMounts { get; set; } = [];
+    [JsonPropertyName("tunnel")] public TunnelConfig Tunnel { get; set; } = new();
 
     public const string DefaultRedirectUri = "https://chatgpt.com/connector_platform_oauth_redirect";
     private static readonly JsonSerializerOptions Format = new() { WriteIndented = true };

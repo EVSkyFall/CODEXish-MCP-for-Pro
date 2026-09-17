@@ -103,6 +103,7 @@ public static class DesktopLiveTests
             string id = Id(observation);
             var focused = await desktop.Act(id, "focus_window", "none", null, null, null, null, null, null, null, 0, true);
             Success(focused, "focus"); id = PostId(focused);
+            Console.WriteLine("LIVE focus activation " + Data(focused).GetProperty("activation").GetRawText());
             // ShowWindowAsync returns before the compositor finishes its animation. Re-observe; never repeat the effect.
             async Task<string> Settled()
             {

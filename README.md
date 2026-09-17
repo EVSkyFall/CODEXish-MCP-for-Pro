@@ -3,9 +3,11 @@
 A single C#/.NET 10 Streamable HTTP application that gives a ChatGPT connector real tools on a Windows PC.
 Two projects live here:
 
-- **[v1 slice 1](#v1-slice-1-coding-core) — `src/Codexish.Server`**: the coding core. Files, patches, shell and
-  process supervision, read-only Git, artifacts, an invocation ledger, a built-in OAuth authorization server and
-  a loopback control API. 21 MCP tools. Desktop control is slice 2 and is **not** in this build.
+- **[v1](#v1-slice-1-coding-core) — `src/Codexish.Server`**: the coding core (files, patches, shell and process
+  supervision, read-only Git, artifacts, an invocation ledger, a built-in OAuth authorization server and a loopback
+  control API; 21 tools), the desktop tools `computer_observe`, `computer_query_ui` and `computer_act` (slice 2),
+  optional tools mounted from an existing browser MCP server ([slice 3](#browser-mounts-slice-3)) and a Windows
+  tray ([slice 4](#tray-slice-4-windows)).
 - **[P0 probe](#p0-probe) — `src/Codexish.P0`**: the seven-tool measurement fixture that answers whether the
   selected Chat Pro model can use tools and observe/control a disposable Notepad at all. It is unchanged and
   still runnable; the M-1 to M-8 measurements are still unperformed.
@@ -92,15 +94,92 @@ Invoke-RestMethod -Method Get  -Uri http://127.0.0.1:3000/control/status        
 Pause is a hold, not a refusal: while paused, a write is accepted into its queue and returned as `queued` with
 `paused: true`, reads keep working, and the queue drains on resume.
 
+### Browser mounts (slice 3)
+
+CODEXish does not drive a browser itself. It starts an existing browser MCP server as a stdio child process and
+publishes that server's tools next to its own. For Playwright MCP installed with `npm install @playwright/mcp` in a
+tools directory, add this to `codexish.json`:
+
+```json
+"browser_mounts": [
+  {
+    "id": "pw",
+    "root_id": "proj",
+    "kind": "playwright",
+    "command": "C:\\Program Files\\nodejs\\node.exe",
+    "args": ["C:\\Tools\\playwright-mcp\\node_modules\\@playwright\\mcp\\cli.js", "--headless", "--browser", "chrome"],
+    "profile_mode": "dedicated",
+    "read_only_tools": ["browser_snapshot"]
+  }
+]
+```
+
+- `command` is started directly with `args`, without a shell, and with the root as its working directory. `.cmd`
+  shims such as `npx` cannot be started this way; run `node` with the path to `cli.js`.
+- `profile_mode: "dedicated"` (the default) keeps the browser's state in `<state_dir>\browser-profiles\<id>`:
+  CODEXish appends `--user-data-dir` with that directory for `kind: "playwright"`. A dedicated mount whose own
+  `args` contain `--user-data-dir`, `--cdp-endpoint`, `--extension`, `--storage-state` or `--config` is not started
+  and is reported as `invalid_config`. `profile_mode: "existing"` passes `args` unchanged; choose it only when you
+  deliberately point the backend at an existing profile, CDP endpoint or extension. `{profile_dir}` in `args`
+  expands to the per-mount directory in both modes. `kind: "custom"` mounts another stdio MCP server without
+  profile handling.
+- Tools appear as `browser_<id>_<backend tool>`, for example `browser_pw_browser_navigate`. A name that is not
+  `^[a-zA-Z0-9_-]+$` or would exceed 64 characters is shortened and given a short hash suffix. Every mounted tool
+  takes the backend's own inputs inside `arguments`. Tools listed in `read_only_tools` run directly; every other
+  tool is treated as a change: it needs an `invocation_id`, runs through the ledger (an identical retry returns the
+  stored result), and its `wait_ms` is a response wait only.
+- Starting a mount and calling a read-only tool need read and shell grants on `root_id`; other tools also need write.
+- The backend receives a small environment: system and user profile paths, `PATH`, `TEMP` and `DOTNET_ROOT`.
+  Variables whose names look like credentials are never passed, and proxy variables are not passed either.
+- A mount that fails to start does not stop the server. `host_capabilities` reports each mount's `state`
+  (`connected`, `unavailable`, `invalid_config`, `exited`) with its error and the last lines of its stderr. Mounts
+  are read when the server starts. The backend runs unconfined as you; the root is its grant and working directory,
+  not a browser network or filesystem sandbox.
+
+### Tray (slice 4, Windows)
+
+```powershell
+dotnet run --project src/Codexish.Server -c Release -- --tray
+dotnet run --project src/Codexish.Server -c Release -- --tray --config D:\Codexish\codexish.json
+```
+
+`--tray` runs the same server behind a notification-area icon. Without a configuration file it first shows a setup
+form (public https origin, one project root, a new CODEXish password and the OAuth callback), writes the file like
+`--init` and shows the client secret once. The server starts only from **Start server**. The menu also offers status
+with roots and processes, pause and resume, stopping session children, token revocation, the connection rejection
+log, and **Edit roots and grants**, which stops the server and saves the file.
+
+**Start configured tunnel** runs `tunnel.command` with `tunnel.args` as a child of the tray; `{port}` becomes the
+listening port. Nothing downloads or selects a tunnel, starting the server never starts one, and stopping the server
+or exiting the tray stops it:
+
+```json
+"tunnel": { "command": "C:\\Tools\\cloudflared.exe", "args": ["tunnel", "--url", "http://127.0.0.1:{port}"] }
+```
+
+The tray exists only in the Windows build; elsewhere `--tray` prints a message and exits with code 2.
+
 ### Tests
 
 ```powershell
 dotnet run --project src/Codexish.Server -c Release -- --self-test
+dotnet run --project src/Codexish.Server -c Release -- --browser-tests
+dotnet run --project src/Codexish.Server -c Release -- --tray-tests
 ```
 
 The self-test uses real files, a real SQLite ledger, real child processes, a real booby-trapped Git repository
 and a real in-process HTTP listener. It opens no tunnel, sends no desktop input and performs no ChatGPT
-measurement. Windows-only checks print `SKIP` elsewhere.
+measurement. Windows-only checks print `SKIP` elsewhere. `--browser-tests` runs this executable as a stdio MCP
+fixture behind the real HTTP host; `--tray-tests` drives the tray controller over the local control endpoint without
+an icon or a tunnel. All three run in CI on Windows and Ubuntu.
+
+Explicit local checks, never run in CI:
+
+- `--browser-live-test <node.exe> <@playwright/mcp cli.js> <chrome.exe>`: a headless browser with a dedicated
+  profile against a loopback page served by the test itself.
+- `--tray-smoke-test`: creates and removes a notification icon.
+- `--self-test-desktop` and `--self-test-desktop-http`: control a new self-owned window on the interactive desktop,
+  the second through the authenticated HTTP host. Both take the foreground and send real input.
 
 ### What v1 slice 1 does not do
 

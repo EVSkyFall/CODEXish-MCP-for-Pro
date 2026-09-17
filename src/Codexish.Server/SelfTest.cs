@@ -86,12 +86,15 @@ public static class SelfTest
         {
             // This directory was created by this test invocation only. A child process that has not finished
             // exiting can still hold its working directory, so the delete is retried before giving up loudly.
+            // A recursive delete can also return while a deleted file is still held open elsewhere, leaving the
+            // emptied directories behind, so success means the directory is actually gone.
             bool removed = false;
             for (int attempt = 0; attempt < 20 && !removed; attempt++)
             {
-                try { ForceDelete(temp); removed = true; }
-                catch (IOException) { Thread.Sleep(500); }
-                catch (UnauthorizedAccessException) { Thread.Sleep(500); }
+                try { ForceDelete(temp); removed = !Directory.Exists(temp); }
+                catch (IOException) { }
+                catch (UnauthorizedAccessException) { }
+                if (!removed) Thread.Sleep(500);
             }
             if (!removed) Console.Error.WriteLine($"WARNING: could not remove the test directory {temp}");
         }

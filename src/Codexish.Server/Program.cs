@@ -1,5 +1,21 @@
 using Codexish.Server;
 
+if (args.Contains("--tray-smoke-test")) return await TrayApplication.Run("", smoke: true);
+if (args.Contains("--tray-tests")) return await TrayTests.Run();
+if (args.Contains("--browser-fixture")) return await BrowserTests.Fixture(CommandLine.Values(args, "--browser-fixture")[0]);
+if (args.Contains("--browser-tests")) return await BrowserTests.Run();
+if (args.Contains("--browser-live-test"))
+{
+    int at = Array.IndexOf(args, "--browser-live-test");
+    if (args.Length < at + 4)
+    {
+        Console.Error.WriteLine("Usage: --browser-live-test <node executable> <@playwright/mcp cli.js> <chrome executable>");
+        return 2;
+    }
+    return await BrowserLiveTests.Run(args[at + 1], args[at + 2], args[at + 3]);
+}
+// Explicit live acceptance: it drives a new self-owned window through the authenticated HTTP host.
+if (args.Contains("--self-test-desktop-http")) return await DesktopHttpAcceptance.Run();
 if (args.Contains("--desktop-regression-test")) return await DesktopRegressionTests.Run();
 if (args.Contains("--desktop-fixture")) return DesktopLiveTests.Fixture(args[^1]);
 if (args.Contains("--self-test-desktop")) return await DesktopLiveTests.Run();
@@ -14,6 +30,7 @@ if (args.Contains("--self-test"))
 
 string? Option(string name) => CommandLine.Values(args, name).FirstOrDefault();
 string configPath = Option("--config") ?? ServerConfig.DefaultPath;
+if (args.Contains("--tray")) return await TrayApplication.Run(configPath);
 
 if (args.Contains("--init"))
 {
@@ -62,11 +79,14 @@ if (noAuth && ServerConfig.NoAuthRefusal(config) is { } refusal) throw new Argum
 if (ServerConfig.TransportRefusal(config, noAuth) is { } insecure) throw new ArgumentException(insecure);
 
 using var runtime = new CodexishRuntime(config, noAuth);
+// A mount that cannot start is reported in host_capabilities; the coding and desktop tools start regardless.
+await runtime.Browsers.InitializeAsync();
 var app = CodexishHost.Build(runtime, config.Port, instructions: !args.Contains("--no-instructions"));
 Console.WriteLine($"""
-    CODEXish v1 slice 2 (coding core and desktop)
+    CODEXish v1 (coding core, desktop, browser mounts)
       MCP           http://127.0.0.1:{config.Port}/mcp  (published as {config.PublicUrl}/mcp)
       Roots         {string.Join(", ", config.Roots.Select(r => $"{r.Id}:{(r.Read ? "r" : "")}{(r.Write ? "w" : "")}{(r.Shell ? "x" : "")}"))}
+      Browser       {runtime.Browsers.Summary()}
       State         {config.StateDir}
       Auth          {(noAuth ? "DISABLED (loopback development only)" : "OAuth bearer required on /mcp")}
       Control       POST http://127.0.0.1:{config.Port}/control/pause with header X-Codexish-Control

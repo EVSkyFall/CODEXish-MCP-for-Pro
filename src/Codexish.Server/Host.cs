@@ -24,7 +24,7 @@ public static class CodexishHost
             o.ServerInfo = new() { Name = "CODEXish", Version = CodexishRuntime.ServerVersion };
             o.ServerInstructions = instructions ? CodexishRuntime.Instructions : null;
         }).WithHttpTransport(o => o.SessionMode = HttpServerSessionMode.Stateless)
-          .WithTools<CodexishTools>().WithTools<DesktopTools>();
+          .WithTools<CodexishTools>().WithTools<DesktopTools>().WithTools(runtime.Browsers.Tools);
         var app = builder.Build();
 
         app.Use(async (context, next) =>
@@ -71,7 +71,7 @@ public static class CodexishHost
 
         app.MapGet("/healthz", () => new
         {
-            status = "codexish_v1_slice2",
+            status = "codexish_v1_slice4",
             authentication = runtime.AuthDisabled ? "disabled" : "oauth_bearer",
             binding = "loopback_only",
             paused = runtime.Ledger.Paused

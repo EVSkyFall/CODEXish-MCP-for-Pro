@@ -104,7 +104,50 @@ public interface IDesktopPlatform
     DesktopUi Query(DesktopWindow window);
     long HitTest(int x, int y);
     int Send(DesktopInput[] inputs, DesktopRect desktop);
-    bool WindowAction(DesktopWindow window, string action);
+    WindowActionResult WindowAction(DesktopWindow window, string action);
+}
+
+// ActivationInputsSent counts the synthetic foreground-lock release events. They are never folded into an action's
+// delivered/planned input counters, and Method is null whenever the request was not confirmed.
+public sealed record WindowActionResult(bool Confirmed, string? Method, int ActivationInputsSent, string[] Attempted);
+
+public interface IForegroundSteps
+{
+    bool Minimized { get; }
+    bool Foreground { get; }
+    void Restore();
+    void SetForeground();
+    void AttachThreadInputAndSetForeground();
+    int AltTapAndSetForeground();
+    bool Confirm(Func<bool> state);
+}
+
+// The order and stop rules of foreground activation live here, apart from the native calls, so they are
+// verified without a desktop: each step runs only after every earlier step failed to confirm.
+public static class ForegroundActivation
+{
+    public static WindowActionResult Run(IForegroundSteps steps)
+    {
+        var attempted = new List<string>();
+        if (steps.Minimized)
+        {
+            attempted.Add("restore");
+            steps.Restore();
+            if (!steps.Confirm(() => !steps.Minimized)) return new(false, null, 0, [.. attempted]);
+        }
+        if (steps.Foreground) return new(true, "already_foreground", 0, [.. attempted]);
+        attempted.Add("set_foreground");
+        steps.SetForeground();
+        if (steps.Confirm(() => steps.Foreground)) return new(true, "set_foreground", 0, [.. attempted]);
+        attempted.Add("attach_thread_input");
+        steps.AttachThreadInputAndSetForeground();
+        if (steps.Confirm(() => steps.Foreground)) return new(true, "attach_thread_input", 0, [.. attempted]);
+        attempted.Add("alt_tap");
+        int inputs = steps.AltTapAndSetForeground();
+        return steps.Confirm(() => steps.Foreground)
+            ? new(true, "alt_tap", inputs, [.. attempted])
+            : new(false, null, inputs, [.. attempted]);
+    }
 }
 
 public sealed class DesktopService : IDisposable
@@ -239,6 +282,7 @@ public sealed class DesktopService : IDisposable
         int? endX, int? endY, string? elementId, string? text, string? key, int wheel, bool after, CancellationToken cancellation = default) => OnThread(() =>
     {
         bool attempted = false; bool windowSubmitted = false; int delivered = 0; int planned = 0; int cleanup = 0; int cleanupSent = 0;
+        WindowActionResult? activation = null;
         try
         {
             cancellation.ThrowIfCancellationRequested();
@@ -251,7 +295,9 @@ public sealed class DesktopService : IDisposable
             {
                 if (space != "none") throw new CodexishFault("INVALID_ARGUMENT", "Window actions use coordinate_space=none.");
                 attempted = true;
-                if (!platform.WindowAction(target, action))
+                var outcome = platform.WindowAction(target, action);
+                if (action == "focus_window") activation = outcome;
+                if (!outcome.Confirmed)
                     throw new CodexishFault("EXECUTION_UNKNOWN", "Windows did not confirm this window request; reobserve instead of forcing focus.", "unknown");
                 windowSubmitted = true; plan = [];
             }
@@ -309,7 +355,7 @@ public sealed class DesktopService : IDisposable
                 }
             }
             CallToolResult? post = after ? ObserveNow(target.Id, obs.MaxWidth, obs.WindowOnly, obs.CustomCrop ? obs.Geometry.Source : null) : null;
-            var ok = Reply.Ok(new { action, delivered, planned, side_effects = attempted ? "applied" : "none",
+            var ok = Reply.Ok(new { action, delivered, planned, activation = Activation(activation), side_effects = attempted ? "applied" : "none",
                 business_outcome = "not_verified", observation = post?.StructuredContent, next_tool = "inspect observation; verify saved file/test outcome separately" });
             return post is null ? ok : AppendImages(ok, post);
         }
@@ -324,10 +370,16 @@ public sealed class DesktopService : IDisposable
             if (attempted && fault?.Code is "WINDOW_NOT_FOUND" or "STALE_OBSERVATION") effects = "applied";
             return Reply.Error(attempted && effects != "none" ? "EXECUTION_UNKNOWN" : fault?.Code ?? "EXECUTION_FAILED",
                 fault?.Message ?? "Desktop provider failed; inspect the effect before retrying.", effects,
-                details: new { cause = fault?.Code ?? e.GetType().Name, delivered, planned, cleanup_planned = cleanup, cleanup_sent = cleanupSent },
+                details: new { cause = fault?.Code ?? e.GetType().Name, delivered, planned, cleanup_planned = cleanup, cleanup_sent = cleanupSent,
+                    activation = Activation(activation) },
                 recovery: "computer_observe; never replay uncertain input");
         }
     });
+    private static object? Activation(WindowActionResult? result) => result is null ? null : new
+    {
+        method = result.Method, confirmed = result.Confirmed, attempted = result.Attempted,
+        activation_inputs_sent = result.ActivationInputsSent
+    };
     private static CallToolResult WithImage(CallToolResult result, byte[] png) => new()
     {
         IsError = result.IsError, StructuredContent = result.StructuredContent,
@@ -360,7 +412,7 @@ public sealed class DesktopTools(CodexishRuntime runtime, DesktopService desktop
     public Task<CallToolResult> Query(string observation_id, string? role = null, string? name = null, string? cursor = null, int page_size = 100) =>
         desktop.Query(observation_id, role, name, cursor, page_size);
     [McpServerTool(Name = "computer_act", ReadOnly = false, Destructive = true, OpenWorld = true)]
-    [Description("Perform one Windows action then observe by default. Actions: click_element, click_coordinate, double_click, right_click, move, scroll, drag, type_text, key_combo, key_press, focus_window, minimize_window, maximize_window, restore_window. coordinate_space is required: image/desktop_physical_px for points, none for keyboard/window/element. Focus_window can recover lost foreground. Use same invocation_id only for identical retries. Partial input releases delivered key-downs and is never replayed; verify actual files after saving. Next tool: computer_observe or fs_read to verify the outcome.")]
+    [Description("Perform one Windows action then observe by default. Actions: click_element, click_coordinate, double_click, right_click, move, scroll, drag, type_text, key_combo, key_press, focus_window, minimize_window, maximize_window, restore_window. coordinate_space is required: image/desktop_physical_px for points, none for keyboard/window/element. Focus_window can recover lost foreground; it reports activation.method, and when Windows holds the foreground lock it may send one synthetic ALT tap, counted in activation_inputs_sent. Use same invocation_id only for identical retries. Partial input releases delivered key-downs and is never replayed; verify actual files after saving. Next tool: computer_observe or fs_read to verify the outcome.")]
     public Task<CallToolResult> Act(string observation_id, string action, string coordinate_space, string invocation_id,
         int? x = null, int? y = null, int? end_x = null, int? end_y = null, string? element_id = null,
         string? text = null, string? key = null, int wheel_delta = -120, bool observe_after = true) =>
