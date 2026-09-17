@@ -1,39 +1,29 @@
 # CODEXish v1 slice plan
 
-Updated 2026-09-17 after user approval of mainline A / PR #4. Follow [current implementation status](../IMPLEMENTATION_STATUS.md) for actual evidence; source existence or CI alone does not establish real ChatGPT completion.
+Updated 2026-09-17. Mainline A remains the user's selected baseline; no merge is performed by this plan. Current evidence and execution blocks are in [IMPLEMENTATION_STATUS.md](../IMPLEMENTATION_STATUS.md).
 
-| Slice | Scope | Current state |
+| Slice | Scope | State |
 | --- | --- | --- |
-| 1 | Coding core, 21 underscore tools including checkpoint, embedded OAuth and local control | Mainline A, PR #4 Ready for review; not merged |
-| 2 | computer_observe, computer_query_ui, computer_act | Draft PR #5; recovered implementation and tests, open findings S2-01–03 |
-| 3 | Existing browser MCP server mount | Not started |
-| 4 | Tray and installation/lifecycle UX | Not started |
-| 5 | Remaining independent extensions | Deferred |
+| 1 | Coding core, 21 tools, OAuth and local control | PR #4 mainline A, Ready for review; unmerged |
+| 2 | computer_observe, computer_query_ui, computer_act | PR #5 Draft; S2-01–03 fixed and CI verified; broader live acceptance still incomplete |
+| 3 | Existing browser MCP stdio mount | Module draft only; runtime integration blocked before execution, not published |
+| 4 | Tray and installation/lifecycle UX | Not implemented |
+| 5 | Independent extensions | Deferred; not implemented |
 
-## Slice 1
+## Current desktop work
 
-Preserve A's files, shell/process execution and Windows Job supervision, fixed Git reads, artifacts/cursors, SQLite invocation recovery, per-resource FIFO, root grants, OAuth and local control. Git writes stay under shell_run, not new Git write tools. PR #3 remains a reference with selected improvements already ported; its branch is retained.
+Source 05ae9e2 freezes UI page responses and original element references, retains the requested capture maximum, and represents a minimized window-only observation without capturing unrelated pixels. Eleven regressions accompany these corrections. Exact-source CI passes 284 Windows and 275 Linux assertions across coding, desktop core and correction suites.
 
-## Slice 2
+The latest local full-suite attempts stalled during Git fixture setup and were stopped, not counted as passes. The fresh native fixture passed capture/UIA checks but returned EXECUTION_UNKNOWN on focus; no keyboard/mouse input followed. Diagnose foreground behavior and run authenticated HTTP desktop and target-application acceptance when the corresponding work is allowed. Do not infer these results from CI or earlier WPF successes.
 
-Promote the P0 desktop concepts without changing P0 itself. Current implementation includes virtual-desktop physical pixels, window/cursor/focus metadata, scaled/cropped PNG, observation-bound coordinates, selected-window UIA, active tabs, focus recovery, mouse/keyboard/window actions and default action-plus-observation. Partial input cleanup releases only delivered outstanding key-downs. InputTick is metadata.
+## Browser mount
 
-Actual evidence is 272 local Windows assertions plus six self-owned live fixture checks; exact source CI reports 273 Windows and 264 Linux assertions. Counts differ because of OS/privilege-specific checks. Keep the live fixture separate from fake-backend and HTTP registration tests.
+Use an existing Playwright or Chrome DevTools MCP backend rather than implementing CDP. Preserve its input schema and image content, apply the existing grants and invocation ledger, and report the selected backend and actual boundaries. A dedicated profile is the default; personal-profile attachment requires an explicit selection. The currently preserved draft is not an implemented mount and was not exposed through the server.
 
-Completion still requires closing the findings in [desktop-slice2.md](desktop-slice2.md), validating re-query/replay behavior, and recording broader actual target-app and physical display tests. Passing one WPF fixture journey does not satisfy Notepad Save As, all actions, multi-monitor/mixed-DPI or Pro/Thinking measurements. Do not mark the slice complete or start advertising later browser/tray work as implemented.
+## Tray
 
-## Slice 3
+Wrap existing server/control lifecycle in a Windows tray: server status, roots/grants, live processes/queues, pause/resume/kill-children/revoke tokens and diagnostics. Grants remain file-backed; no second policy store or repetitive approval UI. No tray completion is claimed while it has no executable integration or tests.
 
-Mount an existing Playwright/Chrome DevTools MCP rather than implementing CDP. Proxy names, descriptions, permissions and results explicitly, with a dedicated browser profile by default. Report the mounted backend and its boundaries. Personal-profile attachment is an explicit selection, not an implicit fallback.
+## Deferred work and verification
 
-## Slice 4
-
-Wrap the existing control/lifecycle in a Windows tray: start/stop, roots/grants, live processes and queued work, pause/resume/kill-children/revoke tokens, and visible connection diagnostics. Keep grants file-backed; do not introduce a second permission store or repeated action approval UI.
-
-## Slice 5
-
-Deferred items include scoped fs_mkdir/fs_move/fs_delete, worktree operations, a paged session journal, LSP diagnostics/symbols, remaining process/native robustness work, browser batching and optional tunnel integration. These are not part of the present desktop completion claim. No new identity architecture, privileges or policy limits are approved merely by this list.
-
-## Review and merge
-
-A is the approved development line; P0 precedes A for the user's eventual merge. PR #5 is stacked on A so its desktop diff remains separate. Keep branches and reviewer history. A green build supports review, not automatic merge or fabricated model measurements.
+Scoped filesystem management, worktrees, journal paging, LSP and optional tunnel integration remain separate extensions. Actual ChatGPT OAuth, image reception, continuation and the Pro/Thinking measurement table remain unrecorded. Existing user decisions do not create measurement evidence. Keep original P0 and reviewer history, and retain branches for the user's eventual merge sequence.

@@ -1,37 +1,53 @@
 # Actual implementation and verification status
 
-Updated: 2026-09-17. Mainline: **A / PR #4**. Desktop continuation: **Draft PR #5**, not merged or approved as complete.
+Updated 2026-09-17. Mainline **A / PR #4** is unchanged. Desktop **PR #5 remains Draft**. No merge, force push, branch deletion, or whole-product completion is reported.
 
-## Current lineage
+## Current source and completed corrections
 
-The user's approval selects PR #4 (`feat/v1-slice1-opus`) as mainline. PR #4 is Ready for review. PR #3 is closed as reference/ported implementation, with its branch retained. No PR was merged and no branch was deleted in this continuation. Merge remains the user's action, with P0 before mainline A.
+Product source: `05ae9e2aaa23833b5e089d73b18dfa0a4f24d8ab` (tree `8f56a9707e08eda023456abb1890321e21b941c6`). This commit was already on the desktop branch when the latest continuation resumed. It supersedes the earlier open-finding statements for S2-01–S2-03; the current continuation verified it rather than recreating its changes.
 
-Desktop branch `feat/v1-slice2-desktop` builds on A at `3cb46760abd7a7ff42e5cd31e3e4aa005711e5ae`. Earlier desktop commits `f7044fc`, `67338aa`, `a1d6124` are preserved. Recovery integration commit: **`0c2b2e90c5ef8e911172d4ee615ee707c8b59f82`**, tree `fe5f32bb5bae63de5bc9778990001e59b4bbf024`.
+| Finding | Implemented correction | Regression evidence |
+| --- | --- | --- |
+| S2-01 | Cached complete UI page response; cursor binds filters and page size | Identical response/next cursor on replay; size mismatch rejected; no duplicate/missing elements |
+| S2-02 | Issued element references retain their original snapshots | Re-query yields a different reference for changed state; old moved target refuses input |
+| S2-03 | Original max_width retained; minimized window-only views are metadata-only | Native/scaled post-capture remains correct after resizing; no unrelated screenshot on minimize; restore yields image |
 
-The recovered working copy was backed up before validation. The 11 integration file Git blob hashes match the published source after normalizing checkout CRLF to Git LF. `src/Codexish.P0` remains unchanged from `c1b04cd`; workflows and deployment settings were not edited. This status update changes documentation only.
+See [correction implementation](docs/desktop-corrections.md) and [latest continuation record](docs/continuation-20260917.md). These findings are **implemented and regression-tested**, not proof of full desktop acceptance or independent review approval.
 
-## Actual tests on the recovered source
+## Verified source CI
 
-| Environment | Build | Coding tests | Deterministic desktop tests | Total | Live desktop fixture |
-| --- | --- | ---: | ---: | ---: | --- |
-| Authorized Windows 11 PC / portable .NET 10.0.401 | exit 0; 0 warnings, 0 errors | 235 PASS | 37 PASS | 272 | 6 PASS, exit 0 |
-| GitHub Windows Server 2025 / .NET 10.0.401 | exit 0; 0 warnings, 0 errors | 236 PASS | 37 PASS | 273 | Not run |
-| GitHub Ubuntu 24.04.5 / .NET 10.0.401 | exit 0; 0 warnings, 0 errors | 226 PASS | 38 PASS | 264 | Not run |
+[Run 35186928060](https://github.com/EVSkyFall/CODEXish-MCP-for-Pro/actions/runs/35186928060) checked out exactly `05ae9e2`. Its branch label is `feat/v1-slice3-browser-mount`, but the SHA contains the same desktop source, not an implemented browser mount. Both complete job logs and completion metadata were read.
 
-The local Windows log explicitly skips a dangling-symbolic-link test because that session may not create symbolic links. No privilege or OS setting was changed to run it. Windows CI executes it. Linux skips Windows-specific sharing/Job checks and adds the explicit unavailable-native-desktop check. Counts are assertions across suites, not separate end-to-end user tasks.
+| Runner / SDK | Job | Coding | Desktop core | S2 regression | Total assertions | Build warnings / errors |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| Windows Server 2025 / .NET 10.0.401 | 105090882195 | 236 PASS | 37 PASS | 11 PASS | **284** | **0 / 0** |
+| Ubuntu 24.04.5 / .NET 10.0.401 | 105090882020 | 226 PASS | 38 PASS | 11 PASS | **275** | **0 / 0** |
 
-Verified code CI: [run 35183820986](https://github.com/EVSkyFall/CODEXish-MCP-for-Pro/actions/runs/35183820986), checkout exactly `0c2b2e9`. Full logs were read for Windows job `105081481480` and Ubuntu job `105081481674`; restore, Release build, self-test and artifact upload completed. Schema artifacts: Windows `10481153210`, Ubuntu `10481636120`. Existing Node/action deprecation warnings are separate from the zero compiler warnings.
+Restore, Release build, all three suites, and artifact upload succeeded. Schema artifacts are Windows `10482876186` and Ubuntu `10481863507`. Platform-specific skips explain the different counts. Existing workflow Node/action deprecation notices are not compiler warnings. CI does not send desktop input or establish ChatGPT behavior.
 
-Fresh local log labels are `resume-build-1`, `resume-self-tests-1`, `resume-live-1` in the existing CODEXish temporary evidence directory. Test children use the existing isolated environment/SDK runner. The live fixture creates only its own new WPF process, captures that window, exercises UIA, maximizes/restores, clicks its editor, types Unicode, and saves through Ctrl+S. Exact saved text: `CODEXish desktop verification - 한글`; 38 UTF-8 bytes; SHA256 `65AE6CAA2D4F4DFBFAE6DD1E858FD5D9FDF028B8DCDD8EBDE3CF3077BE42912A`. Its temporary window and files are cleaned by the test. This is not Notepad Save As or a ChatGPT trial.
+## Latest local continuation — separate outcomes
 
-An earlier interrupted `desktop-final-live` log failed during restore with STALE_OBSERVATION and no delivered input. It remains a failed historical run. The recovered fixture's observation-only settling sequence was exercised in the fresh passing run; it does not repeat the action to wait for animation.
+A fresh temporary clone of `05ae9e2` was used on the authorized Windows PC with portable SDK 10.0.401; no existing working tree was overwritten.
 
-## Delivered scope and remaining work
+| Execution | Actual result |
+| --- | --- |
+| baseline-build: Release build | exit 0; 0 warnings, 0 errors |
+| desktop-core: --desktop-core-test | exit 0; 37 PASS, deterministic backend |
+| desktop-regressions: --desktop-regression-test | exit 0; 11 PASS, 0 FAIL, deterministic backend |
+| baseline-tests: full --self-test | Stopped by operator after initial Git fixture setup stalled at git add tracked.txt; NOT a passing full suite |
+| baseline-tests-isolated: second full --self-test with isolated child Git configuration | Same setup stall; stopped by operator; NOT a pass |
+| fresh --self-test-desktop, process 102444 | exit 1 after two checks: real opaque PNG and selected-tab UIA passed, then focus_window returned EXECUTION_UNKNOWN; no keyboard/mouse input was delivered |
 
-The server registers 24 underscore-named tools: the existing 21 coding/checkpoint tools plus `computer_observe`, `computer_query_ui`, `computer_act`. The native backend is Windows-only. Read [desktop preview and open findings](docs/desktop-slice2.md) before using the new surface. The root README and `docs/v1-design.md` still describe the stable coding base; this preview supplements them, not the archived PR #3 implementation.
+The latest native run's foreground request was not confirmed by Windows. Its root cause is not established, and the known fixture success from an earlier run is not substituted for this result. The runner closed its own fixture. No existing user document, security setting, privilege, tunnel or credential store was changed. The full-suite setup issue was not fixed by altering its test helper or weakening its assertions.
 
-**Slice 2 remains IN_PROGRESS.** Open findings S2-01 through S2-03 cover UI cursor replay stability, re-query element-reference rebinding, and post-action capture options/minimized window behavior. A single proposed correction was blocked before execution by the tool's safety-decision stage. Before/after hashes confirm it was not applied; it was not rerouted. The passing tests do not cover or close these findings.
+## Delivery boundary
 
-Not measured: Notepad Save As, other production apps, physical multi-monitor/mixed-DPI acceptance, real ChatGPT OAuth/image ingestion/continuation or Pro/Thinking M-1 through M-8. No measurements are inferred from CI or the WPF fixture. Browser mounting is slice 3; tray is slice 4.
+The published server still registers **24 tools**: 21 coding/checkpoint tools and computer_observe, computer_query_ui, computer_act. `src/Codexish.P0` and deployment/workflow scripts are unchanged. A remains PR #4; PR #3 remains closed with its reference branch retained.
 
-The preceding status document is preserved byte-for-byte as [IMPLEMENTATION_STATUS.slice1.md](IMPLEMENTATION_STATUS.slice1.md). Its "current" and "not run" statements refer to its historical slice-1/P0 dates, not to the new desktop fixture evidence above.
+A browser-mount module was drafted in a temporary clone. Its requested Config/Runtime/Host/Program integration was blocked before execution by the tool's safety-decision stage. A separate opt-in HTTP desktop acceptance test was drafted, but adding its CLI entry was also blocked before execution. Both drafts were moved outside the source tree and were **not committed, built, exposed as tools, or executed**. Tracked-source diff was empty after preservation. These blocks were not bypassed through another execution or publication route.
+
+Browser mounting is **not integrated**. Tray/lifecycle UI and deferred extensions are **not implemented**. Authenticated HTTP desktop acceptance, Notepad Save As, other production apps, physical multi-monitor/mixed-DPI acceptance, and real ChatGPT OAuth/image/continuation M-1–M-8 remain unverified. The blank measurements still support no Case 0/4 conclusion.
+
+## Earlier evidence retained
+
+For recovery source `0c2b2e9`, run `35183820986` passed Windows 236+37 and Ubuntu 226+38 assertions. A prior local `resume-live-1` passed six self-owned WPF checks and saved `CODEXish desktop verification - 한글` as 38 UTF-8 bytes, SHA256 `65AE6CAA2D4F4DFBFAE6DD1E858FD5D9FDF028B8DCDD8EBDE3CF3077BE42912A`. That evidence remains historical; the new focus failure is recorded above. Earlier source and procedure records remain in Git history, `docs/desktop-corrections.md`, and [IMPLEMENTATION_STATUS.slice1.md](IMPLEMENTATION_STATUS.slice1.md).
