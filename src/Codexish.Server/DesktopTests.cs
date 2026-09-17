@@ -30,12 +30,15 @@ public static class DesktopTests
         public int? Partial;
         public bool FailCapture;
         public bool FailAfterInput;
+        public bool FailCleanup;
+        public bool ChangeDuringCapture;
         public bool Occluded;
         public bool ElementMoved;
         public DesktopScene Inspect() => new(Bounds, "layout", [Window], Foreground, Tick, -1000, 50);
         public byte[] Capture(DesktopGeometry g)
         {
             if (FailCapture) throw new IOException("Synthetic capture failure");
+            if (ChangeDuringCapture) Window = Window with { Bounds = Window.Bounds with { X = Window.Bounds.X + 1 } };
             // This is explicitly a fake backend. Native capture never falls back to these bytes.
             return Convert.FromBase64String("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aOcQAAAAASUVORK5CYII=");
         }
@@ -46,6 +49,7 @@ public static class DesktopTests
         public long HitTest(int x, int y) => Occluded ? 987 : Window.Handle;
         public int Send(DesktopInput[] input, DesktopRect desktop)
         {
+                        if (FailCleanup && input.All(i => i.Up)) throw new CodexishFault("UNSUPPORTED_CAPABILITY", "Synthetic cleanup failure");
             Batches.Add(input); Sent++;
             int delivered = Partial ?? input.Length; Partial = null;
             if (FailAfterInput) FailCapture = true;
@@ -64,6 +68,7 @@ public static class DesktopTests
     {
         try
         {
+                        Check(DesktopRect.Intersect(new(-8, -8, 1936, 1096), new(0, 0, 1920, 1080)) == new DesktopRect(0, 0, 1920, 1080), "maximized invisible borders are clipped to the visible virtual desktop");
             var geometry = DesktopGeometry.Create(new(-1920, -200, 3840, 1280), 1280);
             Check(geometry.Width == 1280 && geometry.Height == 427, "negative virtual desktop and rounded image dimensions");
             Check(geometry.Point(640, 0, "image") == (0, -200), "image transform includes negative virtual origin exactly once");
@@ -107,12 +112,26 @@ public static class DesktopTests
             Check(Reply.CodeOf(focused) is null && fake.Foreground == fake.Window.Id, "focus_window recovers foreground using the bound target");
             id = PostId(focused); fake.Window = fake.Window with { StartTicks = 790 };
             Check(Reply.CodeOf(await Act(desktop, id, "type_text", text: "no")) == "STALE_OBSERVATION", "PID/window reuse with changed process start identity is stale");
-            fake.Window = fake.Window with { StartTicks = 789 }; fake.Occluded = true;
+            fake.Window = fake.Window with { StartTicks = 789, Dpi = 144 };
+            Check(Reply.CodeOf(await Act(desktop, id, "type_text", text: "no")) == "STALE_OBSERVATION", "DPI changes invalidate an observation even without a bounds change");
+            fake.Window = fake.Window with { Dpi = 96 }; fake.Occluded = true;
             Check(Reply.CodeOf(await Act(desktop, id, "click_coordinate", "desktop_physical_px", -1400, 50)) == "STALE_OBSERVATION", "occluding window is never clicked through");
             fake.Occluded = false; fake.Partial = 2;
             var partial = await Act(desktop, id, "key_combo", key: "CTRL+S");
             Check(Reply.CodeOf(partial) == "EXECUTION_UNKNOWN" && partial.StructuredContent!.Value.GetProperty("error").GetProperty("side_effects").GetString() == "partial", "partial native input reports uncertainty rather than success");
             Check(fake.Batches.Last().Select(i => i.Code).SequenceEqual(new[] { (int)'S', 17 }) && fake.Batches.Last().All(i => i.Up), "partial handler sends key-up cleanup, not the original action");
+            fake.Partial = 2; fake.FailCleanup = true;
+            var cleanupFailed = await Act(desktop, id, "key_combo", key: "CTRL+S");
+            Check(Reply.CodeOf(cleanupFailed) == "EXECUTION_UNKNOWN" && cleanupFailed.StructuredContent!.Value.GetProperty("error").GetProperty("side_effects").GetString() == "partial", "cleanup failure retains already-applied prefix effects");
+            fake.FailCleanup = false; fake.Partial = 0;
+            var zero = await Act(desktop, id, "key_combo", key: "CTRL+S");
+            Check(Reply.CodeOf(zero) == "EXECUTION_FAILED" && zero.StructuredContent!.Value.GetProperty("error").GetProperty("side_effects").GetString() == "none", "zero inserted events report no effect and no replay");
+            using var cancel = new CancellationTokenSource(); cancel.Cancel(); int beforeCancel = fake.Sent;
+            var cancelled = await desktop.Act(id, "type_text", "none", null, null, null, null, null, "no", null, 0, true, cancel.Token);
+            Check(Reply.CodeOf(cancelled) == "CANCELLED" && fake.Sent == beforeCancel, "cancelled desktop work sends no input");
+            var oldWindow = fake.Window; fake.ChangeDuringCapture = true;
+            var moving = await desktop.Observe(fake.Window.Id); fake.ChangeDuringCapture = false; fake.Window = oldWindow;
+            Check(!Data(moving).GetProperty("stable_during_capture").GetBoolean() && Reply.CodeOf(await Act(desktop, Id(moving), "type_text", text: "no")) == "STALE_OBSERVATION", "inconsistent capture remains stale even when window later returns to its old bounds");
             fake.FailAfterInput = true;
             var noPost = await Act(desktop, id, "type_text", text: "effect");
             Check(Reply.CodeOf(noPost) == "EXECUTION_UNKNOWN" && noPost.StructuredContent!.Value.GetProperty("error").GetProperty("side_effects").GetString() != "none", "post-capture failure cannot erase an already-delivered effect");

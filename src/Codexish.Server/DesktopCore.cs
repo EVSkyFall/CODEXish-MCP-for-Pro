@@ -1,19 +1,31 @@
 using System.Collections.Concurrent;
 using System.ComponentModel;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using ModelContextProtocol.Protocol;
 using ModelContextProtocol.Server;
 
 namespace Codexish.Server;
 
-public readonly record struct DesktopRect(int X, int Y, int Width, int Height)
+public readonly record struct DesktopRect([property: JsonPropertyName("x")] int X, [property: JsonPropertyName("y")] int Y,
+    [property: JsonPropertyName("width")] int Width, [property: JsonPropertyName("height")] int Height)
 {
+    public static DesktopRect Intersect(DesktopRect a, DesktopRect b)
+    {
+        long x = Math.Max(a.X, b.X), y = Math.Max(a.Y, b.Y);
+        long right = Math.Min((long)a.X + a.Width, (long)b.X + b.Width);
+        long bottom = Math.Min((long)a.Y + a.Height, (long)b.Y + b.Height);
+        return new((int)x, (int)y, (int)Math.Max(0, right - x), (int)Math.Max(0, bottom - y));
+    }
     public bool Contains(int x, int y) => x >= X && y >= Y && (long)x < (long)X + Width && (long)y < (long)Y + Height;
     public bool Contains(DesktopRect r) => r.Width > 0 && r.Height > 0 && Contains(r.X, r.Y) &&
         (long)r.X + r.Width <= (long)X + Width && (long)r.Y + r.Height <= (long)Y + Height;
 }
-public sealed record DesktopWindow(string Id, long Handle, int Pid, long StartTicks, string Title,
-    DesktopRect Bounds, bool Minimized, bool OwnProcess);
+public sealed record DesktopWindow([property: JsonPropertyName("window_id")] string Id,
+    [property: JsonPropertyName("handle")] long Handle, [property: JsonPropertyName("pid")] int Pid,
+    [property: JsonPropertyName("process_start_ticks")] long StartTicks, [property: JsonPropertyName("title")] string Title,
+    [property: JsonPropertyName("bounds")] DesktopRect Bounds, [property: JsonPropertyName("minimized")] bool Minimized,
+    [property: JsonPropertyName("server_owned")] bool OwnProcess, [property: JsonPropertyName("dpi")] uint Dpi = 96);
 public sealed record DesktopScene(DesktopRect Bounds, string Layout, DesktopWindow[] Windows,
     string? Foreground, uint InputTick, int CursorX, int CursorY);
 public sealed record DesktopElement(string Id, string Role, string Name, DesktopRect Bounds,
@@ -97,7 +109,7 @@ public interface IDesktopPlatform
 
 public sealed class DesktopService : IDisposable
 {
-    private sealed record Observation(string Id, DesktopScene Scene, DesktopWindow? Target, DesktopGeometry Geometry);
+    private sealed record Observation(string Id, DesktopScene Scene, DesktopWindow? Target, DesktopGeometry Geometry, bool Stable, bool WindowOnly, bool CustomCrop);
     private sealed record QueryPage(string Observation, string? Role, string? Name, DesktopElement[] Elements, int Offset);
     private readonly IDesktopPlatform platform;
     private readonly BlockingCollection<Action> work = new();
@@ -131,14 +143,18 @@ public sealed class DesktopService : IDisposable
         var target = selected is null ? null : scene.Windows.SingleOrDefault(w => w.Id == selected)
             ?? throw new CodexishFault("WINDOW_NOT_FOUND", "Selected window is no longer present; observe again.");
         if (target?.OwnProcess == true) throw new CodexishFault("UNSUPPORTED_CAPABILITY", "The server's own control UI is not a target.");
-        var rectangle = crop ?? (windowOnly ? target?.Bounds ?? throw new CodexishFault("WINDOW_NOT_FOUND", "A window is required.") : scene.Bounds);
-        if (!scene.Bounds.Contains(rectangle)) throw new CodexishFault("INVALID_ARGUMENT", "Capture rectangle must be inside the virtual desktop; use an explicit visible crop for a partly offscreen window.");
+        var rectangle = crop ?? (windowOnly ? DesktopRect.Intersect(target?.Bounds ?? throw new CodexishFault("WINDOW_NOT_FOUND", "A window is required."), scene.Bounds) : scene.Bounds);
+        if (!scene.Bounds.Contains(rectangle)) throw new CodexishFault("INVALID_ARGUMENT", "Capture rectangle must be inside the virtual desktop; restore a minimized window or use a visible crop.");
         var geometry = DesktopGeometry.Create(rectangle, maxWidth);
-        byte[] png = platform.Capture(geometry); DateTimeOffset captured = DateTimeOffset.UtcNow;
+        byte[] png;
+        try { png = platform.Capture(geometry); }
+        catch (CodexishFault) { throw; }
+        catch (Exception e) { throw new CodexishFault("EXECUTION_FAILED", "Desktop capture failed.", details: new { stage = "capture", provider_error = e.GetType().Name, hresult = e.HResult }); }
+        DateTimeOffset captured = DateTimeOffset.UtcNow;
         DesktopUi ui = target is null ? new([]) : platform.Query(target);
         DateTimeOffset queried = DateTimeOffset.UtcNow;
         var after = platform.Inspect();
-        var obs = new Observation("obs_" + Guid.NewGuid().ToString("N"), scene, target, geometry);
+        var obs = new Observation("obs_" + Guid.NewGuid().ToString("N"), scene, target, geometry, Same(scene, after, target, false), windowOnly, crop.HasValue);
         bool consistent = Same(scene, after, target, false);
         observations.Add(obs.Id, obs);
         var data = new { observation_id = obs.Id, window_id = target?.Id, capture = geometry.Describe(),
@@ -170,10 +186,11 @@ public sealed class DesktopService : IDisposable
         if (target is null) return true;
         var now = current.Windows.SingleOrDefault(w => w.Id == target.Id);
         return now is not null && now.Handle == target.Handle && now.Pid == target.Pid && now.StartTicks == target.StartTicks &&
-            now.Bounds == target.Bounds && now.Minimized == target.Minimized;
+            now.Bounds == target.Bounds && now.Minimized == target.Minimized && now.Dpi == target.Dpi;
     }
     private DesktopWindow Validate(Observation obs, bool focusAction = false)
     {
+        if (!obs.Stable) throw new CodexishFault("STALE_OBSERVATION", "Window changed while capturing this observation; observe again.");
         var target = obs.Target ?? throw new CodexishFault("WINDOW_NOT_FOUND", "Observation has no selected window.");
         if (target.OwnProcess) throw new CodexishFault("UNSUPPORTED_CAPABILITY", "Server control UI is excluded.");
         var scene = platform.Inspect();
@@ -208,11 +225,12 @@ public sealed class DesktopService : IDisposable
                 next_cursor = next, limits_source = "UI result page size; full query snapshot retained", next_tool = "computer_act click_element or continue cursor" });
         }));
     public Task<CallToolResult> Act(string observationId, string action, string space, int? x, int? y,
-        int? endX, int? endY, string? elementId, string? text, string? key, int wheel, bool after) => OnThread(() =>
+        int? endX, int? endY, string? elementId, string? text, string? key, int wheel, bool after, CancellationToken cancellation = default) => OnThread(() =>
     {
-        bool attempted = false; int delivered = 0; int planned = 0; int cleanup = 0; int cleanupSent = 0;
+        bool attempted = false; bool windowSubmitted = false; int delivered = 0; int planned = 0; int cleanup = 0; int cleanupSent = 0;
         try
         {
+            cancellation.ThrowIfCancellationRequested();
             var obs = Get(observationId);
             bool windowAction = action is "focus_window" or "minimize_window" or "maximize_window" or "restore_window";
             if (space is not ("image" or "desktop_physical_px" or "none")) throw new CodexishFault("INVALID_ARGUMENT", "coordinate_space must be image, desktop_physical_px or none.");
@@ -224,7 +242,7 @@ public sealed class DesktopService : IDisposable
                 attempted = true;
                 if (!platform.WindowAction(target, action))
                     throw new CodexishFault("EXECUTION_UNKNOWN", "Windows did not confirm this window request; reobserve instead of forcing focus.", "unknown");
-                plan = [];
+                windowSubmitted = true; plan = [];
             }
             else if (action is "type_text" or "key_combo" or "key_press")
             {
@@ -240,7 +258,7 @@ public sealed class DesktopService : IDisposable
                     if (space != "none" || elementId is null || !elements.TryGetValue(elementId, out var old) || old.observation != obs.Id)
                         throw new CodexishFault("STALE_OBSERVATION", "Use coordinate_space=none and an element_id from this observation.");
                     var current = platform.Query(target).Elements.SingleOrDefault(e => e.Id == old.element.Id);
-                    if (current is null || current.Bounds != old.element.Bounds || !current.Enabled || current.Offscreen)
+                    if (current is null || current.Bounds != old.element.Bounds || current.Role != old.element.Role || current.Name != old.element.Name || !current.Enabled || current.Offscreen)
                         throw new CodexishFault("STALE_OBSERVATION", "UI element moved, disappeared or is not interactable.");
                     point = (current.Bounds.X + current.Bounds.Width / 2, current.Bounds.Y + current.Bounds.Height / 2);
                 }
@@ -270,7 +288,7 @@ public sealed class DesktopService : IDisposable
             if (plan.Length > 0)
             {
                 Validate(obs); // Recheck after potentially slow UIA lookup, immediately before input.
-                attempted = true; planned = plan.Length; delivered = platform.Send(plan, obs.Scene.Bounds);
+                cancellation.ThrowIfCancellationRequested(); attempted = true; planned = plan.Length; delivered = platform.Send(plan, obs.Scene.Bounds);
                 if (delivered != plan.Length)
                 {
                     var release = DesktopInputPlan.Releases(plan, delivered); cleanup = release.Length;
@@ -279,15 +297,19 @@ public sealed class DesktopService : IDisposable
                         "Input was blocked or partially inserted; do not replay. Inspect the next observation.", delivered == 0 ? "none" : "partial");
                 }
             }
-            CallToolResult? post = after ? ObserveNow(target.Id, obs.Geometry.Width, false, obs.Geometry.Source) : null;
+            CallToolResult? post = after ? ObserveNow(target.Id, obs.Geometry.Width, obs.WindowOnly, obs.CustomCrop ? obs.Geometry.Source : null) : null;
             var ok = Reply.Ok(new { action, delivered, planned, side_effects = attempted ? "applied" : "none",
                 business_outcome = "not_verified", observation = post?.StructuredContent, next_tool = "inspect observation; verify saved file/test outcome separately" });
             return post is null ? ok : AppendImages(ok, post);
         }
         catch (Exception e)
         {
+            if (e is OperationCanceledException) return Reply.Error("CANCELLED", "Desktop action cancelled before delivery.", attempted ? "unknown" : "none");
             var fault = e as CodexishFault;
             string effects = fault?.Effects ?? (attempted ? "unknown" : "none");
+            // A later cleanup/capture error cannot erase events already acknowledged by SendInput.
+            if (delivered > 0) effects = delivered < planned ? "partial" : "applied";
+            if (windowSubmitted) effects = "applied";
             if (attempted && fault?.Code is "WINDOW_NOT_FOUND" or "STALE_OBSERVATION") effects = "applied";
             return Reply.Error(attempted && effects != "none" ? "EXECUTION_UNKNOWN" : fault?.Code ?? "EXECUTION_FAILED",
                 fault?.Message ?? "Desktop provider failed; inspect the effect before retrying.", effects,
@@ -305,14 +327,15 @@ public sealed class DesktopService : IDisposable
         IsError = result.IsError, StructuredContent = result.StructuredContent,
         Content = [..result.Content, ..source.Content.OfType<ImageContentBlock>()]
     };
-    public void Dispose() { work.CompleteAdding(); thread.Join(); work.Dispose(); }
+    private int disposed;
+    public void Dispose() { if (Interlocked.Exchange(ref disposed, 1) != 0) return; work.CompleteAdding(); thread.Join(); work.Dispose(); }
 }
 
 [McpServerToolType]
 public sealed class DesktopTools(CodexishRuntime runtime, DesktopService desktop)
 {
     [McpServerTool(Name = "computer_observe", ReadOnly = true, OpenWorld = false)]
-    [Description("Observe real Windows pixels, window identity, virtual-desktop coordinates and focused control/active-tab UIA metadata. max_width=0 keeps native resolution. Use window_only or crop for detail. Preserve observation_id; query_ui for semantic targets, act for one action. InputTick is metadata, not a stale lock. Capture and UIA are sampled at different times.")]
+    [Description("Observe real Windows pixels, window identity, virtual-desktop coordinates and focused control/active-tab UIA metadata. max_width=0 keeps native resolution. Use window_only or crop for detail. Preserve observation_id; query_ui for semantic targets, act for one action. InputTick is metadata, not a stale lock. Capture and UIA are sampled at different times. Next tool: computer_query_ui or computer_act.")]
     public Task<CallToolResult> Observe(string? window_id = null, int max_width = 1280, bool window_only = false,
         int? crop_x = null, int? crop_y = null, int? crop_width = null, int? crop_height = null)
     {
@@ -322,14 +345,14 @@ public sealed class DesktopTools(CodexishRuntime runtime, DesktopService desktop
         return desktop.Observe(window_id, max_width, window_only, any ? new(crop_x!.Value, crop_y!.Value, crop_width!.Value, crop_height!.Value) : null);
     }
     [McpServerTool(Name = "computer_query_ui", ReadOnly = true, OpenWorld = false)]
-    [Description("Query the selected window's UI Automation elements by role/name/text. Returns element_id bound to observation, focus, selected tabs and physical bounds. Password values are omitted. Page with next_cursor; stale/provider failures require another observation, not a guessed click.")]
+    [Description("Query the selected window's UI Automation elements by role/name/text. Returns element_id bound to observation, focus, selected tabs and physical bounds. Password values are omitted. Page with next_cursor; stale/provider failures require another observation, not a guessed click. Next tool: computer_act or computer_observe.")]
     public Task<CallToolResult> Query(string observation_id, string? role = null, string? name = null, string? cursor = null, int page_size = 100) =>
         desktop.Query(observation_id, role, name, cursor, page_size);
     [McpServerTool(Name = "computer_act", ReadOnly = false, Destructive = true, OpenWorld = true)]
-    [Description("Perform one Windows action then observe by default. Actions: click_element, click_coordinate, double_click, right_click, move, scroll, drag, type_text, key_combo, key_press, focus_window, minimize_window, maximize_window, restore_window. coordinate_space is required: image/desktop_physical_px for points, none for keyboard/window/element. Focus_window can recover lost foreground. Use same invocation_id only for identical retries. Partial input releases delivered key-downs and is never replayed; verify actual files after saving.")]
+    [Description("Perform one Windows action then observe by default. Actions: click_element, click_coordinate, double_click, right_click, move, scroll, drag, type_text, key_combo, key_press, focus_window, minimize_window, maximize_window, restore_window. coordinate_space is required: image/desktop_physical_px for points, none for keyboard/window/element. Focus_window can recover lost foreground. Use same invocation_id only for identical retries. Partial input releases delivered key-downs and is never replayed; verify actual files after saving. Next tool: computer_observe or fs_read to verify the outcome.")]
     public Task<CallToolResult> Act(string observation_id, string action, string coordinate_space, string invocation_id,
         int? x = null, int? y = null, int? end_x = null, int? end_y = null, string? element_id = null,
         string? text = null, string? key = null, int wheel_delta = -120, bool observe_after = true) =>
         runtime.Ledger.Invoke(invocation_id, "computer_act", new { observation_id, action, coordinate_space, x, y, end_x, end_y, element_id, text, key, wheel_delta, observe_after },
-            "desktop:input", _ => desktop.Act(observation_id, action, coordinate_space, x, y, end_x, end_y, element_id, text, key, wheel_delta, observe_after), 1000);
+            "desktop:input", job => desktop.Act(observation_id, action, coordinate_space, x, y, end_x, end_y, element_id, text, key, wheel_delta, observe_after, job.Token), 1000);
 }

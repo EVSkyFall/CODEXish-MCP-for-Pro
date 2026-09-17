@@ -34,7 +34,7 @@ public static class DesktopPlatform
 }
 
 #if WINDOWS
-internal sealed class WindowsDesktopPlatform : IDesktopPlatform
+internal sealed class WindowsDesktopPlatform(int? fixturePid = null) : IDesktopPlatform
 {
     private static void Ready()
     {
@@ -55,13 +55,14 @@ internal sealed class WindowsDesktopPlatform : IDesktopPlatform
         EnumWindows((handle, _) =>
         {
             if (!IsWindowVisible(handle) || !GetWindowRect(handle, out var bounds)) return true;
-            var title = new StringBuilder(1024); GetWindowTextW(handle, title, title.Capacity);
             GetWindowThreadProcessId(handle, out uint pid);
+            if (fixturePid.HasValue && pid != fixturePid.Value) return true;
+            var title = new StringBuilder(1024); GetWindowTextW(handle, title, title.Capacity);
             long started;
             try { using var process = Process.GetProcessById((int)pid); started = process.StartTime.ToUniversalTime().Ticks; }
             catch (Exception e) when (e is ArgumentException or InvalidOperationException or System.ComponentModel.Win32Exception) { return true; }
             windows.Add(new($"win_{handle:x}_{pid}_{started}", handle, (int)pid, started,
-                Redaction.Apply(title.ToString()).Text, new(bounds.Left, bounds.Top, bounds.Right - bounds.Left, bounds.Bottom - bounds.Top), IsIconic(handle), pid == Environment.ProcessId));
+                Redaction.Apply(title.ToString()).Text, new(bounds.Left, bounds.Top, bounds.Right - bounds.Left, bounds.Bottom - bounds.Top), IsIconic(handle), pid == Environment.ProcessId, GetDpiForWindow(handle)));
             return true;
         }, 0);
         var rect = new DesktopRect(GetSystemMetrics(76), GetSystemMetrics(77), GetSystemMetrics(78), GetSystemMetrics(79));
@@ -75,13 +76,23 @@ internal sealed class WindowsDesktopPlatform : IDesktopPlatform
     public byte[] Capture(DesktopGeometry geometry)
     {
         Ready(); var r = geometry.Source;
-        using var raw = new Bitmap(r.Width, r.Height, PixelFormat.Format32bppArgb);
-        using (var g = Graphics.FromImage(raw)) g.CopyFromScreen(r.X, r.Y, 0, 0, new Size(r.Width, r.Height), CopyPixelOperation.SourceCopy | CopyPixelOperation.CaptureBlt);
+        using var raw = new Bitmap(r.Width, r.Height, PixelFormat.Format24bppRgb);
+        using (var g = Graphics.FromImage(raw))
+        {
+            nint source = GetDC(0), destination = g.GetHdc();
+            try
+            {
+                // Call BitBlt directly: CopyFromScreen validates its enum and rejects combined ROP flags.
+                if (source == 0 || !BitBlt(destination, 0, 0, r.Width, r.Height, source, r.X, r.Y, 0x40cc0020))
+                    throw new CodexishFault("EXECUTION_FAILED", "BitBlt could not capture the interactive desktop.", details: new { stage = "capture", win32_error = Marshal.GetLastWin32Error() });
+            }
+            finally { g.ReleaseHdc(destination); if (source != 0) ReleaseDC(0, source); }
+        }
         using var output = new MemoryStream();
         if (geometry.Width == r.Width && geometry.Height == r.Height) raw.Save(output, ImageFormat.Png);
         else
         {
-            using var resized = new Bitmap(geometry.Width, geometry.Height);
+            using var resized = new Bitmap(geometry.Width, geometry.Height, PixelFormat.Format24bppRgb);
             using (var g = Graphics.FromImage(resized)) { g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic; g.DrawImage(raw, 0, 0, geometry.Width, geometry.Height); }
             resized.Save(output, ImageFormat.Png);
         }
@@ -118,7 +129,7 @@ internal sealed class WindowsDesktopPlatform : IDesktopPlatform
     public long HitTest(int x, int y) => GetAncestor(WindowFromPoint(new() { X = x, Y = y }), 2);
     public int Send(DesktopInput[] inputs, DesktopRect desktop)
     {
-        Ready(); var native = inputs.Select(i => Convert(i, desktop)).ToArray();
+        Ready(); VerifyIntegrity(GetForegroundWindow()); var native = inputs.Select(i => Convert(i, desktop)).ToArray();
         return checked((int)SendInput((uint)native.Length, native, Marshal.SizeOf<Input>()));
     }
     private static Input Convert(DesktopInput i, DesktopRect desktop)
@@ -137,11 +148,44 @@ internal sealed class WindowsDesktopPlatform : IDesktopPlatform
     }
     public bool WindowAction(DesktopWindow window, string action)
     {
-        Ready(); nint handle = (nint)window.Handle;
-        if (action == "focus_window") { if (IsIconic(handle)) ShowWindowAsync(handle, 9); return SetForegroundWindow(handle); }
+        Ready(); nint handle = (nint)window.Handle; VerifyIntegrity(handle);
+        if (action == "focus_window") { if (GetForegroundWindow() == handle && !IsIconic(handle)) return true; if (IsIconic(handle)) ShowWindowAsync(handle, 9); return SetForegroundWindow(handle); }
         int mode = action switch { "minimize_window" => 6, "maximize_window" => 3, "restore_window" => 9, _ => throw new ArgumentException("Unknown window action") };
         return ShowWindowAsync(handle, mode);
     }
+    // Read security labels only; never elevate or change another process token.
+    private static void VerifyIntegrity(nint window)
+    {
+        GetWindowThreadProcessId(window, out uint pid);
+        static int Level(uint processId)
+        {
+            nint process = OpenProcess(0x1000, false, processId);
+            if (process == 0) throw new CodexishFault("UNSUPPORTED_CAPABILITY", "Cannot verify the target's integrity level.");
+            nint token = 0, buffer = 0;
+            try
+            {
+                if (!OpenProcessToken(process, 8, out token)) throw new CodexishFault("UNSUPPORTED_CAPABILITY", "Cannot query target integrity.");
+                GetTokenInformation(token, 25, 0, 0, out int size);
+                buffer = Marshal.AllocHGlobal(size);
+                if (!GetTokenInformation(token, 25, buffer, size, out _)) throw new CodexishFault("UNSUPPORTED_CAPABILITY", "Cannot read target integrity label.");
+                nint sid = Marshal.ReadIntPtr(buffer);
+                byte count = Marshal.ReadByte(GetSidSubAuthorityCount(sid));
+                return Marshal.ReadInt32(GetSidSubAuthority(sid, (uint)(count - 1)));
+            }
+            finally { if (buffer != 0) Marshal.FreeHGlobal(buffer); if (token != 0) CloseHandle(token); CloseHandle(process); }
+        }
+        if (Level(pid) > Level((uint)Environment.ProcessId))
+            throw new CodexishFault("UNSUPPORTED_CAPABILITY", "Higher-integrity windows are not controlled; no elevation is attempted.");
+    }
+    [DllImport("user32.dll")] private static extern nint GetDC(nint window);
+    [DllImport("user32.dll")] private static extern int ReleaseDC(nint window, nint dc);
+    [DllImport("gdi32.dll", SetLastError = true)] private static extern bool BitBlt(nint dest, int x, int y, int width, int height, nint source, int sourceX, int sourceY, uint rop);
+    [DllImport("kernel32.dll")] private static extern nint OpenProcess(uint access, bool inherit, uint pid);
+    [DllImport("kernel32.dll")] private static extern bool CloseHandle(nint handle);
+    [DllImport("advapi32.dll")] private static extern bool OpenProcessToken(nint process, uint access, out nint token);
+    [DllImport("advapi32.dll")] private static extern bool GetTokenInformation(nint token, int kind, nint data, int bytes, out int needed);
+    [DllImport("advapi32.dll")] private static extern nint GetSidSubAuthorityCount(nint sid);
+    [DllImport("advapi32.dll")] private static extern nint GetSidSubAuthority(nint sid, uint index);
     [StructLayout(LayoutKind.Sequential)] private struct Rect { public int Left, Top, Right, Bottom; }
     [StructLayout(LayoutKind.Sequential)] private struct Point { public int X, Y; }
     [StructLayout(LayoutKind.Sequential)] private struct LastInput { public uint Size, Tick; }
@@ -154,6 +198,7 @@ internal sealed class WindowsDesktopPlatform : IDesktopPlatform
     [DllImport("user32.dll")] private static extern bool EnumWindows(EnumWindow callback, nint param);
     [DllImport("user32.dll")] private static extern bool EnumDisplayMonitors(nint hdc, nint clip, EnumMonitor callback, nint data);
     [DllImport("user32.dll")] private static extern bool IsWindowVisible(nint window);
+    [DllImport("user32.dll")] private static extern uint GetDpiForWindow(nint window);
     [DllImport("user32.dll")] private static extern bool IsIconic(nint window);
     [DllImport("user32.dll")] private static extern bool GetWindowRect(nint window, out Rect rectangle);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetWindowTextW(nint window, StringBuilder title, int count);

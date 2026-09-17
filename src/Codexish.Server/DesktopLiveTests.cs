@@ -72,17 +72,59 @@ public static class DesktopLiveTests
             fixture = Process.Start(start)!;
             for (int i = 0; i < 200 && !File.Exists(Path.Combine(directory, "ready.json")) && !fixture.HasExited; i++) await Task.Delay(100);
             if (!File.Exists(Path.Combine(directory, "ready.json"))) throw new InvalidOperationException("Owned fixture did not become ready.");
-            var native = DesktopPlatform.Create(); using var desktop = new DesktopService(native);
+            var native = new WindowsDesktopPlatform(fixture.Id); using var desktop = new DesktopService(native);
             var target = await desktop.OnThread(() => native.Inspect().Windows.Single(w => w.Pid == fixture.Id));
             var observation = await desktop.Observe(target.Id, 640, true); Success(observation, "capture");
             if (observation.Content.OfType<ImageContentBlock>().Count() != 1) throw new InvalidOperationException("Native PNG missing.");
-            Console.WriteLine("LIVE PASS 01 real own-window PNG capture and structured coordinates");
+                        var image = observation.Content.OfType<ImageContentBlock>().Single();
+            byte[] png = image.DecodedData.ToArray();
+            int imageWidth = System.Buffers.Binary.BinaryPrimitives.ReadInt32BigEndian(png.AsSpan(16, 4));
+            int imageHeight = System.Buffers.Binary.BinaryPrimitives.ReadInt32BigEndian(png.AsSpan(20, 4));
+            var dimensions = Data(observation).GetProperty("capture").GetProperty("image");
+            if (dimensions.GetProperty("width").GetInt32() != imageWidth || dimensions.GetProperty("height").GetInt32() != imageHeight)
+                throw new InvalidOperationException($"PNG dimensions differ: actual {imageWidth}x{imageHeight}, metadata {dimensions}, prefix {Convert.ToHexString(png.AsSpan(0, 8))}");
+                        using (var stream = new MemoryStream(png))
+            using (var bitmap = new System.Drawing.Bitmap(stream))
+            {
+                var colors = new HashSet<int>();
+                for (int row = 0; row < bitmap.Height; row += 7)
+                    for (int col = 0; col < bitmap.Width; col += 7)
+                    {
+                        var pixel = bitmap.GetPixel(col, row);
+                        if (pixel.A != 255) throw new InvalidOperationException("Capture unexpectedly contains transparent pixels.");
+                        colors.Add(pixel.ToArgb());
+                    }
+                if (colors.Count < 4) throw new InvalidOperationException("Capture is blank or flat-colored.");
+            }
+            Console.WriteLine($"LIVE PASS 01 opaque non-flat own-window PNG {imageWidth}x{imageHeight} with matching coordinates");
             var tabs = Data(observation).GetProperty("ui").GetProperty("active_tabs");
             if (!tabs.EnumerateArray().Any(t => t.GetString() == "Untitled fixture")) throw new InvalidOperationException("Active tab metadata missing.");
             Console.WriteLine("LIVE PASS 02 UIA active tab title");
             string id = Id(observation);
             var focused = await desktop.Act(id, "focus_window", "none", null, null, null, null, null, null, null, 0, true);
             Success(focused, "focus"); id = PostId(focused);
+            // ShowWindowAsync returns before the compositor finishes its animation. Re-observe; never repeat the effect.
+            async Task<string> Settled()
+            {
+                string? previous = null; int same = 0;
+                for (int attempt = 0; attempt < 60; attempt++)
+                {
+                    await Task.Delay(100);
+                    var current = await desktop.Observe(target.Id, 640, true); Success(current, "settling observation");
+                    var data = Data(current);
+                    string bounds = data.GetProperty("capture").GetProperty("source").GetRawText();
+                    same = data.GetProperty("stable_during_capture").GetBoolean() && bounds == previous ? same + 1 : 0;
+                    if (same >= 2) return Id(current);
+                    previous = bounds;
+                }
+                throw new InvalidOperationException("Test window did not settle; no additional input was attempted.");
+            }
+            id = await Settled();
+            var maximized = await desktop.Act(id, "maximize_window", "none", null, null, null, null, null, null, null, 0, true);
+            Success(maximized, "maximize"); id = await Settled();
+            var restored = await desktop.Act(id, "restore_window", "none", null, null, null, null, null, null, null, 0, true);
+            Success(restored, "restore"); id = await Settled();
+            Console.WriteLine("LIVE PASS 06 maximize and restore with new post-action transforms");
             var query = await desktop.Query(id, "Edit", "CODEXish fixture editor", null, 100); Success(query, "UIA query");
             string element = Data(query).GetProperty("elements")[0].GetProperty("element_id").GetString()!;
             Console.WriteLine("LIVE PASS 03 UIA semantic editor lookup");
@@ -100,8 +142,8 @@ public static class DesktopLiveTests
             for (int i = 0; i < 100 && !File.Exists(output); i++) await Task.Delay(100);
             byte[] actual = await File.ReadAllBytesAsync(output);
             if (!actual.SequenceEqual(Encoding.UTF8.GetBytes(expected))) throw new InvalidOperationException("Saved bytes do not match Unicode input.");
-            Console.WriteLine("LIVE PASS 05 actual saved UTF-8 bytes verified after CTRL+S");
-            Console.WriteLine("DESKTOP_LIVE_PASSED: 5; self-owned WPF window only. Not Notepad Save As or ChatGPT/Pro measurements.");
+            Console.WriteLine($"LIVE PASS 05 actual saved UTF-8 bytes verified after CTRL+S: {actual.Length} bytes; SHA256={Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(actual))}");
+            Console.WriteLine("DESKTOP_LIVE_PASSED: 6; self-owned WPF window only. Not Notepad Save As or ChatGPT/Pro measurements.");
             return 0;
         }
         catch (Exception e) { Console.Error.WriteLine("DESKTOP_LIVE_FAILED: " + e); return 1; }

@@ -1,6 +1,13 @@
 using Codexish.Server;
 
-if (args.Contains("--self-test")) return await SelfTest.Run();
+if (args.Contains("--desktop-fixture")) return DesktopLiveTests.Fixture(args[^1]);
+if (args.Contains("--self-test-desktop")) return await DesktopLiveTests.Run();
+if (args.Contains("--desktop-core-test")) return await DesktopTests.Run();
+if (args.Contains("--self-test"))
+{
+    int result = await SelfTest.Run();
+    return result == 0 ? await DesktopTests.Run() : result;
+}
 
 string? Option(string name) => CommandLine.Values(args, name).FirstOrDefault();
 string configPath = Option("--config") ?? ServerConfig.DefaultPath;
@@ -54,7 +61,7 @@ if (ServerConfig.TransportRefusal(config, noAuth) is { } insecure) throw new Arg
 using var runtime = new CodexishRuntime(config, noAuth);
 var app = CodexishHost.Build(runtime, config.Port, instructions: !args.Contains("--no-instructions"));
 Console.WriteLine($"""
-    CODEXish v1 slice 1 (coding core)
+    CODEXish v1 slice 2 (coding core and desktop)
       MCP           http://127.0.0.1:{config.Port}/mcp  (published as {config.PublicUrl}/mcp)
       Roots         {string.Join(", ", config.Roots.Select(r => $"{r.Id}:{(r.Read ? "r" : "")}{(r.Write ? "w" : "")}{(r.Shell ? "x" : "")}"))}
       State         {config.StateDir}
