@@ -22,6 +22,10 @@ jobs:
       - run: dotnet run --project src/Codexish.Server/Codexish.Server.csproj --no-build -c Release -- --self-test
         env:
           CODEXISH_TEST_OUTPUT: ${{ github.workspace }}/evidence
+      # Deterministic stdio fixture behind the real HTTP host; no browser is launched.
+      - run: dotnet run --project src/Codexish.Server/Codexish.Server.csproj --no-build -c Release -- --browser-tests
+      # Tray controller lifecycle over the local control endpoint; no notification icon or tunnel.
+      - run: dotnet run --project src/Codexish.Server/Codexish.Server.csproj --no-build -c Release -- --tray-tests
       - uses: actions/upload-artifact@v4
         if: always()
         with:

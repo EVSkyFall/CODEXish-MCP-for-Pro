@@ -62,7 +62,8 @@ public static class DesktopLiveTests
     {
 #if WINDOWS
         string directory = Path.Combine(Path.GetTempPath(), "codexish-owned-desktop-" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(directory); Process? fixture = null;
+        Directory.CreateDirectory(directory); Process? fixture = null, other = null;
+        string otherDirectory = directory + "-other";
         try
         {
             string exe = Environment.ProcessPath!;
@@ -100,25 +101,31 @@ public static class DesktopLiveTests
             var tabs = Data(observation).GetProperty("ui").GetProperty("active_tabs");
             if (!tabs.EnumerateArray().Any(t => t.GetString() == "Untitled fixture")) throw new InvalidOperationException("Active tab metadata missing.");
             Console.WriteLine("LIVE PASS 02 UIA active tab title");
-            string id = Id(observation);
+            // The first capture can land while the new window is still activating; act only on a settled observation.
+            string id = await Settled();
             var focused = await desktop.Act(id, "focus_window", "none", null, null, null, null, null, null, null, 0, true);
             Success(focused, "focus"); id = PostId(focused);
+            Console.WriteLine("LIVE focus activation " + Data(focused).GetProperty("activation").GetRawText());
             // ShowWindowAsync returns before the compositor finishes its animation. Re-observe; never repeat the effect.
-            async Task<string> Settled()
+            async Task<string> StableOn(DesktopService service, DesktopWindow window)
             {
                 string? previous = null; int same = 0;
                 for (int attempt = 0; attempt < 60; attempt++)
                 {
                     await Task.Delay(100);
-                    var current = await desktop.Observe(target.Id, 640, true); Success(current, "settling observation");
+                    var current = await service.Observe(window.Id, 640, true); Success(current, "settling observation");
                     var data = Data(current);
-                    string bounds = data.GetProperty("capture").GetProperty("source").GetRawText();
-                    same = data.GetProperty("stable_during_capture").GetBoolean() && bounds == previous ? same + 1 : 0;
+                    // A minimized window has no captured source; its shape is then compared as "no_capture".
+                    string shape = data.TryGetProperty("capture", out var capture) && capture.ValueKind == JsonValueKind.Object &&
+                        capture.TryGetProperty("source", out var source) ? source.GetRawText() : "no_capture";
+                    bool stable = data.TryGetProperty("stable_during_capture", out var flag) && flag.ValueKind == JsonValueKind.True;
+                    same = stable && shape == previous ? same + 1 : 0;
                     if (same >= 2) return Id(current);
-                    previous = bounds;
+                    previous = shape;
                 }
                 throw new InvalidOperationException("Test window did not settle; no additional input was attempted.");
             }
+            Task<string> Settled() => StableOn(desktop, target);
             id = await Settled();
             var maximized = await desktop.Act(id, "maximize_window", "none", null, null, null, null, null, null, null, 0, true);
             Success(maximized, "maximize"); id = await Settled();
@@ -143,18 +150,49 @@ public static class DesktopLiveTests
             byte[] actual = await File.ReadAllBytesAsync(output);
             if (!actual.SequenceEqual(Encoding.UTF8.GetBytes(expected))) throw new InvalidOperationException("Saved bytes do not match Unicode input.");
             Console.WriteLine($"LIVE PASS 05 actual saved UTF-8 bytes verified after CTRL+S: {actual.Length} bytes; SHA256={Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(actual))}");
-            Console.WriteLine("DESKTOP_LIVE_PASSED: 6; self-owned WPF window only. Not Notepad Save As or ChatGPT/Pro measurements.");
+            // Activation when the window is not already in front: first from minimized, then from behind a window of
+            // another owned fixture process. Only this test's own fixture windows are involved.
+            var minimize = await desktop.Act(await Settled(), "minimize_window", "none", null, null, null, null, null, null, null, 0, false);
+            Success(minimize, "minimize");
+            var fromMinimized = await desktop.Act(await Settled(), "focus_window", "none", null, null, null, null, null, null, null, 0, true);
+            Success(fromMinimized, "focus from minimized");
+            Console.WriteLine("LIVE focus-from-minimized activation " + Data(fromMinimized).GetProperty("activation").GetRawText());
+            if (await desktop.OnThread(() => native.Inspect().Foreground) != target.Id)
+                throw new InvalidOperationException("focus_window reported success from minimized, but the window is not in front.");
+            Console.WriteLine("LIVE PASS 07 focus_window brings a minimized owned window to the foreground");
+            Directory.CreateDirectory(otherDirectory);
+            var otherStart = new ProcessStartInfo(exe) { UseShellExecute = false };
+            foreach (string argument in start.ArgumentList.Take(start.ArgumentList.Count - 1)) otherStart.ArgumentList.Add(argument);
+            otherStart.ArgumentList.Add(otherDirectory);
+            other = Process.Start(otherStart)!;
+            for (int i = 0; i < 200 && !File.Exists(Path.Combine(otherDirectory, "ready.json")) && !other.HasExited; i++) await Task.Delay(100);
+            if (!File.Exists(Path.Combine(otherDirectory, "ready.json"))) throw new InvalidOperationException("Second owned fixture did not become ready.");
+            var otherNative = new WindowsDesktopPlatform(other.Id); using var otherDesktop = new DesktopService(otherNative);
+            var otherProcessId = other.Id;
+            var otherTarget = await otherDesktop.OnThread(() => otherNative.Inspect().Windows.Single(w => w.Pid == otherProcessId));
+            var otherFocus = await otherDesktop.Act(await StableOn(otherDesktop, otherTarget), "focus_window", "none", null, null, null, null, null, null, null, 0, false);
+            Success(otherFocus, "focus second owned window");
+            Console.WriteLine("LIVE second-window activation " + Data(otherFocus).GetProperty("activation").GetRawText());
+            var fromBehind = await desktop.Act(await Settled(), "focus_window", "none", null, null, null, null, null, null, null, 0, true);
+            Success(fromBehind, "focus from behind another process window");
+            Console.WriteLine("LIVE focus-from-behind activation " + Data(fromBehind).GetProperty("activation").GetRawText());
+            if (await desktop.OnThread(() => native.Inspect().Foreground) != target.Id)
+                throw new InvalidOperationException("focus_window reported success from behind another window, but the window is not in front.");
+            Console.WriteLine("LIVE PASS 08 focus_window brings an owned window in front of another process's window");
+            Console.WriteLine("DESKTOP_LIVE_PASSED: 8; self-owned WPF windows only. Not Notepad Save As or ChatGPT/Pro measurements.");
             return 0;
         }
         catch (Exception e) { Console.Error.WriteLine("DESKTOP_LIVE_FAILED: " + e); return 1; }
         finally
         {
-            if (fixture is not null)
+            foreach (var owned in new[] { other, fixture })
             {
-                if (!fixture.HasExited) { fixture.CloseMainWindow(); if (!fixture.WaitForExit(5000)) fixture.Kill(); }
-                fixture.Dispose();
+                if (owned is null) continue;
+                if (!owned.HasExited) { owned.CloseMainWindow(); if (!owned.WaitForExit(5000)) owned.Kill(); }
+                owned.Dispose();
             }
-            try { Directory.Delete(directory, true); } catch (IOException) { }
+            foreach (string owned in new[] { directory, otherDirectory })
+                try { if (Directory.Exists(owned)) Directory.Delete(owned, true); } catch (IOException) { }
         }
 #else
         Console.Error.WriteLine("DESKTOP_LIVE_NOT_RUN: Windows interactive desktop required."); return 2;

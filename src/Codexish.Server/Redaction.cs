@@ -49,6 +49,8 @@ public static partial class Redaction
 
     public static int EnvironmentValueCount => environmentValues.Length;
 
+    public static bool IsSecretName(string name) => SecretName().IsMatch(name);
+
     public static (string Text, bool Redacted, string[] Kinds) Apply(string text)
     {
         if (string.IsNullOrEmpty(text)) return (text, false, []);
