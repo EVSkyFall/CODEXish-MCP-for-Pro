@@ -1,12 +1,15 @@
 using Codexish.Server;
 
+if (args.Contains("--desktop-regression-test")) return await DesktopRegressionTests.Run();
 if (args.Contains("--desktop-fixture")) return DesktopLiveTests.Fixture(args[^1]);
 if (args.Contains("--self-test-desktop")) return await DesktopLiveTests.Run();
 if (args.Contains("--desktop-core-test")) return await DesktopTests.Run();
 if (args.Contains("--self-test"))
 {
     int result = await SelfTest.Run();
-    return result == 0 ? await DesktopTests.Run() : result;
+    if (result != 0) return result;
+    result = await DesktopTests.Run();
+    return result == 0 ? await DesktopRegressionTests.Run() : result;
 }
 
 string? Option(string name) => CommandLine.Values(args, name).FirstOrDefault();

@@ -109,8 +109,11 @@ public interface IDesktopPlatform
 
 public sealed class DesktopService : IDisposable
 {
-    private sealed record Observation(string Id, DesktopScene Scene, DesktopWindow? Target, DesktopGeometry Geometry, bool Stable, bool WindowOnly, bool CustomCrop);
-    private sealed record QueryPage(string Observation, string? Role, string? Name, DesktopElement[] Elements, int Offset);
+    private sealed record Observation(string Id, DesktopScene Scene, DesktopWindow? Target, DesktopGeometry Geometry, bool Stable, bool WindowOnly, bool CustomCrop, int MaxWidth);
+    private sealed record QueryPage(string Observation, string? Role, string? Name, DesktopElement[] Elements, int Offset, int Size)
+    {
+        public CallToolResult? Response { get; set; }
+    }
     private readonly IDesktopPlatform platform;
     private readonly BlockingCollection<Action> work = new();
     private readonly Thread thread;
@@ -143,21 +146,24 @@ public sealed class DesktopService : IDisposable
         var target = selected is null ? null : scene.Windows.SingleOrDefault(w => w.Id == selected)
             ?? throw new CodexishFault("WINDOW_NOT_FOUND", "Selected window is no longer present; observe again.");
         if (target?.OwnProcess == true) throw new CodexishFault("UNSUPPORTED_CAPABILITY", "The server's own control UI is not a target.");
-        var rectangle = crop ?? (windowOnly ? DesktopRect.Intersect(target?.Bounds ?? throw new CodexishFault("WINDOW_NOT_FOUND", "A window is required."), scene.Bounds) : scene.Bounds);
+        bool imageAvailable = !(windowOnly && target?.Minimized == true && crop is null);
+        // A minimized window-only request returns metadata, not pixels from unrelated windows.
+        var rectangle = !imageAvailable ? scene.Bounds : crop ?? (windowOnly ? DesktopRect.Intersect(target?.Bounds ?? throw new CodexishFault("WINDOW_NOT_FOUND", "A window is required."), scene.Bounds) : scene.Bounds);
         if (!scene.Bounds.Contains(rectangle)) throw new CodexishFault("INVALID_ARGUMENT", "Capture rectangle must be inside the virtual desktop; restore a minimized window or use a visible crop.");
         var geometry = DesktopGeometry.Create(rectangle, maxWidth);
-        byte[] png;
-        try { png = platform.Capture(geometry); }
+        byte[]? png;
+        try { png = imageAvailable ? platform.Capture(geometry) : null; }
         catch (CodexishFault) { throw; }
         catch (Exception e) { throw new CodexishFault("EXECUTION_FAILED", "Desktop capture failed.", details: new { stage = "capture", provider_error = e.GetType().Name, hresult = e.HResult }); }
         DateTimeOffset captured = DateTimeOffset.UtcNow;
         DesktopUi ui = target is null ? new([]) : platform.Query(target);
         DateTimeOffset queried = DateTimeOffset.UtcNow;
         var after = platform.Inspect();
-        var obs = new Observation("obs_" + Guid.NewGuid().ToString("N"), scene, target, geometry, Same(scene, after, target, false), windowOnly, crop.HasValue);
+        var obs = new Observation("obs_" + Guid.NewGuid().ToString("N"), scene, target, geometry, Same(scene, after, target, false), windowOnly, crop.HasValue, maxWidth);
         bool consistent = Same(scene, after, target, false);
         observations.Add(obs.Id, obs);
-        var data = new { observation_id = obs.Id, window_id = target?.Id, capture = geometry.Describe(),
+        var data = new { observation_id = obs.Id, window_id = target?.Id, capture = imageAvailable ? geometry.Describe() : null,
+            image_available = imageAvailable, image_unavailable_reason = imageAvailable ? null : "minimized_window",
             virtual_desktop = scene.Bounds, layout = scene.Layout, windows = scene.Windows,
             foreground_window_id = scene.Foreground, cursor = new { x = scene.CursorX, y = scene.CursorY },
             input_tick = scene.InputTick, input_tick_role = "metadata_only", stable_during_capture = consistent,
@@ -166,12 +172,13 @@ public sealed class DesktopService : IDisposable
                 focused = ui.Elements.Where(e => e.Focused).Select(e => PublicElement(obs.Id, e)).ToArray(),
                 active_tabs = ui.Elements.Where(e => e.Role == "TabItem" && e.Selected).Select(e => e.Name).ToArray(),
                 documents = ui.Elements.Where(e => e.Role == "Document").Select(e => e.Name).ToArray() },
-            png_bytes = png.Length, next_tool = consistent ? "computer_query_ui or computer_act" : "computer_observe; screen changed while sampling" };
-        return WithImage(Reply.Ok(data), png);
+            png_bytes = png?.Length ?? 0, next_tool = consistent ? "computer_query_ui or computer_act" : "computer_observe; screen changed while sampling" };
+        return png is null ? Reply.Ok(data) : WithImage(Reply.Ok(data), png);
     }
     private object PublicElement(string observationId, DesktopElement item)
     {
-        string id = observationId + ":" + item.Id;
+        // An issued reference is immutable even when the same provider runtime ID is queried again.
+        string id = observationId + ":element_" + Guid.NewGuid().ToString("N");
         elements[id] = (observationId, item);
         return new { element_id = id, role = item.Role, name = item.Name, bounds = item.Bounds,
             focused = item.Focused, password = item.Password, enabled = item.Enabled, offscreen = item.Offscreen,
@@ -203,26 +210,30 @@ public sealed class DesktopService : IDisposable
         OnThread(() => Reply.Guard(() =>
         {
             if (pageSize is < 1 or > 200) throw new CodexishFault("INVALID_ARGUMENT", "page_size is 1..200, a response-page budget.");
-            var obs = Get(observationId); Validate(obs, true);
+            var obs = Get(observationId);
             QueryPage page;
             if (cursor is not null)
             {
-                if (!pages.TryGetValue(cursor, out page!) || page.Observation != observationId || page.Role != role || page.Name != name)
-                    throw new CodexishFault("CURSOR_INVALID", "Cursor belongs to another observation or query.");
+                if (!pages.TryGetValue(cursor, out page!) || page.Observation != observationId || page.Role != role || page.Name != name || page.Size != pageSize)
+                    throw new CodexishFault("CURSOR_INVALID", "Cursor belongs to another observation, query or page size.");
+                if (page.Response is not null) return page.Response;
             }
             else
             {
+                Validate(obs, true);
                 var ui = platform.Query(obs.Target!);
                 if (ui.Error is not null) return Reply.Error("UNSUPPORTED_CAPABILITY", "UI Automation could not inspect this provider.", details: new { provider_error = ui.Error });
                 page = new(observationId, role, name, ui.Elements.Where(e =>
                     (role is null || e.Role.Equals(role, StringComparison.OrdinalIgnoreCase)) &&
-                    (name is null || e.Name.Contains(name, StringComparison.OrdinalIgnoreCase) || (!e.Password && e.Text?.Contains(name, StringComparison.OrdinalIgnoreCase) == true))).ToArray(), 0);
+                    (name is null || e.Name.Contains(name, StringComparison.OrdinalIgnoreCase) || (!e.Password && e.Text?.Contains(name, StringComparison.OrdinalIgnoreCase) == true))).ToArray(), 0, pageSize);
             }
             var result = page.Elements.Skip(page.Offset).Take(pageSize).Select(e => PublicElement(observationId, e)).ToArray();
             int nextOffset = page.Offset + result.Length; string? next = null;
-            if (nextOffset < page.Elements.Length) { next = "ui_" + Guid.NewGuid().ToString("N"); pages.Add(next, page with { Offset = nextOffset }); }
-            return Reply.Ok(new { observation_id = observationId, elements = result, total = page.Elements.Length,
+            if (nextOffset < page.Elements.Length) { next = "ui_" + Guid.NewGuid().ToString("N"); pages.Add(next, page with { Offset = nextOffset, Response = null }); }
+            var response = Reply.Ok(new { observation_id = observationId, elements = result, total = page.Elements.Length,
                 next_cursor = next, limits_source = "UI result page size; full query snapshot retained", next_tool = "computer_act click_element or continue cursor" });
+            page.Response = response;
+            return response;
         }));
     public Task<CallToolResult> Act(string observationId, string action, string space, int? x, int? y,
         int? endX, int? endY, string? elementId, string? text, string? key, int wheel, bool after, CancellationToken cancellation = default) => OnThread(() =>
@@ -297,7 +308,7 @@ public sealed class DesktopService : IDisposable
                         "Input was blocked or partially inserted; do not replay. Inspect the next observation.", delivered == 0 ? "none" : "partial");
                 }
             }
-            CallToolResult? post = after ? ObserveNow(target.Id, obs.Geometry.Width, obs.WindowOnly, obs.CustomCrop ? obs.Geometry.Source : null) : null;
+            CallToolResult? post = after ? ObserveNow(target.Id, obs.MaxWidth, obs.WindowOnly, obs.CustomCrop ? obs.Geometry.Source : null) : null;
             var ok = Reply.Ok(new { action, delivered, planned, side_effects = attempted ? "applied" : "none",
                 business_outcome = "not_verified", observation = post?.StructuredContent, next_tool = "inspect observation; verify saved file/test outcome separately" });
             return post is null ? ok : AppendImages(ok, post);
