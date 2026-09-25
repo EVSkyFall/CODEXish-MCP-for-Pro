@@ -30,7 +30,7 @@ if (args.Contains("--self-test"))
 
 string? Option(string name) => CommandLine.Values(args, name).FirstOrDefault();
 string configPath = Option("--config") ?? ServerConfig.DefaultPath;
-if (args.Contains("--tray")) return await TrayApplication.Run(configPath);
+if (args.Contains("--tray")) return await TrayApplication.Run(configPath, TrayOptions.Parse(args));
 
 if (args.Contains("--init"))
 {
@@ -58,7 +58,7 @@ if (args.Contains("--init"))
           Client ID           {created.OAuth.ClientId}
           Client secret       {created.OAuth.ClientSecret}
           Scope               mcp
-          Redirect URI(s)     {string.Join(", ", created.OAuth.RedirectUris)}
+          Redirect URIs       any https callback; listed: {string.Join(", ", created.OAuth.RedirectUris)}
 
         Local control token (loopback only, never send it through the tunnel)
           {created.ControlToken}
@@ -67,8 +67,9 @@ if (args.Contains("--init"))
         State dir: {created.StateDir}
         Allowed Host header(s): {string.Join(", ", created.AllowHosts.Concat(["127.0.0.1", "localhost"]))}
 
-        If the connector's callback differs, the server logs the offered redirect_uri on rejection;
-        rerun --init with --redirect-uri <that value> to accept it.
+        Any https callback without a fragment is accepted, and the sign-in page names the host it returns to.
+        Only a callback that is not https has to be listed: the server logs a refused one with its offered
+        redirect_uri, and --init --redirect-uri <that value> lists it.
         """);
     return 0;
 }

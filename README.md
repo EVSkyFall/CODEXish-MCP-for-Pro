@@ -17,12 +17,27 @@ Design decisions for v1 are in [docs/v1-design.md](docs/v1-design.md) and the sl
 
 ## v1 slice 1: coding core
 
-### Create a configuration
+### Install
+
+Publish a self-contained build once. The .NET runtime is bundled into the output folder, so running it later needs
+no SDK and no separately installed runtime:
 
 ```powershell
-dotnet run --project src/Codexish.Server -c Release -- --init `
+dotnet publish src/Codexish.Server -c Release -r win-x64 --self-contained true -o "$env:LOCALAPPDATA\Programs\Codexish"
+$codexish = "$env:LOCALAPPDATA\Programs\Codexish\Codexish.Server.exe"
+```
+
+To update, exit the tray (or stop the server) and publish again into the same folder.
+
+### Create a configuration
+
+The tray's first-run form does this for you (see [Tray](#tray-slice-4-windows)). From the command line:
+
+```powershell
+& $codexish --init `
   --password "<a password you choose>" `
   --public-url "https://<your-tunnel-host>" `
+  --port <port> `
   --root "proj=C:\Projects\Example"
 ```
 
@@ -31,22 +46,47 @@ secret and the loopback control token with `RandomNumberGenerator`, stores the p
 and puts the hostname from `--public-url` into `allow_hosts` and its origin into `allow_origins` (the tunnel
 terminates TLS, so the login form's own POST arrives with an https Origin over an http connection).
 `--public-url` must be https unless you run with `--no-auth`, because the access token would otherwise cross
-the tunnel in clear text. Roots may not overlap: one root per directory tree. Repeat `--root id=path` for more roots; each root
+the tunnel in clear text. `--port` is the local listening port (default 3000). Roots may not overlap: one root per
+directory tree. Repeat `--root id=path` for more roots; each root
 grants read, write and shell unless you edit the file afterwards. `--state-dir` moves the ledger, artifacts and
-backups; it must stay outside every root or the server refuses to start. Add `--redirect-uri <uri>` (repeatable)
-if your connector's callback differs from the default ChatGPT one. **`--init` prints the client secret and the
-control token once. Treat both as passwords.**
+backups; it must stay outside every root or the server refuses to start. Any https callback is accepted (see
+below), so `--redirect-uri <uri>` (repeatable) is only needed for a connector whose callback is not https.
+**`--init` prints the client secret and the control token once. Treat both as passwords.**
 
 ### Run it
 
 ```powershell
-dotnet run --project src/Codexish.Server -c Release
-cloudflared tunnel --url http://127.0.0.1:3000
+& $codexish
 ```
 
 The listener is loopback only; the tunnel is what makes it reachable. Host and Origin checks are not
 authentication — the bearer token is. `--no-auth` is accepted only when `allow_hosts` is empty, that is, for
-loopback development.
+loopback development. To have the server start with Windows and restart by itself, use the
+[tray](#tray-slice-4-windows) with **Start with Windows**.
+
+### Tunnel
+
+Use Tailscale Funnel as the persistent tunnel. Its `https://<machine>.<tailnet>.ts.net` address does not change, so
+it is the `--public-url` and the connector is registered once:
+
+```powershell
+tailscale set --unattended
+tailscale funnel --bg <port>
+```
+
+`--unattended` keeps Tailscale running while you are signed out, and `--bg` keeps the funnel configured across
+restarts. Disable key expiry for this machine in the Tailscale admin console, or it drops off the tailnet when its
+key expires. Give CODEXish a dedicated, uncommon local port: anything listening on the funneled port is published to
+the internet, including another program that takes the port while CODEXish is not running.
+
+For a trial, a cloudflared quick tunnel needs no account:
+
+```powershell
+cloudflared tunnel --url http://127.0.0.1:<port>
+```
+
+Its `https://….trycloudflare.com` URL changes on every start, so each time `public_url` and `allow_hosts` in
+`codexish.json` must be updated (or `--init` rerun) and the connector registered again.
 
 ### Connect the ChatGPT connector
 
@@ -56,13 +96,31 @@ loopback development.
 | Authorization URL | `<public_url>/authorize` |
 | Token URL | `<public_url>/token` |
 | Client ID | `codexish-chatgpt` (from `codexish.json`) |
-| Client secret | printed by `--init`, stored in `codexish.json` |
-| Scope | `mcp` (the only scope this server issues) |
+| Client secret | printed by `--init`, stored in `codexish.json`; required on every token request |
+| Scope | any value, or none; the server always grants `mcp`, its only scope |
+| Callback | any absolute `https` URI without a fragment; one that is not https must be listed in `oauth.redirect_uris` |
 | PKCE | S256, required whenever the client sends a `code_challenge` |
+| Refresh | the refresh token is kept, not rotated, and does not expire (`oauth.refresh_token_days` 0); access tokens last `oauth.access_token_hours` (12) |
 
-Signing in opens a single password form served by this server. If the connector's callback is refused, the
-server prints `rejected oauth stage=authorize reason=redirect_uri_mismatch offered_redirect_uri="..."` — rerun
-`--init` with that value as `--redirect-uri`.
+Signing in opens a single password form served by this server. It names the host the browser returns to, for
+example "After sign-in you will return to chatgpt.com"; check it before you type the password. For a callback
+outside `oauth.redirect_uris`, errors before the password is accepted stay on that local page instead of being
+redirected, and the server logs `accepted oauth redirect_uri outside configured list host=<host>`. A refused
+callback is logged as `rejected oauth stage=authorize reason=redirect_uri_mismatch offered_redirect_uri="..."`. One
+that is not https can be added to `oauth.redirect_uris` in `codexish.json`, or passed as `--redirect-uri` when you run
+`--init`; one with a fragment is never a valid OAuth callback. The token request must repeat the callback of its
+sign-in. A `resource` parameter never causes a refusal: tokens are always issued for `<public_url>/mcp`, and a value
+on another origin is logged as `oauth resource differs from public origin value=...`. Every authorization redirect
+carries `iss`, the metadata says so (`authorization_response_iss_parameter_supported`), and the protected-resource
+document is served at both `/.well-known/oauth-protected-resource` and `/.well-known/oauth-protected-resource/mcp`.
+
+At the token endpoint a `client_id` that is present must match; without one, the client secret (form field or Basic
+credentials) identifies the single configured client. The secret is always required, so a leaked refresh token is
+useless on its own, and refresh tokens are therefore kept instead of rotated: a refresh response lost in the tunnel,
+or two refreshes racing, no longer disconnect the connector. A positive `oauth.refresh_token_days` is still honored,
+counted from the token's last refresh. Configuration files written before this change contain
+`"refresh_token_days": 30`; set it to `0` for refresh tokens that never expire. **Revoke all tokens** in the tray, or
+`/control/revoke-tokens`, ends every access and refresh token.
 
 ### ChatGPT Project custom instructions
 
@@ -80,7 +138,8 @@ Paste this into the Project's custom instructions so the harness text survives a
 ### Local control
 
 The control API answers only when the connection is loopback, the `Host` header is loopback, and the request
-carries the control token. It is never reachable through the tunnel and it is not an MCP tool.
+carries the control token. It is never reachable through the tunnel and it is not an MCP tool. The examples use the
+default port 3000; use your configured `port`.
 
 ```powershell
 $t = (Get-Content "$env:LOCALAPPDATA\Codexish\codexish.json" | ConvertFrom-Json).control_token
@@ -143,24 +202,43 @@ tools directory, add this to `codexish.json`:
 ### Tray (slice 4, Windows)
 
 ```powershell
-dotnet run --project src/Codexish.Server -c Release -- --tray
-dotnet run --project src/Codexish.Server -c Release -- --tray --config D:\Codexish\codexish.json
+& $codexish --tray --public-url "https://<machine>.<tailnet>.ts.net" --port <port> --root "proj=C:\Projects\Example"
+& $codexish --tray --config D:\Codexish\codexish.json
 ```
 
 `--tray` runs the same server behind a notification-area icon. Without a configuration file it first shows a setup
-form (public https origin, one project root, a new CODEXish password and the OAuth callback), writes the file like
-`--init` and shows the client secret once. The server starts only from **Start server**. The menu also offers status
-with roots and processes, pause and resume, stopping session children, token revocation, the connection rejection
-log, and **Edit roots and grants**, which stops the server and saves the file.
+form: public https origin, local port (3000 unless `--port` says otherwise), one project root, a new CODEXish
+password, the OAuth callback and **Start CODEXish when I sign in to Windows**, which is checked. `--public-url`,
+`--port` and `--root` only pre-fill the form; the password is never taken from the command line. The form writes the
+file like `--init`, shows the client secret once, and then starts the server and a configured tunnel.
+
+**Start with Windows**, a checkable menu item and the setup checkbox, writes `CODEXish.lnk` into your Startup folder.
+It runs this executable with `--tray --start` (plus `--config "<path>"` for a configuration outside the default
+location) from the executable's folder, with the console window minimized; unchecking it deletes the shortcut. When
+the tray starts and the shortcut names a file that no longer exists, for example after the install folder moved, the
+shortcut is rewritten to the running executable. `--start` starts the server once the tray is up, then the tunnel if
+`tunnel.command` is configured. A plain `--tray` waits for **Start server**.
+
+The server and the owned tunnel are supervised. A failed server start (a busy port, for example), a server that
+stops without being asked to, and an owned tunnel that exits without being asked to are retried after 1 s, doubling
+to at most 60 s between attempts, without ever giving up; five minutes of healthy running reset the delay. **Stop
+server and owned tunnel**, **Stop owned tunnel**, **Edit roots and grants** and **Exit** end supervision of what they
+stop until you start it again. The icon's tooltip shows whether each part is running, retrying (with a short cause)
+or stopped, and every failure and restart is in the connection log with its cause.
+
+The menu also offers status with roots and processes, pause and resume, stopping session children, revoking all
+tokens, the connection log, and **Edit roots and grants**, which stops the server and saves the file.
 
 **Start configured tunnel** runs `tunnel.command` with `tunnel.args` as a child of the tray; `{port}` becomes the
-listening port. Nothing downloads or selects a tunnel, starting the server never starts one, and stopping the server
-or exiting the tray stops it:
+listening port. Nothing downloads or selects a tunnel. Starting the server alone never starts it, and it is only
+started while this server is listening, so it never publishes another program that took the port. Stopping the
+server or exiting the tray stops it:
 
 ```json
 "tunnel": { "command": "C:\\Tools\\cloudflared.exe", "args": ["tunnel", "--url", "http://127.0.0.1:{port}"] }
 ```
 
+A Tailscale Funnel set up as in [Tunnel](#tunnel) needs no `tunnel` entry: Tailscale publishes the port by itself.
 The tunnel process inherits the tray's environment, so a tunnel tool can read its own settings from environment
 variables. Its output appears in the connection log with the control token, client secret and password hash from
 `codexish.json` replaced by redaction markers. The tray exists only in the Windows build; elsewhere `--tray` prints a
@@ -177,8 +255,9 @@ dotnet run --project src/Codexish.Server -c Release -- --tray-tests
 The self-test uses real files, a real SQLite ledger, real child processes, a real booby-trapped Git repository
 and a real in-process HTTP listener. It opens no tunnel, sends no desktop input and performs no ChatGPT
 measurement. Windows-only checks print `SKIP` elsewhere. `--browser-tests` runs this executable as a stdio MCP
-fixture behind the real HTTP host; `--tray-tests` drives the tray controller over the local control endpoint without
-an icon or a tunnel. All three run in CI on Windows and Ubuntu.
+fixture behind the real HTTP host; `--tray-tests` drives the tray controller over the local control endpoint,
+including supervision (a busy port, a stopped host, short-lived test tunnels) and, on Windows, the autostart shortcut
+in a temporary Startup folder, without an icon or an external tunnel. All three run in CI on Windows and Ubuntu.
 
 Explicit local checks, never run in CI:
 

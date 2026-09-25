@@ -7,7 +7,7 @@ Updated 2026-09-17. Mainline A remains the user's selected baseline; no merge is
 | 1 | Coding core, 21 tools, OAuth and local control | PR #4 mainline A, Ready for review; unmerged |
 | 2 | computer_observe, computer_query_ui, computer_act | PR #5 Draft; S2-01–03 fixed and CI verified; focus_window activation chain added on `feat/v1-slice3-4-integration` and covered by deterministic checks; live desktop acceptance still incomplete |
 | 3 | Existing browser MCP stdio mount | Integrated on `feat/v1-slice3-4-integration`; 40 deterministic checks pass locally after review round 2, and 8 headless live Playwright checks passed in the first round; not measured with ChatGPT |
-| 4 | Tray and installation/lifecycle UX | Integrated on the same branch; 13 controller checks pass locally after review round 2 and a notification-icon smoke test passed in the first round; interactive menus not exercised |
+| 4 | Tray and installation/lifecycle UX | Integrated on the same branch; 13 controller checks pass locally after review round 2 and a notification-icon smoke test passed in the first round. Connection hardening (`feat/v1-connect-hardening`) adds sign-in autostart, `--start` and supervision; 34 controller checks pass locally. Interactive menus not exercised |
 | 5 | Independent extensions | Deferred; not implemented |
 
 ## Current desktop work
@@ -24,7 +24,7 @@ A dedicated profile is the default: a Playwright mount receives `--user-data-dir
 
 ## Tray
 
-`--tray` wraps the existing server and control lifecycle in a Windows notification icon: start/stop, status with roots and processes, pause/resume, stopping session children, token revocation, the connection rejection log, and editing roots/grants, which stops the server and saves the file. A first run without configuration shows a setup form equivalent to `--init`. A configured tunnel runs only from its menu item as a child of the tray and stops with the server. Grants remain file-backed; there is no second policy store and no repetitive approval UI. The controller is tested over the real local control endpoint; the menus, setup form and tunnel item have not been exercised interactively.
+`--tray` wraps the existing server and control lifecycle in a Windows notification icon: start/stop, status with roots and processes, pause/resume, stopping session children, token revocation, the connection log (rejections, tunnel output, supervision), and editing roots/grants, which stops the server and saves the file. A first run without configuration shows a setup form equivalent to `--init`, with a local port and a sign-in autostart checkbox, and ends with the server running. **Start with Windows** keeps a `CODEXish.lnk` in the Startup folder that runs `--tray --start`, and the tray rewrites it when its target file no longer exists. A configured tunnel runs as a child of the tray, from its menu item, `--start` or the end of setup, only while this server listens, and stops with the server. The server and the owned tunnel are supervised: failures and unrequested stops are retried with a 1 s to 60 s backoff that never gives up, and a user stop ends supervision. Grants remain file-backed; there is no second policy store and no repetitive approval UI. The controller, its supervision and the shortcut (in a temporary Startup folder) are tested without an icon; the menus, setup form and tunnel item have not been exercised interactively.
 
 ## Deferred work and verification
 

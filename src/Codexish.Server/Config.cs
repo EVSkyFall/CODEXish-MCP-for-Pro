@@ -32,7 +32,8 @@ public sealed class OAuthConfig
     [JsonPropertyName("redirect_uris")] public string[] RedirectUris { get; set; } = [];
     [JsonPropertyName("password_hash")] public string PasswordHash { get; set; } = "";
     [JsonPropertyName("access_token_hours")] public int AccessTokenHours { get; set; } = 12;
-    [JsonPropertyName("refresh_token_days")] public int RefreshTokenDays { get; set; } = 30;
+    // 0 means refresh tokens never expire; a positive value counts days since the token's last refresh.
+    [JsonPropertyName("refresh_token_days")] public int RefreshTokenDays { get; set; }
 }
 
 public sealed class ServerConfig
@@ -77,8 +78,7 @@ public sealed class ServerConfig
     public void Validate()
     {
         if (Port is < 0 or > 65535) throw new ArgumentException("port must be between 0 and 65535.");
-        if (OAuth.AccessTokenHours <= 0 || OAuth.RefreshTokenDays <= 0)
-            throw new ArgumentException("access_token_hours and refresh_token_days must be positive.");
+        if (OAuth.AccessTokenHours <= 0) throw new ArgumentException("access_token_hours must be positive.");
         if (string.IsNullOrWhiteSpace(StateDir)) throw new ArgumentException("state_dir is required.");
         // JSON null for these optional sections means none configured; each browser mount entry is validated on its
         // own when the mounts start, so one malformed entry cannot stop the server.
@@ -208,8 +208,8 @@ public sealed class ServerConfig
         };
         config.OAuth.ClientSecret = NewSecret();
         config.OAuth.PasswordHash = HashPassword(password);
-        // The documented ChatGPT callback is always accepted; --redirect-uri adds the connector's own value,
-        // which the server logs whenever it rejects one.
+        // Any https callback is accepted at /authorize; the listed ones additionally receive OAuth error redirects.
+        // --redirect-uri is needed only for a callback that is not https, which the server logs when it refuses one.
         List<string> redirects = [DefaultRedirectUri, .. redirectUris];
         config.OAuth.RedirectUris = redirects.Distinct(StringComparer.Ordinal).ToArray();
         // The tunnel hostname comes from public_url so the Host allowlist matches the issued OAuth metadata.

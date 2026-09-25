@@ -9,9 +9,10 @@ namespace Codexish.Server;
 // Windows Forms exists only in the Windows build; elsewhere the command-line server remains the whole product.
 public static class TrayApplication
 {
-    public static Task<int> Run(string path, bool smoke = false)
+    public static Task<int> Run(string path, TrayOptions? options = null, bool smoke = false)
     {
 #if WINDOWS
+        options ??= new TrayOptions();
         var completion = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
         var thread = new Thread(() =>
         {
@@ -19,9 +20,17 @@ public static class TrayApplication
             {
                 Forms.Application.EnableVisualStyles();
                 Forms.Application.SetCompatibleTextRenderingDefault(false);
-                ServerConfig? config = smoke ? null : File.Exists(path) ? ServerConfig.Load(path) : Setup(path);
-                if (!smoke && config is null) { completion.SetResult(0); return; }
-                using var context = new Context(config, path, smoke);
+                bool start = options.Start;
+                ServerConfig? config = null;
+                if (!smoke && File.Exists(path)) config = ServerConfig.Load(path);
+                else if (!smoke)
+                {
+                    config = Setup(path, options);
+                    if (config is null) { completion.SetResult(0); return; }
+                    // First-run setup ends with the server, and a configured tunnel, running.
+                    start = true;
+                }
+                using var context = new Context(config, path, smoke, start);
                 Forms.Application.Run(context);
                 completion.SetResult(context.ExitCode);
             }
@@ -43,15 +52,19 @@ public static class TrayApplication
         private readonly Forms.Timer timer = new() { Interval = 500 };
         private readonly TrayController? controller;
         private readonly ServerConfig? config;
+        private readonly TrayAutostart? autostart;
         private readonly string path;
         private bool exiting;
         public int ExitCode { get; private set; }
 
-        public Context(ServerConfig? config, string path, bool smoke)
+        public Context(ServerConfig? config, string path, bool smoke, bool start)
         {
             this.config = config; this.path = path;
             _ = dispatcher.Handle;
             controller = config is null ? null : new TrayController(config);
+            // Without a known executable path there is nothing to autostart; the tray itself still runs.
+            try { autostart = config is null ? null : TrayAutostart.ForThisProcess(path); }
+            catch (Exception error) { controller?.Note("Autostart is unavailable: " + error.GetType().Name + ": " + error.Message); }
             var menu = new Forms.ContextMenuStrip();
             void Add(string title, Func<Task> action) => menu.Items.Add(title, null, async (_, _) => await Guard(action));
             Add("Start server", async () => await controller!.StartAsync());
@@ -63,13 +76,32 @@ public static class TrayApplication
             Add("Pause changes", async () => { await controller!.ControlAsync("pause"); });
             Add("Resume changes", async () => { await controller!.ControlAsync("resume"); });
             Add("Stop session children", async () => { await controller!.ControlAsync("kill-children"); });
-            Add("Revoke access tokens", async () => { await controller!.ControlAsync("revoke-tokens"); });
+            Add("Revoke all tokens", async () => { await controller!.ControlAsync("revoke-tokens"); });
             Add("Edit roots and grants", EditRoots);
-            Add("Connection rejection log", () => { ShowText("CODEXish diagnostics", string.Join(Environment.NewLine, controller!.Diagnostics)); return Task.CompletedTask; });
+            Add("Connection log", () => { ShowText("CODEXish diagnostics", string.Join(Environment.NewLine, controller!.Diagnostics)); return Task.CompletedTask; });
             menu.Items.Add(new Forms.ToolStripSeparator());
+            // Checked exactly when the shortcut exists; read again every time the menu opens.
+            var startWithWindows = new Forms.ToolStripMenuItem("Start with Windows");
+            startWithWindows.Click += async (_, _) => await Guard(() =>
+            {
+                if (autostart is null) return Task.CompletedTask;
+                if (autostart.Enabled) autostart.Disable();
+                else autostart.Enable();
+                controller?.Note((autostart.Enabled ? "Autostart shortcut written: " : "Autostart shortcut removed: ") + autostart.ShortcutPath);
+                return Task.CompletedTask;
+            });
+            menu.Items.Add(startWithWindows);
+            menu.Opening += (_, _) => startWithWindows.Checked = autostart?.Enabled == true;
             Add("Exit", Exit);
             icon = new Forms.NotifyIcon { Icon = Drawing.SystemIcons.Application, Text = "CODEXish — stopped", ContextMenuStrip = menu, Visible = true };
             icon.DoubleClick += async (_, _) => await Guard(async () => ShowText("CODEXish status", await controller!.ControlAsync("status")));
+            if (!smoke && autostart is not null && controller is not null)
+            {
+                try { if (autostart.Heal()) controller.Note("The autostart shortcut named a file that no longer exists; it now starts " + Environment.ProcessPath); }
+                catch (Exception error) { controller.Note("Repairing the autostart shortcut failed: " + error.GetType().Name + ": " + error.Message); }
+            }
+            // Posted to the message loop, so the server and tunnel start once the tray is up.
+            if (start && controller is not null) dispatcher.BeginInvoke(new Action(async () => await Guard(controller.StartConfiguredAsync)));
             timer.Tick += async (_, _) =>
             {
                 if (smoke)
@@ -81,9 +113,16 @@ public static class TrayApplication
                         : "TRAY_UI_SMOKE_FAILED");
                     await Exit();
                 }
-                else icon.Text = controller!.Running ? "CODEXish — server running" : "CODEXish — stopped";
+                else icon.Text = Tooltip(controller!.Status);
             };
             timer.Start();
+        }
+
+        // A notification icon's tooltip holds at most 127 characters.
+        private static string Tooltip(string status)
+        {
+            string text = "CODEXish — " + status;
+            return text.Length <= 127 ? text : text[..126] + "…";
         }
 
         private async Task Guard(Func<Task> action)
@@ -142,31 +181,50 @@ public static class TrayApplication
         form.Show();
     }
 
-    private static ServerConfig? Setup(string path)
+    private static ServerConfig? Setup(string path, TrayOptions options)
     {
         ServerConfig? created = null;
-        using var form = new Forms.Form { Text = "CODEXish first-run setup", Width = 700, Height = 430, StartPosition = Forms.FormStartPosition.CenterScreen };
-        var panel = new Forms.TableLayoutPanel { Dock = Forms.DockStyle.Fill, ColumnCount = 2, RowCount = 6, Padding = new Forms.Padding(16) };
-        var url = new Forms.TextBox { Width = 440, PlaceholderText = "https://your-tunnel-host" };
-        var root = new Forms.TextBox { Width = 440, PlaceholderText = "Existing project directory" };
+        var (rootId, rootPath) = options.RootEntry();
+        using var form = new Forms.Form { Text = "CODEXish first-run setup", Width = 700, Height = 500, StartPosition = Forms.FormStartPosition.CenterScreen };
+        var panel = new Forms.TableLayoutPanel { Dock = Forms.DockStyle.Fill, ColumnCount = 2, RowCount = 8, Padding = new Forms.Padding(16) };
+        var url = new Forms.TextBox { Width = 440, PlaceholderText = "https://your-tunnel-host", Text = options.PublicUrl ?? "" };
+        var port = new Forms.TextBox { Width = 120, Text = options.Port ?? "3000" };
+        var root = new Forms.TextBox { Width = 440, PlaceholderText = "Existing project directory", Text = rootPath };
         var password = new Forms.TextBox { Width = 440, UseSystemPasswordChar = true };
         var callback = new Forms.TextBox { Width = 440, Text = ServerConfig.DefaultRedirectUri };
-        foreach (var pair in new[] { ("Public HTTPS origin", url), ("Project root (read / write / shell)", root), ("New CODEXish password", password), ("OAuth callback", callback) })
+        var signIn = new Forms.CheckBox { Text = "Start CODEXish when I sign in to Windows", Checked = true, AutoSize = true };
+        foreach (var (label, control) in new (string, Forms.Control)[] { ("Public HTTPS origin", url), ("Local port", port), ("Project root (read / write / shell)", root), ("New CODEXish password", password), ("OAuth callback", callback) })
         {
-            panel.Controls.Add(new Forms.Label { Text = pair.Item1, AutoSize = true });
-            panel.Controls.Add(pair.Item2);
+            panel.Controls.Add(new Forms.Label { Text = label, AutoSize = true });
+            panel.Controls.Add(control);
         }
+        panel.Controls.Add(new Forms.Label { AutoSize = true });
+        panel.Controls.Add(signIn);
         var save = new Forms.Button { Text = "Create local configuration", AutoSize = true };
         save.Click += (_, _) =>
         {
             try
             {
                 if (password.Text.Length == 0) throw new ArgumentException("Enter a new server password.");
-                created = ServerConfig.Create(url.Text, password.Text, [("project", root.Text)], [callback.Text], 3000, null);
+                if (!int.TryParse(port.Text.Trim(), out int localPort)) throw new ArgumentException("Enter the local port as a number, for example 3000.");
+                string[] callbacks = string.IsNullOrWhiteSpace(callback.Text) ? [] : [callback.Text.Trim()];
+                created = ServerConfig.Create(url.Text, password.Text, [(rootId, root.Text)], callbacks, localPort, null);
                 created.Save(path);
+                string signInResult = "Start at sign-in: off. Turn it on with Start with Windows in the tray menu.";
+                if (signIn.Checked)
+                {
+                    try
+                    {
+                        var autostart = TrayAutostart.ForThisProcess(path);
+                        autostart.Enable();
+                        signInResult = "Start at sign-in: on (" + autostart.ShortcutPath + ").";
+                    }
+                    catch (Exception error) { signInResult = "Start at sign-in could not be set up (" + error.Message + "). Use Start with Windows in the tray menu."; }
+                }
                 ShowText("CODEXish connection details — keep private", "MCP endpoint: " + created.PublicUrl + "/mcp" + Environment.NewLine +
                     "Client ID: " + created.OAuth.ClientId + Environment.NewLine + "Client secret: " + created.OAuth.ClientSecret + Environment.NewLine +
-                    "Configuration: " + path + Environment.NewLine + "Use your new CODEXish password on its login page. This is not your OpenAI password.");
+                    "Configuration: " + path + Environment.NewLine + "Local port: " + created.Port + Environment.NewLine + signInResult + Environment.NewLine +
+                    "Use your new CODEXish password on its login page. This is not your OpenAI password.");
                 form.Close();
             }
             catch (Exception error) { created = null; Forms.MessageBox.Show(form, error.Message, "Configuration not saved"); }

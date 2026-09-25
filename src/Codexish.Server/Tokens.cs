@@ -5,7 +5,7 @@ using System.Text;
 namespace Codexish.Server;
 
 public sealed record AuthorizationCode(string ClientId, string RedirectUri, string? Challenge, string? Resource,
-    string Scope, DateTimeOffset Expires);
+    DateTimeOffset Expires);
 
 // D12. Opaque tokens: 32 random bytes, stored only as a SHA-256 hash with an audience and an expiry, so the
 // database never holds a usable credential. Authorization codes and login nonces are short-lived and in memory.
@@ -20,37 +20,32 @@ public sealed class Tokens(Store store, ServerConfig config)
     public static string HashToken(string token) =>
         Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(token))).ToLowerInvariant();
 
+    // The only scope this server grants. Whatever a client asks for, it receives this one.
     public const string Scope = "mcp";
 
-    public string Issue(string kind, string clientId, string audience, TimeSpan lifetime, bool pkceUsed,
-        string family, string scope)
+    public string Issue(string kind, string clientId, string audience, DateTimeOffset expires, bool pkceUsed, string family)
     {
         string token = ServerConfig.NewSecret();
-        store.InsertToken(new TokenRow(HashToken(token), kind, clientId, audience, DateTimeOffset.UtcNow + lifetime,
-            false, pkceUsed, family, scope));
-        store.Event("token_issued", kind, new { client_id = clientId, audience, pkce_used = pkceUsed, family, scope,
-            expires_in = (int)lifetime.TotalSeconds });
+        store.InsertToken(new TokenRow(HashToken(token), kind, clientId, audience, expires, false, pkceUsed, family, Scope));
+        store.Event("token_issued", kind, new { client_id = clientId, audience, pkce_used = pkceUsed, family, scope = Scope,
+            expires_in = expires == DateTimeOffset.MaxValue ? (long?)null : (long)(expires - DateTimeOffset.UtcNow).TotalSeconds });
         return token;
     }
 
-    // Only the mcp scope exists in this slice; anything else is refused at /authorize rather than downgraded.
-    public static string? NormalizeScope(string? requested)
-    {
-        string[] parts = (requested ?? "").Split(' ', StringSplitOptions.RemoveEmptyEntries);
-        if (parts.Length == 0) return Scope;
-        return parts.All(p => p == Scope) ? Scope : null;
-    }
+    // refresh_token_days <= 0 means a refresh token never expires. A lifetime past the calendar's end is the same.
+    public static DateTimeOffset RefreshExpiry(OAuthConfig oauth, DateTimeOffset now) =>
+        oauth.RefreshTokenDays <= 0 || oauth.RefreshTokenDays >= (DateTimeOffset.MaxValue - now).TotalDays
+            ? DateTimeOffset.MaxValue
+            : now.AddDays(oauth.RefreshTokenDays);
+
+    // A refresh token is kept, never rotated. A positive refresh_token_days therefore counts from the last refresh,
+    // the way each rotation used to start a full new lifetime; with 0 the row is marked as never expiring.
+    public void Renew(string token) => store.SetTokenExpiry(HashToken(token), RefreshExpiry(config.OAuth, DateTimeOffset.UtcNow));
 
     public static bool Grants(TokenRow row, string scope) =>
         row.Scope.Split(' ', StringSplitOptions.RemoveEmptyEntries).Contains(scope, StringComparer.Ordinal);
 
-    public bool ConsumeRefresh(string token) => store.ConsumeRefresh(HashToken(token));
-
     public static string NewFamily() => ServerConfig.NewSecret(16);
-
-    public TokenRow? Row(string token) => store.Token(HashToken(token));
-
-    public int RevokeFamily(string family) => store.RevokeFamily(family);
 
     public (TokenRow? Row, string Reason) Validate(string token, string kind, string audience)
     {
@@ -58,7 +53,10 @@ public sealed class Tokens(Store store, ServerConfig config)
         if (row is null) return (null, "unknown_token");
         if (row.Kind != kind) return (null, "wrong_token_kind");
         if (row.Revoked) return (null, "revoked");
-        if (row.ExpiresAt <= DateTimeOffset.UtcNow) return (null, "expired");
+        // With refresh_token_days <= 0 a refresh token does not expire, including one stored with a finite expiry
+        // under the earlier rotating scheme.
+        bool expires = kind != "refresh" || config.OAuth.RefreshTokenDays > 0;
+        if (expires && row.ExpiresAt <= DateTimeOffset.UtcNow) return (null, "expired");
         // Resource indicators default to <public_url>/mcp; a token minted for something else is not accepted here.
         if (audience.Length > 0 && !string.Equals(row.Audience, audience, StringComparison.Ordinal)) return (null, "wrong_audience");
         // A token that does not carry the mcp scope cannot be used on /mcp, whatever else it may carry.
@@ -70,10 +68,10 @@ public sealed class Tokens(Store store, ServerConfig config)
 
     public int RevokeAll() => store.RevokeAllTokens();
 
-    public string IssueCode(string clientId, string redirectUri, string? challenge, string? resource, string scope)
+    public string IssueCode(string clientId, string redirectUri, string? challenge, string? resource)
     {
         string code = ServerConfig.NewSecret();
-        codes[code] = new AuthorizationCode(clientId, redirectUri, challenge, resource, scope, DateTimeOffset.UtcNow + CodeLifetime);
+        codes[code] = new AuthorizationCode(clientId, redirectUri, challenge, resource, DateTimeOffset.UtcNow + CodeLifetime);
         return code;
     }
 

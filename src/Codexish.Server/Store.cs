@@ -190,22 +190,10 @@ public sealed class Store : IDisposable
                 DateTimeOffset.Parse(r.GetString(4)), r.GetInt32(5) != 0, r.GetInt32(6) != 0, r.GetString(7),
                 r.GetString(8)), ("$h", hash));
 
-    // One atomic consume-and-revoke: two concurrent refreshes cannot both see the token as live.
-    public bool ConsumeRefresh(string hash) =>
-        ExecuteCount("UPDATE tokens SET revoked=1 WHERE hash=$h AND revoked=0 AND kind='refresh'", ("$h", hash)) == 1;
+    public void SetTokenExpiry(string hash, DateTimeOffset expires) =>
+        Execute("UPDATE tokens SET expires_at=$e WHERE hash=$h", ("$e", expires.ToString("o")), ("$h", hash));
 
     public void RevokeToken(string hash) => Execute("UPDATE tokens SET revoked=1 WHERE hash=$h", ("$h", hash));
-
-    // Replaying a rotated refresh token means the family is compromised: every token issued from that same
-    // authorization is revoked, not just the one presented.
-    public int RevokeFamily(string family)
-    {
-        if (family.Length == 0) return 0;
-        var live = ReadAll("SELECT hash FROM tokens WHERE family=$f AND revoked=0", r => r.GetString(0), ("$f", family));
-        Execute("UPDATE tokens SET revoked=1 WHERE family=$f", ("$f", family));
-        Event("token_family_revoked", family, new { revoked = live.Count });
-        return live.Count;
-    }
 
     public int RevokeAllTokens()
     {

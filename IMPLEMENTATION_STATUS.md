@@ -2,6 +2,33 @@
 
 Updated 2026-09-17. Mainline **A / PR #4** is unchanged. Desktop **PR #5 remains Draft**. No merge, force push, branch deletion, or whole-product completion is reported.
 
+## Connection hardening — local Windows results (2026-09-26)
+
+Branch `feat/v1-connect-hardening`, based on `b6a19aa` (the PR #6 head); the runs below used the uncommitted working tree. They ran on the authorized Windows 11 PC with portable SDK 10.0.401. Nothing here involved ChatGPT, a tunnel, a notification icon, the user's configuration or the real Startup folder. For current behavior this section supersedes the tray row of the slice 3–4 table below.
+
+| Change | What it does |
+| --- | --- |
+| OAuth metadata | `authorization_response_iss_parameter_supported: true`; the protected-resource document is also served at `/.well-known/oauth-protected-resource/mcp`; no `openid-configuration`. |
+| Scope | Any requested scope, or none, is accepted; the grant and the token response are always `mcp`. The `invalid_scope` path is removed. |
+| Resource | `resource` never refuses at `/authorize` or `/token`; tokens are always issued for `<public_url>/mcp`; a value on another origin is logged as `oauth resource differs from public origin value=<json>`. |
+| Client authentication | A `client_id` that is present (form or Basic) must match; without one the secret alone authenticates the single client; a missing secret is refused as `missing_client_secret`. |
+| Redirect URIs | Configured entries still match exactly; any other absolute https URI without a fragment is accepted. For those, errors before the password stay on the local page, the acceptance is logged as `accepted oauth redirect_uri outside configured list host=<host>`, and the code redirect carries `iss`. The sign-in page names the destination host for every callback. `/token` still requires the same redirect_uri. |
+| Refresh tokens | Not rotated or consumed: a refresh validates the token and returns a new access token with the same refresh token. Family revocation on reuse, the "already consumed" refusal and consume-and-revoke are removed. `refresh_token_days` defaults to 0, meaning no expiry, which also covers rows stored under the rotating scheme; a positive value is honored and restarts from each refresh. `revoke-tokens` still revokes every token. |
+| Build | NU1901–NU1904 are no longer in the server project's `WarningsAsErrors`. The P0 project is unchanged and still has them. |
+| Tray | The setup form adds Local port and "Start CODEXish when I sign in to Windows" (checked); `--tray` takes `--start` and pre-fill values `--public-url`, `--port`, `--root`. `TrayAutostart.cs` writes `CODEXish.lnk` in the Startup folder through `IShellLinkW`/`IPersistFile`; a checkable "Start with Windows" item; a shortcut whose target file is gone or that cannot be read is rewritten at tray start. The server and the owned tunnel are supervised: 1 s doubling to 60 s, reset after 5 healthy minutes, never giving up; user stops end supervision; the tunnel starts only while the server listens; the tooltip shows running, retrying with a cause, or stopped. |
+| Runtime | A server start that fails after taking the state-directory lock now releases the lock and the database, so a later attempt in the same process can take them. |
+
+| Command | Result |
+| --- | --- |
+| Release build, server | 0 warnings, 0 errors |
+| Server project copy with its Windows conditions set to false (net10.0, no WPF/Windows Forms), offline restore | 0 warnings, 0 errors; a compile check on Windows, not a Linux run |
+| `--self-test` | SELF_TEST_PASSED 261 (237 before); DESKTOP_CORE_PASSED 56; DESKTOP_REGRESSIONS 11 passed, 0 failed. The dangling-link check printed SKIP because this session cannot create symbolic links. |
+| `--browser-tests` | BROWSER_TESTS_PASSED 40 |
+| `--tray-tests` | TRAY_CONTROLLER_PASSED 36 (13 before); the autostart checks ran against a temporary Startup folder |
+| `--tray-tests` built with the previous `Runtime.cs` | TRAY_CONTROLLER_FAILED after 28, at the check that a failed start releases the state-directory lock; its test directory could not be removed while the leaked handle was open and was deleted afterwards |
+
+Not run and not claimed: `--tray-smoke-test`, a plain `--tray` (setup form, menus, the Start with Windows item and the tooltip), an actual Windows sign-in with the shortcut, `--self-test-desktop`, `--self-test-desktop-http`, `--browser-live-test`, the P0 self-test, CI for this branch, a Linux run, and any use of ChatGPT, Tailscale or cloudflared.
+
 ## Slice 3–4 integration — local Windows results
 
 Branch `feat/v1-slice3-4-integration`, based on `bddeffe` (PR #5 head). Everything below ran on the authorized Windows 11 PC with portable SDK 10.0.401 against the source containing these changes. No CI run of this branch has been read, and nothing here involved ChatGPT, a tunnel or a personal browser profile.

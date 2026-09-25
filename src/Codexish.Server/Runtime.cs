@@ -42,19 +42,30 @@ public sealed class CodexishRuntime : IDisposable
         Directory.CreateDirectory(Path.Combine(config.StateDir, "backups"));
         instanceLock = new FileStream(Path.Combine(config.StateDir, "instance.lock"),
             FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
-        Store = new Store(Path.Combine(config.StateDir, "codexish.db"));
-        Workspace = new Workspace(config);
-        Artifacts = new Artifacts(Store, Path.Combine(config.StateDir, "artifacts"));
-        Ledger = new Ledger(Store);
-        Files = new FileService(Workspace, Artifacts, Store, config.StateDir);
-        Patches = new PatchService(Workspace, Files, Store);
-        Processes = new ProcessSupervisor(Store, Artifacts, config);
-        Git = new GitService(config, Workspace, Artifacts, Store, HooksDirectory);
-        Tokens = new Tokens(Store, config);
-        Browsers = new BrowserMounts(this);
-        RecoveredInvocations = Store.RecoverInvocations();
-        RecoveredProcesses = Processes.Recover();
-        Store.Event("server_start", null, new { version = ServerVersion, auth = authDisabled ? "disabled" : "oauth" });
+        try
+        {
+            Store = new Store(Path.Combine(config.StateDir, "codexish.db"));
+            Workspace = new Workspace(config);
+            Artifacts = new Artifacts(Store, Path.Combine(config.StateDir, "artifacts"));
+            Ledger = new Ledger(Store);
+            Files = new FileService(Workspace, Artifacts, Store, config.StateDir);
+            Patches = new PatchService(Workspace, Files, Store);
+            Processes = new ProcessSupervisor(Store, Artifacts, config);
+            Git = new GitService(config, Workspace, Artifacts, Store, HooksDirectory);
+            Tokens = new Tokens(Store, config);
+            Browsers = new BrowserMounts(this);
+            RecoveredInvocations = Store.RecoverInvocations();
+            RecoveredProcesses = Processes.Recover();
+            Store.Event("server_start", null, new { version = ServerVersion, auth = authDisabled ? "disabled" : "oauth" });
+        }
+        catch
+        {
+            // A start that fails here releases the state directory, so the next attempt in this process is not
+            // refused by a lock this one still holds.
+            Store?.Dispose();
+            instanceLock.Dispose();
+            throw;
+        }
     }
 
     // D14. The harness text a connector shows the model before it plans anything.

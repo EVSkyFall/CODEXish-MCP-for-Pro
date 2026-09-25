@@ -6,6 +6,8 @@ Read IMPLEMENTATION_STATUS.md, docs/continuation-20260917.md, docs/desktop-corre
 
 Mainline A is PR #4 (`feat/v1-slice1-opus`). PR #4 is Ready for review; PR #3 is closed as a reference with its branch preserved. The user asked for continuous implementation, not a new choice of baseline. Do not merge PRs or delete branches; merge remains the user's action.
 
+Connection hardening (`feat/v1-connect-hardening`) records user decisions: any https OAuth callback is accepted for the configured client (errors before the password stay on the local page), any requested scope is granted as `mcp`, a `resource` indicator never refuses, refresh tokens are kept rather than rotated and do not expire by default, NuGet audit findings stay warnings, and the tray and server start at sign-in from a Startup-folder shortcut with supervised restarts. Do not reintroduce rotation, replay revocation, scope or resource refusals, audit findings as errors, or any gate, cap, timeout or latch that can stop a working run.
+
 Desktop continuation is Draft PR #5 (`feat/v1-slice2-desktop`). Current product source is 05ae9e2. S2-01–S2-03 are implemented and covered by 11 passing regressions; older statements that they are unimplemented are historical. Both source CI jobs passed. Broader desktop acceptance is not complete: the latest own-window live run failed when Windows did not confirm focus, before keyboard/mouse delivery. Do not replace that failure with a prior successful run.
 
 ## Follow-up and blocked writes

@@ -30,9 +30,10 @@ documentation aliases.** A ChatGPT connector function name must match `^[a-zA-Z0
 secrets and a PBKDF2-SHA256 password hash.** `--config <path>` overrides the location; nothing is read from
 environment variables or from any other credential store.
 
-**Decision: `--init` derives `allow_hosts` from the hostname in `--public-url`, always accepts the documented
-ChatGPT callback, and accepts repeatable `--redirect-uri` values for a connector whose callback differs.**
-When a redirect_uri is refused, the offered value is written to the rejection log so the user can add it.
+**Decision: `--init` derives `allow_hosts` from the hostname in `--public-url`, lists the documented ChatGPT
+callback, and accepts repeatable `--redirect-uri` values.** Any https callback is accepted anyway (section 9), so
+the list matters only for a callback that is not https and for OAuth error redirects. When a redirect_uri is
+refused, the offered value is written to the rejection log so the user can add it.
 
 **Decision: a grant is per root and has three bits — read, write, shell — and a listed root defaults to all
 three.** There is no per-action approval UI and no model-writable approval tool: the local user edits the file.
@@ -211,25 +212,38 @@ preserved prefix readable, and reports `OUTPUT_INCOMPLETE` when a read asks for 
 `Origin: https://<host>` while Kestrel sees scheme http; without the automatic allowance the server's own login
 form would be rejected as cross-origin.
 
-**Decision: the only scope is `mcp`.** An empty scope becomes `mcp`, anything else is `invalid_scope` at
-`/authorize`, the granted scope is stored on the token row, and `/mcp` refuses a token that does not carry it.
+**Decision: the only scope is `mcp`, and any requested scope is accepted.** Whatever a client asks for, or
+nothing, the grant is `mcp`, the token response says `scope: "mcp"`, the scope is stored on the token row, and
+`/mcp` refuses a token that does not carry it. Refusing a scope only ever disconnected a client.
 
-**Decision: refresh rotation is one atomic consume-and-revoke.** Two concurrent exchanges of the same refresh
-token cannot both succeed; the loser is `invalid_grant`.
-
-**Decision: replaying a refresh token that was already rotated away revokes every token of that family.** The
-family is the authorization the tokens descend from, and the revocation is recorded in the events table.
+**Decision: refresh tokens of this confidential client are neither rotated nor expired by default.** A refresh
+validates the presented token (known, not revoked, not expired, audience matching), issues a new access token and
+returns the same refresh token. The client secret is required at `/token`, so a leaked refresh token alone is
+useless, while rotation's replay revocation permanently disconnected the connector whenever a refresh response was
+lost in the tunnel or two refreshes raced. `oauth.refresh_token_days` defaults to 0 (no expiry); a positive value is
+honored and counted from the token's last refresh. Refresh tokens stored under the earlier rotating scheme keep
+working, and `revoke-tokens` still revokes every token.
 
 **Decision: the authorization response carries `iss`** (RFC 9207), on both the success redirect and the error
-redirect.
+redirect, and the authorization-server metadata advertises `authorization_response_iss_parameter_supported`.
+Without that flag ChatGPT uses a per-connection callback instead of its stable one.
+
+**Decision: any absolute https redirect_uri without a fragment is accepted for the configured client, besides the
+exact entries of `oauth.redirect_uris`.** For a callback outside the list, errors before the password is accepted
+are shown on the local page and never redirected, so `/authorize` is not an unauthenticated open redirect; the sign-in
+page names the destination host for every callback; and the acceptance is logged with the host. `/token` still
+requires the redirect_uri of the authorization request.
 
 **Decision: authentication is a built-in single-user OAuth 2.1 authorization server on the same listener — no
 external IdP — with `S256` PKCE, opaque 32-byte tokens stored only as SHA-256 hashes with an audience and an
-expiry, a rotating refresh token, and both `client_secret_post` and `client_secret_basic`.**
+expiry, a refresh token that is kept rather than rotated, and both `client_secret_post` and `client_secret_basic`.**
+A `client_id` that is present at `/token` must match; without one, the secret alone identifies the single client.
+No `openid-configuration` is served, because no id_token is issued.
 
 **Decision: a request to `/mcp` without a valid bearer token is `401` with
 `WWW-Authenticate: Bearer resource_metadata="<public_url>/.well-known/oauth-protected-resource"`, and both
-metadata documents are served unauthenticated.**
+metadata documents are served unauthenticated.** The protected-resource document is also served at
+`/.well-known/oauth-protected-resource/mcp`, the RFC 9728 location for a resource with a path.
 
 **Decision: the `/authorize` GET form carries every incoming OAuth parameter into the POST as hidden fields plus
 a single-use CSRF nonce, and the POST revalidates all of them.** The issued code stays bound to the caller that
@@ -239,7 +253,8 @@ started the flow.
 client that never sent one may omit the verifier, and `pkce_used` is recorded on the token row and in the
 events table.**
 
-**Decision: an absent `resource` indicator defaults to `<public_url>/mcp`, and a present one must equal it.**
+**Decision: tokens are always issued for `<public_url>/mcp`, and a `resource` indicator never refuses a request at
+`/authorize` or `/token`.** A presented value whose origin differs from the public origin is logged.
 
 **Decision: `--no-auth` is accepted only when `allow_hosts` is empty.** The listener is loopback-only and the
 access policy always allows loopback hosts, so an empty allow list really does mean nothing but this machine.
