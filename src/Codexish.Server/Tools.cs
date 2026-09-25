@@ -99,7 +99,7 @@ public sealed class CodexishTools(CodexishRuntime runtime)
         [Description("New id for a new write; the same id only to retry that write.")] string invocation_id,
         [Description("sha256 from fs_read. Required for replace, forbidden for create.")] string? expected_sha256 = null) =>
         runtime.Ledger.Invoke(invocation_id, "fs_write", new { root_id, path, text, mode, expected_sha256 },
-            $"files:{root_id}", _ => Task.FromResult(Reply.Guard(() => runtime.Files.Write(root_id, path, text, mode, expected_sha256))), 15000);
+            "files:" + runtime.Workspace.QueueKey(root_id), _ => Task.FromResult(Reply.Guard(() => runtime.Files.Write(root_id, path, text, mode, expected_sha256))), 15000);
 
     [McpServerTool(Name = "fs_apply_patch", ReadOnly = false, Destructive = true, OpenWorld = false)]
     [Description("Applies a unified diff that may touch several files. List every touched file in expected[] with its " +
@@ -115,22 +115,23 @@ public sealed class CodexishTools(CodexishRuntime runtime)
         [Description("One entry per file the patch touches.")] PatchExpectation[] expected,
         [Description("New id for a new patch; the same id only to retry it.")] string invocation_id) =>
         runtime.Ledger.Invoke(invocation_id, "fs_apply_patch", new { root_id, patch, expected = expected.Select(e => new { e.Path, e.ExpectedSha256 }) },
-            $"files:{root_id}", _ => Task.FromResult(Reply.Guard(() => runtime.Patches.Apply(root_id, patch, expected))), 30000);
+            "files:" + runtime.Workspace.QueueKey(root_id), _ => Task.FromResult(Reply.Guard(() => runtime.Patches.Apply(root_id, patch, expected))), 30000);
 
     [McpServerTool(Name = "shell_run", ReadOnly = false, Destructive = true, OpenWorld = false)]
     [Description("Runs a build, test or other command in a root that has the shell grant. Prefer executable plus args; " +
-        "a command string requires an explicit shell from the allowed list. The child runs with the logged-in user's " +
+        "a command string runs in the given shell from the allowed list, or in the configured default shell when none is " +
+        "given, and the result names the interpreter that ran it. The child runs with the logged-in user's " +
         "full rights - this is not a sandbox. If it finishes within wait_ms you get the real exit code with stdout and " +
         "stderr previews; otherwise you get process_id and status running and the child keeps running, because wait_ms " +
         "is only a response wait and never kills anything. Full output is always available as artifacts. " +
-        "PERMISSION_DENIED: the root has no shell grant or the shell is not allowed. NOT_FOUND: the executable does " +
-        "not exist. Next tool: process_poll with the returned process_id, or artifact_read for full output.")]
+        "PERMISSION_DENIED: the root has no shell grant or the shell is not allowed. NOT_FOUND: the executable or the " +
+        "root directory does not exist. Next tool: process_poll with the returned process_id, or artifact_read for full output.")]
     public Task<CallToolResult> ShellRun(
         [Description("Root id from workspace_info; the root needs the shell grant.")] string root_id,
         [Description("New id for a new command; the same id only to retry it.")] string invocation_id,
         [Description("Working directory relative to the root. Empty means the root itself.")] string cwd = "",
-        [Description("Command line for the chosen shell. Requires shell.")] string? command = null,
-        [Description("pwsh or cmd. Required when command is used.")] string? shell = null,
+        [Description("Command line for the chosen shell.")] string? command = null,
+        [Description("pwsh, powershell or cmd. Optional: the configured default shell runs the command when this is omitted.")] string? shell = null,
         [Description("Executable to run directly. Preferred over command.")] string? executable = null,
         [Description("Arguments for executable, already split.")] string[]? args = null,
         [Description("How long to wait for the response, in milliseconds. Not a deadline.")] int wait_ms = 10000,
@@ -146,8 +147,8 @@ public sealed class CodexishTools(CodexishRuntime runtime)
         [Description("Root id from workspace_info; the root needs the shell grant.")] string root_id,
         [Description("New id for a new process; the same id only to retry the start.")] string invocation_id,
         [Description("Working directory relative to the root.")] string cwd = "",
-        [Description("Command line for the chosen shell. Requires shell.")] string? command = null,
-        [Description("pwsh or cmd. Required when command is used.")] string? shell = null,
+        [Description("Command line for the chosen shell.")] string? command = null,
+        [Description("pwsh, powershell or cmd. Optional: the configured default shell runs the command when this is omitted.")] string? shell = null,
         [Description("Executable to run directly. Preferred over command.")] string? executable = null,
         [Description("Arguments for executable, already split.")] string[]? args = null,
         [Description("Response wait in milliseconds before the handle is returned.")] int wait_ms = 1000,
@@ -157,7 +158,7 @@ public sealed class CodexishTools(CodexishRuntime runtime)
     private Task<CallToolResult> Start(string tool, string rootId, string invocationId, string cwd, string? command,
         string? shell, string? executable, string[]? args, int waitMs, string lifetime) =>
         runtime.Ledger.Invoke(invocationId, tool,
-            new { root_id = rootId, cwd, command, shell, executable, args, lifetime }, $"shell:{rootId}",
+            new { root_id = rootId, cwd, command, shell, executable, args, lifetime }, "shell:" + runtime.Workspace.QueueKey(rootId),
             job => Reply.GuardAsync(async () =>
             {
                 var target = runtime.Workspace.Resolve(rootId, cwd, Grant.Shell);
@@ -181,6 +182,8 @@ public sealed class CodexishTools(CodexishRuntime runtime)
         supervision = managed.Supervision,
         root_id = managed.RootId,
         command = managed.Display,
+        shell = managed.Shell,
+        interpreter = managed.Interpreter,
         stdout_artifact = managed.StdoutArtifact,
         stderr_artifact = managed.StderrArtifact,
         note,
@@ -200,6 +203,8 @@ public sealed class CodexishTools(CodexishRuntime runtime)
             succeeded = managed.ExitCode == 0,
             duration_ms = (DateTimeOffset.UtcNow - started).TotalMilliseconds,
             command = managed.Display,
+            shell = managed.Shell,
+            interpreter = managed.Interpreter,
             stdout_preview = stdout.Text,
             stderr_preview = stderr.Text,
             stdout_bytes = runtime.Artifacts.Length(managed.StdoutArtifact),

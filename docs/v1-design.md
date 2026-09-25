@@ -28,7 +28,14 @@ documentation aliases.** A ChatGPT connector function name must match `^[a-zA-Z0
 
 **Decision: one JSON file, `%LOCALAPPDATA%\Codexish\codexish.json` by default, created by `--init` with random
 secrets and a PBKDF2-SHA256 password hash.** `--config <path>` overrides the location; nothing is read from
-environment variables or from any other credential store.
+environment variables or from any other credential store. A save writes a temporary file in the same directory and
+swaps it in with `File.Replace`, keeping the previous version as `codexish.json.bak`; a file that cannot be parsed
+is kept as `codexish.json.broken-<utc>` and a readable `.bak` is loaded and restored in its place.
+
+**Decision: nothing optional stops the server.** Only a port outside 0-65535, an unusable `public_url`, an http
+`public_url` with authentication (`TransportRefusal`), `--no-auth` with a public host (`NoAuthRefusal`) and the
+single-instance state lock refuse to start. Every other problem in the file is skipped or replaced by its default
+and reported in the startup log and `host_capabilities.warnings`.
 
 **Decision: `--init` derives `allow_hosts` from the hostname in `--public-url`, lists the documented ChatGPT
 callback, and accepts repeatable `--redirect-uri` values.** Any https callback is accepted anyway (section 9), so
@@ -38,13 +45,15 @@ refused, the offered value is written to the rejection log so the user can add i
 **Decision: a grant is per root and has three bits — read, write, shell — and a listed root defaults to all
 three.** There is no per-action approval UI and no model-writable approval tool: the local user edits the file.
 
-**Decision: two roots may not name the same directory or nest inside one another, and the server refuses to
-start otherwise.** FIFO resources are keyed by `root_id`, so two ids over one tree would give the same files
-two independent queues and let concurrent writes interleave.
+**Decision: roots may name the same directory or nest inside one another.** Each call resolves through the
+`root_id` it names, with that root's grants. The files and shell FIFO keys are the canonical full path of the
+outermost configured root that contains the named one (compared without case on Windows), so files reachable
+through two ids still share one queue. A root entry with a bad or duplicate id or no path is skipped with a
+warning; a root whose directory is missing stays configured, reports `exists=false`, and each call checks again.
 
-**Decision: the state directory must lie outside every root, and the server refuses to start otherwise.** The
-ledger, the artifact store and the `.bak` backups must not be reachable through `fs_*` or through a shell grant
-pointed at a root.
+**Decision: a state directory inside a root is a warning, not a refusal.** The ledger, the artifact store and the
+`.bak` backups are then reachable through that root's tools, which `host_capabilities.warnings` and
+`workspace_info.state_dir_note` say.
 
 **Decision: `host_capabilities` and `workspace_info` publish the roots, the grants, the execution boundary, the
 unimplemented features with a reason each, the protocol and schema versions, the latest checkpoint, and the
@@ -112,9 +121,16 @@ the process, and `process_write` is refused because its stdin belongs to nobody.
 `CURSOR_INVALID` rather than an offset into a different pair of streams.
 
 **Decision: `shell_run` and `process_start` are the same supervisor; structured `executable` plus `args` is
-preferred and a `command` string requires an explicit shell from `shell.allowed`.** `cmd` is invoked as
-`cmd.exe /s /c "<command>"` because cmd does not follow `CommandLineToArgvW` quoting; `pwsh` is invoked as
-`pwsh -NoProfile -NonInteractive -Command <command>` through the argument list.
+preferred, and a `command` string runs in the named shell or, without one, in `shell.default`.** The shell must
+be in `shell.allowed`, the user's own policy; supported names are `pwsh`, `powershell` and `cmd`, and unsupported
+names are ignored with a warning. `cmd` is invoked as `cmd.exe /s /c "<command>"` because cmd does not follow
+`CommandLineToArgvW` quoting; `pwsh` and `powershell` are invoked with `-NoProfile -NonInteractive -Command
+<command>` through the argument list. `pwsh` is resolved on every call from `PATH`, the newest
+`%ProgramFiles%\PowerShell\*\pwsh.exe`, then Windows PowerShell, and each result reports the `interpreter` used.
+
+**Decision: a failure after `Process.Start` terminates the child tree and its job before the error surfaces, and an
+exited process keeps only its metadata.** Its process and job handles are released once its final state is
+recorded (a job that still holds descendants is closed when they are gone).
 
 **Decision: `wait_ms` bounds the response only.** When it elapses the call returns `status: running` with a
 `process_id`, the child keeps running, and no timeout in this server ever kills anything.
@@ -140,19 +156,22 @@ re-attached as `running` with `reattached: true` and `output_since_restart: not_
 
 ## 6. Git
 
-**Decision: `git_status`, `git_diff` and `git_log` run the configured git binary with fixed argument sets and,
-on every call, `-c core.hooksPath=<empty directory in the state dir> -c core.fsmonitor=false -c core.pager=cat
--c diff.external= -c core.editor=true --no-optional-locks`, plus `--no-ext-diff --no-textconv` on diff and
-`GIT_TERMINAL_PROMPT=0` in the environment.** Reading a repository must not execute the repository's code.
+**Decision: `git_status`, `git_diff` and `git_log` run git with fixed argument sets and, on every call,
+`-c core.hooksPath=<empty directory in the state dir> -c core.fsmonitor=false -c core.pager=cat
+-c diff.external= -c core.editor=true --no-optional-locks`, plus `--no-ext-diff --no-textconv` on diff; every
+inherited `GIT_*` variable is dropped and only `GIT_TERMINAL_PROMPT=0` is set.** Reading a repository must not
+execute the repository's code. Git is resolved on every call: `git.path` when that file exists, then `PATH`, then
+`%ProgramFiles%\Git\cmd\git.exe`, then `%LOCALAPPDATA%\Programs\Git\cmd\git.exe`.
 
 **Decision: before each read, the repository's declared clean and process filters are listed by name with
 `git config --null --name-only --get-regexp '^filter\..*\.(clean|process|required)$'` and each one is
 disabled with `-c <name>=` (`=false` for `.required`).** A filter declared by `.gitattributes` runs during
 status and diff as well, so disabling hooks alone would not be enough. Only names are read, never values.
 
-**Decision: `--no-lazy-fetch` is probed once and used only where git understands it.** It stops a read of a
+**Decision: `--no-lazy-fetch` is probed and used only where git understands it.** It stops a read of a
 partial clone from starting a network fetch, which would run the remote and credential helpers; git 2.40
-rejects the option, so an unconditional flag would break every call on that version.
+rejects the option, so an unconditional flag would break every call on that version. The probe is repeated
+whenever the git binary found differs from the one probed.
 
 **Decision: `ref` and `path` arrive from the model, so a ref must match `^[A-Za-z0-9._/@^~{}-]+$`, must not
 start with `-` and must not be a filesystem traversal; `--end-of-options` precedes any ref and `--` precedes any
@@ -169,7 +188,8 @@ arguments; the same id with the same digest joins the live task or returns the s
 with a different digest is `IDEMPOTENCY_CONFLICT`.**
 
 **Decision: acceptance order is the order of the ledger insert under the gate lock, and each resource
-(`files:<root>`, `shell:<root>`, `git:<root>`, `process:<id>`) runs its accepted work in exactly that order.**
+(`files:<canonical root path>`, `shell:<canonical root path>`, `process:<id>`, `browser:<mount>`) runs its accepted
+work in exactly that order.**
 This closes the P0 contract gap that Codex finding M-2 identified; P0 promised mutual exclusion only.
 
 **Decision: a `shell:<root>` chain item completes when the child has started, not when it exits.** A dev server
@@ -195,6 +215,19 @@ cancellation request and reports `side_effects: unknown`.** Cancellation is not 
 
 **Decision: one SQLite file in the state directory holds `invocations`, `processes`, `artifacts`, `events`,
 `tokens` and `checkpoints`; artifact bytes live as files under `state_dir\artifacts`.**
+
+**Decision: a ledger that SQLite reports as damaged or not a database at startup, including `PRAGMA quick_check`,
+is renamed with its `-wal`/`-shm` files to `ledger.corrupt-<utc>.*` and replaced by a fresh one.** The rebuild is
+reported as `host_capabilities.ledger_rebuilt`; issued tokens are lost with it, so ChatGPT signs in again. A migration
+ignores only a duplicate-column error and logs any other; SQLITE_BUSY, SQLITE_LOCKED and SQLITE_IOERR are retried
+within the command timeout; a row that cannot be read is contained to that row.
+
+**Decision: CODEXish's own state is cleaned by age.** `retention.output_days` (30) covers artifacts, finished
+ledger rows, events, exited processes with their output, expired or revoked tokens, older checkpoints and tray
+logs; `retention.backup_days` (90) covers pre-edit backups, quarantined ledgers and unreadable configuration copies;
+0 keeps forever. A sweep runs about a minute after start and every 6 hours, deletes rows in small batches without
+VACUUM, and never touches running or reattachable processes, queued or running operations, the newest checkpoint,
+live tokens, browser profiles or anything in a root.
 
 **Decision: an artifact cursor is bound to the artifact's generation, and a cursor from an earlier generation is
 `CURSOR_INVALID` rather than an offset into different bytes.**

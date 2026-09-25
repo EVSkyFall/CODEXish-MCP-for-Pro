@@ -27,10 +27,8 @@ public sealed class TrayAutostart
 
     public static TrayAutostart ForThisProcess(string configPath)
     {
-        string process = Environment.ProcessPath ?? throw new InvalidOperationException("The path of this executable is unknown.");
-        // Started as "dotnet Codexish.Server.dll": the shortcut has to hand the assembly to the dotnet host.
-        string? assembly = Path.GetFileNameWithoutExtension(process).Equals("dotnet", StringComparison.OrdinalIgnoreCase)
-            ? typeof(TrayAutostart).Assembly.Location : null;
+        // Started as "dotnet Codexish.Server.dll", the shortcut has to hand the assembly to the dotnet host.
+        var (process, assembly) = TrayInstance.SelfLaunch();
         return new TrayAutostart(Environment.GetFolderPath(Environment.SpecialFolder.Startup), process, configPath, assembly);
     }
 

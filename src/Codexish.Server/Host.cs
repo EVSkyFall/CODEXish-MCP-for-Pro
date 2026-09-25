@@ -19,13 +19,21 @@ public static class CodexishHost
         builder.Logging.SetMinimumLevel(LogLevel.Warning);
         builder.Services.AddSingleton(runtime);
         builder.Services.AddSingleton(runtime.Desktop);
+        // Mounted browser tools are listed and dispatched per request, so a mount that connects, reconnects or is still
+        // starting changes the tool list without rebuilding the host.
         builder.Services.AddMcpServer(o =>
         {
             o.ServerInfo = new() { Name = "CODEXish", Version = CodexishRuntime.ServerVersion };
             o.ServerInstructions = instructions ? CodexishRuntime.Instructions : null;
         }).WithHttpTransport(o => o.SessionMode = HttpServerSessionMode.Stateless)
-          .WithTools<CodexishTools>().WithTools<DesktopTools>().WithTools(runtime.Browsers.Tools);
+          .WithTools<CodexishTools>().WithTools<DesktopTools>()
+          .WithListToolsHandler((_, _) => ValueTask.FromResult(new ModelContextProtocol.Protocol.ListToolsResult { Tools = runtime.Browsers.Tools.Select(t => t.ProtocolTool).ToList() }))
+          .WithCallToolHandler((request, token) => runtime.Browsers.Find(request.Params?.Name) is { } tool
+              ? tool.InvokeAsync(request, token)
+              : throw new ModelContextProtocol.McpProtocolException($"Unknown tool: '{request.Params?.Name}'", ModelContextProtocol.McpErrorCode.InvalidParams));
         var app = builder.Build();
+        // Mounts connect only once Kestrel listens, each in the background, so none can delay or stop the host.
+        app.Lifetime.ApplicationStarted.Register(runtime.Browsers.Start);
         // In-flight browser calls are cancelled as soon as the host starts stopping, so its request drain is not held
         // by a backend that never answers.
         app.Lifetime.ApplicationStopping.Register(runtime.Browsers.Stop);
@@ -155,6 +163,15 @@ public static class CodexishHost
                 string retryNonce = runtime.Tokens.IssueNonce();
                 return Results.Content(LoginForm(parsed!, retryNonce, "This form expired. Sign in again."),
                     "text/html; charset=utf-8", statusCode: StatusCodes.Status400BadRequest);
+            }
+            if (ServerConfig.PasswordHashProblem(runtime.Config.OAuth.PasswordHash) is { } problem)
+            {
+                log($"rejected oauth stage=authorize reason=malformed_password_hash detail={problem}");
+                runtime.Store.Event("oauth_rejected", "authorize", new { reason = "malformed_password_hash", detail = problem });
+                string retryNonce = runtime.Tokens.IssueNonce();
+                return Results.Content(LoginForm(parsed!, retryNonce,
+                    "The password hash stored in codexish.json is damaged, so no password can sign in. Write a new configuration with --init or the tray setup."),
+                    "text/html; charset=utf-8", statusCode: StatusCodes.Status401Unauthorized);
             }
             if (!ServerConfig.VerifyPassword(form["password"].ToString(), runtime.Config.OAuth.PasswordHash))
             {

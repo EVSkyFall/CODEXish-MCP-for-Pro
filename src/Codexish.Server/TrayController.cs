@@ -39,7 +39,9 @@ public sealed record TrayOptions(bool Start = false, string? PublicUrl = null, s
 // stop ends supervision of that component until the user starts it again.
 public sealed class TrayController(ServerConfig config) : IAsyncDisposable
 {
-    public static readonly TimeSpan HealthyRun = TimeSpan.FromMinutes(5);
+    public static readonly TimeSpan HealthyRun = Backoff.HealthyRun;
+    // The connection log window shows this many recent lines; the files under state_dir\logs keep every line.
+    public const int MemoryLines = 5000;
 
     private sealed class Supervision
     {
@@ -59,16 +61,32 @@ public sealed class TrayController(ServerConfig config) : IAsyncDisposable
     private WebApplication? app;
     private CodexishRuntime? runtime;
     private Process? tunnel;
+    private nint tunnelJob;
     private Task? stdout, stderr;
     private Supervision? serverWatch, tunnelWatch;
     private TaskCompletionSource serverChanged = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly SemaphoreSlim gate = new(1, 1);
     private readonly object sync = new();
-    private readonly List<string> diagnostics = [];
+    private readonly Queue<string> diagnostics = new();
     public bool Running => app is not null;
     public Uri? Address { get; private set; }
     public string[] Diagnostics { get { lock (diagnostics) return diagnostics.ToArray(); } }
     internal IHostApplicationLifetime? HostLifetime => app?.Lifetime;
+    public string LogDirectory => Path.Combine(config.StateDir, "logs");
+    public string LogFile => Path.Combine(LogDirectory, "tray-" + DateTime.UtcNow.ToString("yyyyMMdd", System.Globalization.CultureInfo.InvariantCulture) + ".log");
+
+    // Whether the owned tunnel runs inside the kill-on-close job that ends it with this process.
+    internal bool TunnelInJob
+    {
+        get
+        {
+            lock (sync)
+            {
+                try { return tunnel is { HasExited: false } process && Native.InJob(process.Handle, tunnelJob); }
+                catch (InvalidOperationException) { return false; }
+            }
+        }
+    }
 
     public bool TunnelRunning
     {
@@ -81,10 +99,9 @@ public sealed class TrayController(ServerConfig config) : IAsyncDisposable
         }
     }
 
-    public static TimeSpan RetryDelay(int failures) =>
-        TimeSpan.FromSeconds(failures <= 1 ? 1 : failures >= 7 ? 60 : 1 << (failures - 1));
+    public static TimeSpan RetryDelay(int failures) => Backoff.Delay(failures);
 
-    public static int FailuresAfterRun(int failures, TimeSpan healthy) => healthy >= HealthyRun ? 0 : failures;
+    public static int FailuresAfterRun(int failures, TimeSpan healthy) => Backoff.FailuresAfterRun(failures, healthy);
 
     // For the icon tooltip: running, retrying with a short cause, waiting, or stopped.
     public string Status
@@ -104,7 +121,18 @@ public sealed class TrayController(ServerConfig config) : IAsyncDisposable
     private void Log(string value)
     {
         string line = DateTimeOffset.UtcNow.ToString("O") + " " + Scrub(value);
-        lock (diagnostics) diagnostics.Add(line);
+        lock (diagnostics)
+        {
+            diagnostics.Enqueue(line);
+            while (diagnostics.Count > MemoryLines) diagnostics.Dequeue();
+            // Every line also goes to disk, redacted the same way; a file that cannot be written never stops logging.
+            try
+            {
+                Directory.CreateDirectory(LogDirectory);
+                File.AppendAllText(LogFile, line + Environment.NewLine, new System.Text.UTF8Encoding(false));
+            }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException) { }
+        }
     }
 
     // The configuration's own secrets are not environment variables, so the shared redaction cannot know them; they
@@ -280,7 +308,7 @@ public sealed class TrayController(ServerConfig config) : IAsyncDisposable
             WebApplication? host = null;
             try
             {
-                await candidate.Browsers.InitializeAsync();
+                // Browser mounts connect in the background once the host listens; none of them can hold this start.
                 host = CodexishHost.Build(candidate, config.Port, Log);
                 await host.StartAsync();
                 var address = new Uri(host.Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>()!.Addresses.Single());
@@ -289,6 +317,7 @@ public sealed class TrayController(ServerConfig config) : IAsyncDisposable
                 runtime = candidate; app = host;
                 ServerChanged(address);
                 Log("Server started at " + address + "; browser mounts: " + candidate.Browsers.Summary());
+                foreach (string warning in candidate.Warnings) Log("Warning: " + warning);
                 return stopping.Task;
             }
             catch
@@ -356,6 +385,8 @@ public sealed class TrayController(ServerConfig config) : IAsyncDisposable
             var healthy = Stopwatch.StartNew();
             try { await process.WaitForExitAsync(token); }
             catch (OperationCanceledException) { break; }
+            // Descendants the tunnel left behind end with its job, so they cannot hold its port or pipes.
+            CloseTunnelJob();
             failures = FailuresAfterRun(failures, healthy.Elapsed) + 1;
             string code;
             try { code = process.ExitCode.ToString(); }
@@ -395,7 +426,12 @@ public sealed class TrayController(ServerConfig config) : IAsyncDisposable
             var start = new ProcessStartInfo(config.Tunnel.Command) { UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true, CreateNoWindow = true };
             foreach (string argument in config.Tunnel.Args) start.ArgumentList.Add(argument.Replace("{port}", address.Port.ToString(), StringComparison.Ordinal));
             var process = Process.Start(start) ?? throw new IOException("Tunnel process did not start.");
-            tunnel = process;
+            // A kill-on-close job ends the tunnel and its descendants with this process, even when the tray is killed.
+            CloseTunnelJob();
+            nint job = Native.CreateKillOnCloseJob();
+            if (job != 0 && !Native.AssignProcess(job, process.Handle)) { Native.CloseJob(job); job = 0; }
+            if (job == 0 && OperatingSystem.IsWindows()) Log("The owned tunnel could not be placed in a job object; it may outlive a tray that is killed.");
+            lock (sync) { tunnel = process; tunnelJob = job; }
             async Task Drain(StreamReader reader) { while (await reader.ReadLineAsync() is { } line) Log("Tunnel: " + line); }
             stdout = Drain(process.StandardOutput);
             stderr = Drain(process.StandardError);
@@ -405,11 +441,21 @@ public sealed class TrayController(ServerConfig config) : IAsyncDisposable
         finally { gate.Release(); }
     }
 
+    private void CloseTunnelJob()
+    {
+        nint job;
+        lock (sync) { job = tunnelJob; tunnelJob = 0; }
+        Native.CloseJob(job);
+    }
+
     private async Task StopTunnelCore()
     {
         if (tunnel is null) return;
         bool live = !tunnel.HasExited;
-        if (live) tunnel.Kill(entireProcessTree: true);
+        nint job;
+        lock (sync) job = tunnelJob;
+        if (live && !Native.TerminateJob(job)) tunnel.Kill(entireProcessTree: true);
+        CloseTunnelJob();
         await tunnel.WaitForExitAsync();
         // The output of a tree this stop ended is complete once its pipes close. A tunnel that had already exited by
         // itself may have left a descendant holding them, so its readers are left to finish on their own.
@@ -543,6 +589,9 @@ public static class TrayTests
             await busy.StartConfiguredAsync();
             Check(busy.Running && busy.TunnelRunning && busy.Status == "server running, tunnel running",
                 "starting the configuration starts the server and then the configured tunnel");
+            if (OperatingSystem.IsWindows())
+                Check(busy.TunnelInJob, "the owned tunnel runs inside a kill-on-close job, so it cannot outlive a killed tray");
+            else Console.WriteLine("TRAY SKIP tunnel job object: Windows only");
             await busy.StopAsync();
             await Task.Delay(1500);
             Check(!busy.Running && !busy.TunnelRunning && busy.Status == "server stopped, tunnel stopped",
@@ -562,6 +611,55 @@ public static class TrayTests
             Check(await Eventually(() => blocked.Running, 30),
                 "the failed attempt released the state directory lock, so a later attempt starts the server");
             await blocked.StopAsync();
+
+            // Diagnostics: the most recent lines in memory, every line on disk, redacted the same way.
+            await using var logged = new TrayController(blockedConfig);
+            for (int line = 1; line <= TrayController.MemoryLines + 100; line++) logged.Note($"line {line} {blockedConfig.ControlToken}");
+            string[] kept = logged.Diagnostics;
+            string[] onDisk = File.ReadAllLines(logged.LogFile);
+            Check(kept.Length == TrayController.MemoryLines && kept[0].EndsWith("line 101 [REDACTED:control_token]", StringComparison.Ordinal) &&
+                  onDisk.Count(l => l.Contains(" line ", StringComparison.Ordinal)) == TrayController.MemoryLines + 100 &&
+                  onDisk.All(l => !l.Contains(blockedConfig.ControlToken, StringComparison.Ordinal)) &&
+                  logged.LogFile.StartsWith(Path.Combine(blockedConfig.StateDir, "logs"), StringComparison.Ordinal),
+                $"the connection log keeps the latest {TrayController.MemoryLines} lines in memory and every line, redacted, in state_dir\\logs");
+
+            // Relaunch without a console, one tray per configuration, and loading that never throws.
+            var detached = TrayInstance.DetachedStart(@"C:\Apps\Codexish.Server.exe", null, ["--tray", "--start"]);
+            var hosted = TrayInstance.DetachedStart("dotnet", @"C:\Apps\Codexish.Server.dll", ["--tray"]);
+            Check(!detached.UseShellExecute && detached.CreateNoWindow && !detached.RedirectStandardInput && !detached.RedirectStandardOutput &&
+                  !detached.RedirectStandardError && detached.ArgumentList.SequenceEqual(["--tray", "--start", TrayInstance.DetachedMarker]) &&
+                  hosted.ArgumentList.SequenceEqual([@"C:\Apps\Codexish.Server.dll", "--tray", TrayInstance.DetachedMarker]),
+                "--tray relaunches the same executable with the same arguments plus the detached marker, a hidden console and no redirection");
+            string configPath = Path.Combine(directory, "tray-config", "codexish.json");
+            Check(TrayInstance.MutexName(configPath) == TrayInstance.MutexName(OperatingSystem.IsWindows() ? configPath.ToUpperInvariant() : configPath) &&
+                  TrayInstance.MutexName(configPath) != TrayInstance.MutexName(configPath + ".other"),
+                "the tray mutex is named after the full configuration path, compared the way the platform compares paths");
+            if (OperatingSystem.IsWindows())
+            {
+                var first = TrayInstance.TryAcquire(configPath);
+                var second = TrayInstance.TryAcquire(configPath);
+                Check(first is not null && second is null, "a second tray for the same configuration finds the first one's mutex");
+                first!.ReleaseMutex();
+                first.Dispose();
+                var third = TrayInstance.TryAcquire(configPath);
+                Check(third is not null, "the configuration is free again once that tray is gone");
+                third!.ReleaseMutex();
+                third.Dispose();
+            }
+            else Console.WriteLine("TRAY SKIP single-instance mutex: the tray exists only on Windows");
+            Directory.CreateDirectory(Path.GetDirectoryName(configPath)!);
+            File.WriteAllText(configPath, "{ unreadable");
+            var (unreadable, why) = TrayInstance.TryLoad(configPath);
+            var plain = ServerConfig.Create("https://tray-plain.invalid", "test-only-password", [("busy", Path.Combine(directory, "busy-root"))], [], 0, Path.Combine(directory, "plain-state"));
+            plain.PublicUrl = "http://tray-plain.invalid";
+            plain.Save(configPath);
+            var (refused, refusal) = TrayInstance.TryLoad(configPath);
+            plain.PublicUrl = "https://tray-plain.invalid";
+            plain.Save(configPath);
+            var (usable, none) = TrayInstance.TryLoad(configPath);
+            Check(unreadable is null && why!.Contains("could not be read", StringComparison.Ordinal) && refused is null && refusal!.Contains("requires https", StringComparison.Ordinal) &&
+                  usable is not null && none is null,
+                "loading for the tray never throws: an unreadable file or a refused public_url comes back as the reason to show and retry");
 
             if (OperatingSystem.IsWindows())
             {

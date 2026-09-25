@@ -2,6 +2,44 @@
 
 Updated 2026-09-17. Mainline **A / PR #4** is unchanged. Desktop **PR #5 remains Draft**. No merge, force push, branch deletion, or whole-product completion is reported.
 
+## Availability hardening (pass 2) — local Windows results (2026-09-26)
+
+Branch `feat/v1-connect-hardening`, on top of 7f07d65; the runs below used the uncommitted working tree on the authorized Windows 11 PC with portable SDK 10.0.401. Nothing here involved ChatGPT, a tunnel, a notification icon, the user's configuration, the real Startup folder or port 38451.
+
+| Item | What it does |
+| --- | --- |
+| P1 startup tolerance | Bad, duplicate or empty root entries are skipped with a warning; a missing root directory stays configured (`exists=false`) and every call checks again; overlapping and nested roots are allowed; a state_dir inside a root, unsupported shell names, an invalid `access_token_hours`, a missing `state_dir` and invalid `redirect_uris` entries become warnings; zero roots leaves the desktop tools working. Warnings go to the startup log and `host_capabilities.warnings`. The files and shell FIFO keys are the canonical full path of the outermost containing root (case-insensitive on Windows), computed without disk access. |
+| P2 kept refusals | The single-instance state lock, `TransportRefusal` and `NoAuthRefusal` are unchanged; a port outside 0-65535 and an unusable `public_url` also still refuse. |
+| P3 configuration files | `Save` writes a flushed temporary file and swaps it in with `File.Replace` (or `File.Move`), keeping `codexish.json.bak`. `Load` keeps an unparseable file as `codexish.json.broken-<utc>`, loads and restores a readable `.bak`, and otherwise raises the real parse error. |
+| P4 drive roots | One containment helper (`PathRules.IsInside`) appends a separator only when the root lacks one; used by configuration warnings, `Workspace.Resolve` and the handle check. |
+| P5 secrets | `SecretMatches` never matches an empty configured secret. A malformed `password_hash` makes sign-in fail with `reason=malformed_password_hash detail=<cause>`; empty secrets and an unusable hash are also startup warnings. |
+| P6 shells | A command without `shell` runs in `shell.default` (or the first allowed shell when the default is not usable). `pwsh` resolves on every call from PATH, the newest `%ProgramFiles%\PowerShell\*\pwsh.exe`, then Windows PowerShell; `powershell` is a supported name and joins the default allowed list; results report `shell` and `interpreter`. |
+| P7 ledger rebuild | SQLITE_CORRUPT/NOTADB at open or schema time, or a failing `PRAGMA quick_check`, renames the database and its `-wal`/`-shm` to `ledger.corrupt-<utc>.*`, creates a fresh one, records an event and reports `ledger_rebuilt`. |
+| P8 ledger containment | Migrations ignore only duplicate-column errors and log others; BUSY, LOCKED and IOERR are retried with backoff within the 30 s command timeout; unreadable token, checkpoint, process and result rows are contained to that row. The ledger's acceptance and start records now surface a write failure as "nothing was started" instead of leaving the call waiting. |
+| P9, P10 processes | A failure after `Process.Start` terminates the child tree and its job, records `process_start_failed` and returns `EXECUTION_FAILED`. After the final state is recorded, the process handle is disposed and the job closed once it holds no process; job handles are used under a per-process lock so a closed handle number is never reused. |
+| P11, P12 Git | Every inherited `GIT_*` variable is dropped (only `GIT_TERMINAL_PROMPT=0` is set). Git resolves on every call from `git.path`, PATH, `%ProgramFiles%\Git\cmd`, then `%LOCALAPPDATA%\Programs\Git\cmd`; the `--no-lazy-fetch` probe repeats when the binary changes. |
+| P13 mounts in the background | Kestrel starts first; mounts connect afterwards from `ApplicationStarted`, each in its own loop with no handshake deadline. Mounted tools are served through list/call handlers, so the tool list changes without rebuilding the host. |
+| P14 mount supervision | A backend that fails to start or exits is restarted with the shared backoff (1 s doubling to 60 s, never giving up, reset after 5 healthy minutes). The last tool list is saved as `<state_dir>\browser-profiles\<id>.manifest.json` and listed while the backend is down; calls then answer `BROWSER_UNAVAILABLE` with state, attempts and `next_retry`. |
+| P15 profile flags | A dedicated Playwright mount whose own args carry profile, CDP, extension, storage-state or config flags starts with its args unchanged, without CODEXish's `--user-data-dir`, and with a warning. |
+| P16 tunnel job | The tray-owned tunnel runs in a kill-on-close job, closed when it exits by itself or is stopped. |
+| P17 retention | `retention.output_days` (30) and `backup_days` (90), 0 = forever; a sweep 60 s after start and every 6 h deletes the listed state classes in batches of 500 rows without VACUUM, protects the listed live state, and reports settings and the last sweep in `host_capabilities.retention`. |
+| P18 console-less tray | `--tray` relaunches the same executable with `--tray-detached`, `CreateNoWindow`, no redirection, and exits; a failed relaunch runs the tray in place. |
+| P19 configuration errors | A configuration that cannot be loaded (after `.bak` recovery) or is refused by `TransportRefusal` leaves the icon up with a balloon and the reason in the status window, retries every 60 s, then proceeds as `--start`; "Open configuration folder" is in the menu. |
+| P20 tray logs | The connection log keeps the latest 5,000 lines in memory and appends every redacted line to `<state_dir>\logs\tray-<yyyyMMdd>.log`; the window names the file. |
+| P21 single tray | A named mutex derived from the full configuration path; a second tray shows "CODEXish is already running; its icon is in the notification area" and exits 0. |
+
+| Command | Result |
+| --- | --- |
+| Release build, server | 0 warnings, 0 errors |
+| Server project copy with its Windows conditions set to false (net10.0, no WPF/Windows Forms), offline restore | 0 warnings, 0 errors; a compile check on Windows, not a Linux run |
+| `--self-test`, three runs | SELF_TEST_PASSED 310 (261 before) in each; DESKTOP_CORE_PASSED 56; DESKTOP_REGRESSIONS 11 passed, 0 failed. The dangling-link check printed SKIP because this session cannot create symbolic links; the new drive-root, powershell and Git-fallback checks ran. |
+| `--browser-tests`, five runs | BROWSER_TESTS_PASSED 53 (40 before) in each |
+| `--tray-tests`, five runs | TRAY_CONTROLLER_PASSED 43 (36 before) in each |
+
+Only the last run of each suite used the final source. The first run of each predates two small follow-ups (first: queue keys computed without disk access and retention deletes in batches; second: the per-process job-handle lock and the empty-secret warnings), and the runs in between predate the second. Not run and not claimed: the relaunch, the mutex message box, the configuration-error balloon and the other tray UI (`--tray`, `--tray-smoke-test`), an actual Windows sign-in, `--self-test-desktop`, `--self-test-desktop-http`, `--browser-live-test`, the P0 self-test, CI, a Linux run, and any use of ChatGPT, Tailscale or cloudflared.
+
+Known gaps, recorded and left for later: the Job Object race (a grandchild spawned between `Process.Start` and job assignment escapes; starting suspended would close it); Git output and directory traversal are not streamed; continuation cursors for `fs_read`, artifacts and search and cursor identity binding are incomplete; artifact hashes are not re-verified; `$dynamicRef` in backend schemas is not rebased; the foreground confirmation window is unchanged; UAC, secure-desktop and higher-integrity targets are refused.
+
 ## Connection hardening — local Windows results (2026-09-26)
 
 Branch `feat/v1-connect-hardening`, based on `b6a19aa` (the PR #6 head); the runs below used the uncommitted working tree. They ran on the authorized Windows 11 PC with portable SDK 10.0.401. Nothing here involved ChatGPT, a tunnel, a notification icon, the user's configuration or the real Startup folder. For current behavior this section supersedes the tray row of the slice 3–4 table below.
@@ -14,7 +52,7 @@ Branch `feat/v1-connect-hardening`, based on `b6a19aa` (the PR #6 head); the run
 | Client authentication | A `client_id` that is present (form or Basic) must match; without one the secret alone authenticates the single client; a missing secret is refused as `missing_client_secret`. |
 | Redirect URIs | Configured entries still match exactly; any other absolute https URI without a fragment is accepted. For those, errors before the password stay on the local page, the acceptance is logged as `accepted oauth redirect_uri outside configured list host=<host>`, and the code redirect carries `iss`. The sign-in page names the destination host for every callback. `/token` still requires the same redirect_uri. |
 | Refresh tokens | Not rotated or consumed: a refresh validates the token and returns a new access token with the same refresh token. Family revocation on reuse, the "already consumed" refusal and consume-and-revoke are removed. `refresh_token_days` defaults to 0, meaning no expiry, which also covers rows stored under the rotating scheme; a positive value is honored and restarts from each refresh. `revoke-tokens` still revokes every token. |
-| Build | NU1901–NU1904 are no longer in the server project's `WarningsAsErrors`. The P0 project is unchanged and still has them. |
+| Build | NU1901–NU1904 are no longer in the server project's `WarningsAsErrors`; the lead removed them from the P0 project the same way before committing 7f07d65. |
 | Tray | The setup form adds Local port and "Start CODEXish when I sign in to Windows" (checked); `--tray` takes `--start` and pre-fill values `--public-url`, `--port`, `--root`. `TrayAutostart.cs` writes `CODEXish.lnk` in the Startup folder through `IShellLinkW`/`IPersistFile`; a checkable "Start with Windows" item; a shortcut whose target file is gone or that cannot be read is rewritten at tray start. The server and the owned tunnel are supervised: 1 s doubling to 60 s, reset after 5 healthy minutes, never giving up; user stops end supervision; the tunnel starts only while the server listens; the tooltip shows running, retrying with a cause, or stopped. |
 | Runtime | A server start that fails after taking the state-directory lock now releases the lock and the database, so a later attempt in the same process can take them. |
 

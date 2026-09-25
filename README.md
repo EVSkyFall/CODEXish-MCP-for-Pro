@@ -46,12 +46,23 @@ secret and the loopback control token with `RandomNumberGenerator`, stores the p
 and puts the hostname from `--public-url` into `allow_hosts` and its origin into `allow_origins` (the tunnel
 terminates TLS, so the login form's own POST arrives with an https Origin over an http connection).
 `--public-url` must be https unless you run with `--no-auth`, because the access token would otherwise cross
-the tunnel in clear text. `--port` is the local listening port (default 3000). Roots may not overlap: one root per
-directory tree. Repeat `--root id=path` for more roots; each root
-grants read, write and shell unless you edit the file afterwards. `--state-dir` moves the ledger, artifacts and
-backups; it must stay outside every root or the server refuses to start. Any https callback is accepted (see
-below), so `--redirect-uri <uri>` (repeatable) is only needed for a connector whose callback is not https.
+the tunnel in clear text. `--port` is the local listening port (default 3000). Repeat `--root id=path` for more
+roots; each root grants read, write and shell unless you edit the file afterwards. Roots may overlap or nest: each
+call uses the grants of the `root_id` it names, and changes to files reachable through several roots wait in one
+queue. `--state-dir` moves the ledger, artifacts and backups; keep it outside every root, because a root that
+contains it exposes them to that root's tools. Any https callback is accepted (see below), so
+`--redirect-uri <uri>` (repeatable) is only needed for a connector whose callback is not https.
 **`--init` prints the client secret and the control token once. Treat both as passwords.**
+
+Only a `port` outside 0-65535, an unusable `public_url`, an http `public_url` with authentication, `--no-auth`
+with a public host, and another server already running on the same `state_dir` still refuse to start. Everything
+else that is wrong in the file is skipped or replaced by its
+default and reported as a warning in the startup log and in `host_capabilities.warnings`: a root entry with a bad or
+duplicate id or no path is ignored; a root whose directory does not exist stays configured with `exists=false`, and
+calls on it fail until the directory exists, without a restart; a server with no usable root still serves the
+desktop tools. Saving (the tray's setup and **Edit roots and grants**) writes a temporary file and swaps it in, and
+keeps the previous version as `codexish.json.bak`. If `codexish.json` cannot be parsed, it is kept as
+`codexish.json.broken-<utc>` and a readable `codexish.json.bak` is loaded and restored in its place.
 
 ### Run it
 
@@ -153,6 +164,42 @@ Invoke-RestMethod -Method Get  -Uri http://127.0.0.1:3000/control/status        
 Pause is a hold, not a refusal: while paused, a write is accepted into its queue and returned as `queued` with
 `paused: true`, reads keep working, and the queue drains on resume.
 
+### Shells and Git
+
+A `command` string without `shell` runs in `shell.default`. The supported shells are `pwsh`, `powershell` (Windows
+PowerShell 5.1) and `cmd`, and new configurations allow all three; `shell.allowed` stays your own policy, so a shell
+that is not in it is refused. `pwsh` is looked up on every call: on `PATH`, then the newest
+`%ProgramFiles%\PowerShell\*\pwsh.exe`, then Windows PowerShell. Every result names the `interpreter` that ran the
+command. Unsupported names in `shell.allowed` are ignored with a warning, and a `shell.default` that is not allowed
+falls back to the first allowed shell.
+
+Git is looked up on every call as well: `git.path` when that file exists, then `git` on `PATH`, then
+`%ProgramFiles%\Git\cmd\git.exe`, then `%LOCALAPPDATA%\Programs\Git\cmd\git.exe`, so a moved or upgraded Git keeps
+working without editing the file. `host_capabilities` and `workspace_info` report the path in use. Git runs without
+any `GIT_*` variable inherited from the server's environment.
+
+### Ledger and retention
+
+The ledger is the SQLite database `codexish.db` in `state_dir`. If SQLite reports it as damaged or not a database at
+startup (including `PRAGMA quick_check`), it and its `-wal`/`-shm` files are renamed to `ledger.corrupt-<utc>.*`, a
+fresh database is created and `host_capabilities.ledger_rebuilt` says so. **The fresh ledger has no tokens, so the
+ChatGPT connector has to sign in again.** Brief lock or I/O errors from other programs are retried within the normal
+command timeout, and a row that cannot be read affects only the response that needed it.
+
+CODEXish deletes its own old state, never your roots, files or Git history:
+
+```json
+"retention": { "output_days": 30, "backup_days": 90 }
+```
+
+About a minute after start and then every 6 hours, artifacts (command output and stored reads), finished ledger
+entries, events, exited processes with their output, expired or revoked tokens, older checkpoints and the tray's log
+files older than `output_days` are deleted; pre-edit backups, quarantined ledgers and `codexish.json.broken-*` copies
+older than `backup_days` are deleted. A missing section means these defaults, and `0` keeps that state forever.
+Running and reattachable processes, queued or running operations, the newest checkpoint, live tokens and browser
+profiles are never deleted. A failed step is retried at the next sweep; `host_capabilities.retention` shows the
+settings and the last sweep.
+
 ### Browser mounts (slice 3)
 
 CODEXish does not drive a browser itself. It starts an existing browser MCP server as a stdio child process and
@@ -177,11 +224,11 @@ tools directory, add this to `codexish.json`:
   shims such as `npx` cannot be started this way; run `node` with the path to `cli.js`.
 - `profile_mode: "dedicated"` (the default) keeps the browser's state in `<state_dir>\browser-profiles\<id>`:
   CODEXish appends `--user-data-dir` with that directory for `kind: "playwright"`. A dedicated mount whose own
-  `args` contain `--user-data-dir`, `--cdp-endpoint`, `--extension`, `--storage-state` or `--config` is not started
-  and is reported as `invalid_config`. `profile_mode: "existing"` passes `args` unchanged; choose it only when you
-  deliberately point the backend at an existing profile, CDP endpoint or extension. `{profile_dir}` in `args`
-  expands to the per-mount directory in both modes. `kind: "custom"` mounts another stdio MCP server without
-  profile handling.
+  `args` already contain `--user-data-dir`, `--cdp-endpoint`, `--extension`, `--storage-state` or `--config` starts
+  with those `args` unchanged and without CODEXish's `--user-data-dir`, and `host_capabilities` shows a warning for
+  it. `profile_mode: "existing"` passes `args` unchanged; choose it only when you deliberately point the backend at
+  an existing profile, CDP endpoint or extension. `{profile_dir}` in `args` expands to the per-mount directory in
+  both modes. `kind: "custom"` mounts another stdio MCP server without profile handling.
 - Tools appear as `browser_<id>_<backend tool>`, for example `browser_pw_browser_navigate`. A name that is not
   `^[a-zA-Z0-9_-]+$` or would exceed 64 characters is shortened and given a short hash suffix. Every mounted tool
   takes the backend's own inputs inside `arguments`. Tools listed in `read_only_tools` run directly and bypass the
@@ -191,9 +238,16 @@ tools directory, add this to `codexish.json`:
 - Starting a mount and calling a read-only tool need read and shell grants on `root_id`; other tools also need write.
 - The backend receives a small environment: system and user profile paths, `PATH`, `TEMP` and `DOTNET_ROOT`.
   Variables whose names look like credentials are never passed, and proxy variables are not passed either.
-- A mount that fails to start does not stop the server. `host_capabilities` reports each mount's `state`
-  (`connected`, `unavailable`, `invalid_config`, `exited`) with its error and the last lines of its stderr. Mounts
-  are read when the server starts.
+- Mounts connect in the background once the server listens, each on its own, so a backend that is slow or never
+  answers its handshake delays nothing else. A backend that fails to start or exits is restarted after 1 s, doubling
+  to at most 60 s between attempts, without giving up; five healthy minutes reset the delay. `host_capabilities`
+  reports each mount's `state` (`starting`, `connected`, `retrying`, `invalid_config`, `stopped`), its attempts, last
+  error, next retry time and the last lines of its stderr. Only an entry that is invalid in the file itself
+  (`invalid_config`) is not retried.
+- The tool list a backend last reported is saved as `<state_dir>\browser-profiles\<id>.manifest.json`. While the
+  backend is down, and after a restart until it connects, those tools stay listed and a call answers
+  `BROWSER_UNAVAILABLE` with the mount's state and the time of its next retry. Mounts are read when the server
+  starts.
 - Mounted tools run unconfined as you and are not contained by the root or its grants. Tools such as
   `browser_file_upload`, `browser_evaluate` or `browser_run_code_unsafe` can read files or run code anywhere your
   account can; the grants only decide whether CODEXish forwards a call, and the root is the backend's working
@@ -206,11 +260,20 @@ tools directory, add this to `codexish.json`:
 & $codexish --tray --config D:\Codexish\codexish.json
 ```
 
-`--tray` runs the same server behind a notification-area icon. Without a configuration file it first shows a setup
-form: public https origin, local port (3000 unless `--port` says otherwise), one project root, a new CODEXish
-password, the OAuth callback and **Start CODEXish when I sign in to Windows**, which is checked. `--public-url`,
-`--port` and `--root` only pre-fill the form; the password is never taken from the command line. The form writes the
-file like `--init`, shows the client secret once, and then starts the server and a configured tunnel.
+`--tray` runs the same server behind a notification-area icon. It first starts itself again in the background with
+a hidden console and exits, so the console window of a shortcut, a double-click or a terminal closes at once and
+closing a terminal no longer ends CODEXish; if that relaunch fails, the tray runs in the original process. One tray
+runs per configuration: a second `--tray` for the same `codexish.json` says "CODEXish is already running; its icon is
+in the notification area" and exits.
+
+Without a configuration file the tray first shows a setup form: public https origin, local port (3000 unless
+`--port` says otherwise), one project root, a new CODEXish password, the OAuth callback and **Start CODEXish when I
+sign in to Windows**, which is checked. `--public-url`, `--port` and `--root` only pre-fill the form; the password is
+never taken from the command line. The form writes the file like `--init`, shows the client secret once (with any
+warnings), and then starts the server and a configured tunnel. When the file exists but cannot be loaded even from
+`codexish.json.bak`, or its `public_url` is http, the icon starts anyway, shows the reason in a balloon and in the
+status window, offers **Open configuration folder**, and tries again every minute; once the file loads, it starts
+the server and a configured tunnel.
 
 **Start with Windows**, a checkable menu item and the setup checkbox, writes `CODEXish.lnk` into your Startup folder.
 It runs this executable with `--tray --start` (plus `--config "<path>"` for a configuration outside the default
@@ -227,12 +290,16 @@ stop until you start it again. The icon's tooltip shows whether each part is run
 or stopped, and every failure and restart is in the connection log with its cause.
 
 The menu also offers status with roots and processes, pause and resume, stopping session children, revoking all
-tokens, the connection log, and **Edit roots and grants**, which stops the server and saves the file.
+tokens, the connection log, **Open configuration folder**, and **Edit roots and grants**, which stops the server and
+saves the file. The connection log window shows the latest 5,000 lines; every line, redacted the same way, is also
+appended to `<state_dir>\logs\tray-<yyyyMMdd>.log`, which the window names and retention removes after
+`output_days`.
 
 **Start configured tunnel** runs `tunnel.command` with `tunnel.args` as a child of the tray; `{port}` becomes the
 listening port. Nothing downloads or selects a tunnel. Starting the server alone never starts it, and it is only
-started while this server is listening, so it never publishes another program that took the port. Stopping the
-server or exiting the tray stops it:
+started while this server is listening, so it never publishes another program that took the port. The tunnel runs
+inside a kill-on-close job object, so it ends with the tray even when the tray is killed. Stopping the server or
+exiting the tray stops it:
 
 ```json
 "tunnel": { "command": "C:\\Tools\\cloudflared.exe", "args": ["tunnel", "--url", "http://127.0.0.1:{port}"] }
@@ -255,7 +322,8 @@ dotnet run --project src/Codexish.Server -c Release -- --tray-tests
 The self-test uses real files, a real SQLite ledger, real child processes, a real booby-trapped Git repository
 and a real in-process HTTP listener. It opens no tunnel, sends no desktop input and performs no ChatGPT
 measurement. Windows-only checks print `SKIP` elsewhere. `--browser-tests` runs this executable as a stdio MCP
-fixture behind the real HTTP host; `--tray-tests` drives the tray controller over the local control endpoint,
+fixture behind the real HTTP host, including fixture modes that exit after a number of calls, never answer the
+handshake, or fail their first starts; `--tray-tests` drives the tray controller over the local control endpoint,
 including supervision (a busy port, a stopped host, short-lived test tunnels) and, on Windows, the autostart shortcut
 in a temporary Startup folder, without an icon or an external tunnel. All three run in CI on Windows and Ubuntu.
 
@@ -273,6 +341,14 @@ There is no sandbox: `shell_run`, builds, tests and any Git hook they invoke run
 `mode=replace` is not crash-atomic, `fs_apply_patch` has no rollback, redaction is a small published pattern set
 and not a guarantee, and no part of this has been measured against ChatGPT Pro. The complete list is the final
 section of [docs/v1-design.md](docs/v1-design.md).
+
+Known gaps that are recorded but not addressed yet: a child is placed in its Job Object just after it starts, so a
+grandchild spawned in that moment can escape it (starting suspended would close this); Git output and directory
+walks are read whole rather than streamed; continuation cursors for `fs_read`, artifacts and search, and binding
+each cursor to the identity of what it pages through, are incomplete; stored artifacts are not re-verified against
+their hash; backend schemas that use `$dynamicRef` are not rebased; the foreground confirmation window of desktop
+actions is unchanged; and desktop actions on UAC prompts, the secure desktop and higher-integrity windows are
+refused.
 
 ## P0 probe
 

@@ -25,8 +25,10 @@ public sealed class BrowserMountConfig
 }
 
 // The backend is a configured executable, not generated code or a second model. It owns browser semantics;
-// this layer owns grants, naming, transport and invocation recovery.
-public sealed class BrowserMounts(CodexishRuntime runtime) : IAsyncDisposable
+// this layer owns grants, naming, transport, restarts and invocation recovery. Every mount is supervised on its own:
+// it connects after the host listens, is restarted with backoff whenever it fails to start or exits, and a mount that
+// is still starting or never answers affects nothing but itself.
+public sealed class BrowserMounts : IAsyncDisposable
 {
     public const int MaxToolName = 64;
     private const int StderrTailLines = 20;
@@ -44,34 +46,81 @@ public sealed class BrowserMounts(CodexishRuntime runtime) : IAsyncDisposable
         public nint Job;
         public string State = "not_started";
         public string? Error;
+        public string? Warning;
         public string? Version;
         public string? ProfileDirectory;
         public readonly Queue<string> StderrTail = new();
-        public readonly List<MountedTool> Tools = [];
+        // The tools currently published for this mount: the backend's own list, or the saved one while it is down.
+        public MountedTool[] Tools = [];
+        public string ToolsSource = "none";
+        public int Attempts;
+        public DateTimeOffset? NextRetry;
+        public DateTimeOffset? ConnectedAt;
+        public bool Supervised;
+        public Task Loop = Task.CompletedTask;
+        // Completed by the first outcome of the first attempt, for callers that want to wait for it.
+        public readonly TaskCompletionSource Settled = new(TaskCreationOptions.RunContinuationsAsynchronously);
     }
 
-    private readonly CodexishRuntime owner = runtime;
+    private readonly CodexishRuntime owner;
     private readonly List<Connection> connections = [];
     private readonly CancellationTokenSource stopping = new();
-    private int initialized, disposed;
+    private int started, disposed;
 
-    public IReadOnlyList<McpServerTool> Tools => connections.SelectMany(c => c.Tools).ToArray();
+    public BrowserMounts(CodexishRuntime runtime)
+    {
+        owner = runtime;
+        var ids = NewIdSet();
+        foreach (var entry in runtime.Config.BrowserMounts ?? [])
+        {
+            var mount = Normalize(entry);
+            var connection = new Connection(mount);
+            connections.Add(connection);
+            string? problem;
+            try { problem = entry is null ? "the browser_mounts entry is null." : Invalid(mount, ids); }
+            catch (Exception error) { problem = "the entry could not be validated: " + error.GetType().Name; }
+            if (problem is not null)
+            {
+                // A configuration error cannot heal by retrying; it is reported and the entry stays out of the tool list.
+                connection.State = "invalid_config";
+                connection.Error = problem;
+                connection.Settled.TrySetResult();
+                Report(connection);
+                continue;
+            }
+            connection.Supervised = true;
+            connection.Warning = ProfileWarning(mount);
+            LoadManifest(connection);
+        }
+    }
+
+    public IReadOnlyList<McpServerTool> Tools => connections.SelectMany(c => Volatile.Read(ref c.Tools)).ToArray();
+
+    public McpServerTool? Find(string? name) =>
+        name is null ? null : connections.SelectMany(c => Volatile.Read(ref c.Tools)).FirstOrDefault(t => t.ProtocolTool.Name == name);
 
     public string Summary() => connections.Count == 0 ? "none configured" :
-        string.Join(", ", connections.Select(c => $"{c.Config.Id}={c.State}" + (c.State == "connected" ? $" ({c.Tools.Count} tools)" : "")));
+        string.Join(", ", connections.Select(c => $"{c.Config.Id}={c.State}" + (c.Tools.Length > 0 ? $" ({c.Tools.Length} tools, {c.ToolsSource})" : "")));
 
     public object Describe() => new
     {
-        mounted = connections.Select(c => new
+        mounted = connections.Select(c =>
         {
-            id = c.Config.Id, root_id = c.Config.RootId, kind = c.Config.Kind, profile_mode = c.Config.ProfileMode,
-            profile_directory = c.ProfileDirectory, state = c.State, error = c.Error, server_version = c.Version,
-            tools = c.Tools.Select(t => t.ProtocolTool.Name).ToArray(),
-            stderr_tail = c.State == "connected" ? null : Tail(c)
+            lock (c.Sync)
+                return new
+                {
+                    id = c.Config.Id, root_id = c.Config.RootId, kind = c.Config.Kind, profile_mode = c.Config.ProfileMode,
+                    profile_directory = c.ProfileDirectory, state = c.State, error = c.Error, warning = c.Warning,
+                    attempts = c.Attempts, next_retry = c.NextRetry, connected_at = c.ConnectedAt, server_version = c.Version,
+                    tools = c.Tools.Select(t => t.ProtocolTool.Name).ToArray(), tools_source = c.ToolsSource,
+                    stderr_tail = c.State == "connected" ? null : Tail(c)
+                };
         }).ToArray(),
         configured = owner.Config.BrowserMounts?.Length ?? 0,
         transport = "stdio child process driven by the official MCP client; CODEXish opens no browser debugging listener",
-        profile = "dedicated: CODEXish passes --user-data-dir under state_dir to a Playwright backend; existing: the configured arguments select the browser state",
+        profile = "dedicated: CODEXish passes --user-data-dir under state_dir to a Playwright backend, unless the mount's own args already select browser state; existing: the configured arguments select the browser state",
+        supervision = "Mounts connect in the background after the server listens. A backend that fails to start or exits is restarted after 1 s, doubling to 60 s between attempts, without giving up; five healthy minutes reset the delay. There is no deadline for a backend's handshake.",
+        manifest = "The last tool list each backend reported is kept in state_dir/browser-profiles/<id>.manifest.json and stays listed while that backend is down; calls then answer BROWSER_UNAVAILABLE with the next retry time.",
         limits_source = "Action and navigation limits are the backend's own options and defaults; CODEXish adds no action deadline.",
         boundary = "Mounted backend tools, for example file upload, script evaluation or run_code_unsafe, run as the logged-in user and are not contained by the root or its grants: the grants only decide whether CODEXish forwards a call, and the root is the backend's working directory, not a filesystem, network or code sandbox.",
         read_only_tools = "Tools listed in read_only_tools are forwarded without an invocation_id and bypass the ledger because the local configuration says so; CODEXish does not verify that they are free of side effects.",
@@ -87,11 +136,21 @@ public sealed class BrowserMounts(CodexishRuntime runtime) : IAsyncDisposable
         return name[..Math.Min(name.Length, MaxToolName - hash.Length - 1)] + "_" + hash;
     }
 
+    // A mount whose own args already select browser state keeps them unchanged and gets no second --user-data-dir.
+    internal static bool OwnsBrowserState(BrowserMountConfig mount) =>
+        mount.Args.Any(a => a is not null && ProfileFlags.Any(flag => a == flag || a.StartsWith(flag + "=", StringComparison.Ordinal)));
+
+    internal static string? ProfileWarning(BrowserMountConfig mount) =>
+        mount.Kind == "playwright" && mount.ProfileMode == "dedicated" && OwnsBrowserState(mount)
+            ? "Its own args already select browser state (--user-data-dir, --cdp-endpoint, --extension, --storage-state or --config), " +
+              "so it runs with those args unchanged and without the dedicated profile directory CODEXish would supply."
+            : null;
+
     internal static string[] LaunchArguments(BrowserMountConfig mount, string profileDirectory)
     {
         var arguments = mount.Args.Select(a => a.Replace("{profile_dir}", profileDirectory, StringComparison.Ordinal)).ToList();
         // An explicit directory also avoids Chrome refusing remote debugging for a default-looking profile.
-        if (mount.Kind == "playwright" && mount.ProfileMode == "dedicated")
+        if (mount.Kind == "playwright" && mount.ProfileMode == "dedicated" && !OwnsBrowserState(mount))
         {
             arguments.Add("--user-data-dir");
             arguments.Add(profileDirectory);
@@ -140,64 +199,91 @@ public sealed class BrowserMounts(CodexishRuntime runtime) : IAsyncDisposable
         if (mount.ProfileMode is not ("dedicated" or "existing")) return "profile_mode must be dedicated or existing.";
         if (mount.Args.Any(a => a is null)) return "args must not contain null.";
         if (mount.ReadOnlyTools.Any(t => t is null)) return "read_only_tools must not contain null.";
-        if (mount.Kind == "playwright" && mount.ProfileMode == "dedicated" &&
-            mount.Args.Any(a => ProfileFlags.Any(flag => a == flag || a.StartsWith(flag + "=", StringComparison.Ordinal))))
-            return "Profile, CDP endpoint, extension, storage-state and config flags select existing browser state; use profile_mode=existing for them. A dedicated profile directory is supplied by CODEXish.";
         return null;
     }
 
-    // A mount that cannot start is recorded with its state and error; it never stops the coding and desktop tools.
-    public async Task InitializeAsync(CancellationToken cancellation = default)
+    // Starts one supervision loop per mount. Called once the host listens; later calls do nothing.
+    public void Start()
     {
-        if (Interlocked.Exchange(ref initialized, 1) != 0) return;
-        var ids = NewIdSet();
-        var names = new HashSet<string>(CodexishRuntime.ToolNames, StringComparer.Ordinal);
-        foreach (var entry in owner.Config.BrowserMounts ?? [])
+        if (Volatile.Read(ref disposed) != 0 || Interlocked.Exchange(ref started, 1) != 0) return;
+        foreach (var connection in connections.Where(c => c.Supervised))
+            connection.Loop = Task.Run(() => Supervise(connection));
+    }
+
+    // For tests and callers that want the first outcome of every mount: starts the mounts and waits for each first
+    // attempt, whether it connected or failed. A backend that never answers its handshake never settles.
+    public async Task InitializeAsync()
+    {
+        Start();
+        await Task.WhenAll(connections.Select(c => c.Settled.Task));
+    }
+
+    private async Task Supervise(Connection connection)
+    {
+        var token = stopping.Token;
+        int failures = 0;
+        try
         {
-            var mount = Normalize(entry);
-            var connection = new Connection(mount);
-            connections.Add(connection);
-            string? problem;
-            try { problem = entry is null ? "the browser_mounts entry is null." : Invalid(mount, ids); }
-            catch (Exception error) { problem = "the entry could not be validated: " + error.GetType().Name; }
-            if (problem is not null)
+            while (!token.IsCancellationRequested)
             {
-                connection.State = "invalid_config";
-                connection.Error = problem;
-                Report(connection);
-                continue;
-            }
-            try
-            {
-                connection.State = "starting";
-                await Connect(connection, names, cancellation);
-            }
-            catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
-            {
-                await StopConnection(connection);
-                connection.State = "cancelled";
-                throw;
-            }
-            catch (Exception error)
-            {
-                string exit = connection.Process is { } process && Exited(process) ? $"; backend exited with code {ExitCode(process)}" : "";
+                var healthy = Stopwatch.StartNew();
+                string reason;
+                try
+                {
+                    lock (connection.Sync) connection.State = "starting";
+                    var process = await Connect(connection, token);
+                    connection.Settled.TrySetResult();
+                    try { await process.WaitForExitAsync(token); }
+                    catch (OperationCanceledException) { break; }
+                    failures = Backoff.FailuresAfterRun(failures, healthy.Elapsed) + 1;
+                    reason = $"The backend process exited with code {ExitCode(process)}.";
+                }
+                catch (OperationCanceledException) when (token.IsCancellationRequested) { break; }
+                catch (Exception error)
+                {
+                    failures++;
+                    Process? process;
+                    lock (connection.Sync) process = connection.Process;
+                    reason = error.GetType().Name + ": " + Redaction.Apply(error.Message).Text +
+                        (process is not null && Exited(process) ? $" The backend exited with code {ExitCode(process)}." : "");
+                }
+                // A backend that is gone releases its session and job at once, so its tools answer BROWSER_UNAVAILABLE
+                // and closing the kill-on-close job ends any browser it left behind.
                 bool ended = await StopConnection(connection);
-                connection.Tools.Clear();
-                connection.State = "unavailable";
-                connection.Error = error.GetType().Name + ": " + Redaction.Apply(error.Message).Text + exit +
-                    (ended ? "" : "; the backend process exit could not be confirmed");
+                var delay = Backoff.Delay(failures);
+                lock (connection.Sync)
+                {
+                    connection.State = "retrying";
+                    connection.Error = reason + (ended ? "" : " The backend process exit could not be confirmed.");
+                    connection.Attempts = failures;
+                    connection.NextRetry = DateTimeOffset.UtcNow + delay;
+                }
+                connection.Settled.TrySetResult();
                 Report(connection);
+                try { await Task.Delay(delay, token); }
+                catch (OperationCanceledException) { break; }
             }
+        }
+        finally
+        {
+            bool exited = await StopConnection(connection);
+            lock (connection.Sync)
+            {
+                connection.State = exited ? "stopped" : "exited_unknown";
+                connection.NextRetry = null;
+            }
+            connection.Settled.TrySetResult();
         }
     }
 
-    private async Task Connect(Connection connection, HashSet<string> names, CancellationToken cancellation)
+    private async Task<Process> Connect(Connection connection, CancellationToken cancellation)
     {
         var mount = connection.Config;
         var root = owner.Workspace.Resolve(mount.RootId, "", Grant.Read | Grant.Shell);
         owner.Workspace.VerifyDirectory(root);
         string profile = Path.Combine(owner.Config.StateDir, "browser-profiles", mount.Id);
-        if ((mount.Kind == "playwright" && mount.ProfileMode == "dedicated") || mount.Args.Any(a => a.Contains("{profile_dir}", StringComparison.Ordinal)))
+        if ((mount.Kind == "playwright" && mount.ProfileMode == "dedicated" && !OwnsBrowserState(mount)) ||
+            mount.Args.Any(a => a.Contains("{profile_dir}", StringComparison.Ordinal)))
         {
             Directory.CreateDirectory(profile);
             connection.ProfileDirectory = profile;
@@ -215,34 +301,98 @@ public sealed class BrowserMounts(CodexishRuntime runtime) : IAsyncDisposable
         foreach (var (name, value) in ChildEnvironment()) start.Environment[name] = value;
         foreach (string argument in LaunchArguments(mount, profile)) start.ArgumentList.Add(argument);
         var process = Process.Start(start) ?? throw new IOException("The backend process did not start.");
-        connection.Process = process;
+        lock (connection.Sync) connection.Process = process;
         // A kill-on-close job ends the backend and any browser it launched together with this server.
-        connection.Job = Native.CreateKillOnCloseJob();
-        if (connection.Job != 0 && !Native.AssignProcess(connection.Job, process.Handle))
+        nint job = Native.CreateKillOnCloseJob();
+        if (job != 0 && !Native.AssignProcess(job, process.Handle))
         {
-            Native.CloseJob(connection.Job);
-            connection.Job = 0;
+            Native.CloseJob(job);
+            job = 0;
         }
+        lock (connection.Sync) connection.Job = job;
         _ = Drain(connection, process.StandardError);
-        process.EnableRaisingEvents = true;
-        process.Exited += (_, _) => OnExited(connection, process);
         var transport = new StreamClientTransport(process.StandardInput.BaseStream, process.StandardOutput.BaseStream);
-        connection.Client = await McpClient.CreateAsync(transport, new McpClientOptions
+        var client = await McpClient.CreateAsync(transport, new McpClientOptions
         {
             ClientInfo = new() { Name = "CODEXish browser mount", Version = CodexishRuntime.ServerVersion }
         }, cancellationToken: cancellation);
-        var listed = await connection.Client.ListToolsAsync(cancellationToken: cancellation);
+        lock (connection.Sync) connection.Client = client;
+        var listed = await client.ListToolsAsync(cancellationToken: cancellation);
         var proxies = listed.Select(t => new MountedTool(this, connection, t.ProtocolTool)).ToArray();
-        var mapped = new HashSet<string>(StringComparer.Ordinal);
+        if (Collision(connection, proxies) is { } taken)
+            throw new InvalidOperationException($"Mounted tool name '{taken}' collides with another tool; choose a different mount id.");
+        lock (connection.Sync)
+        {
+            connection.Version = client.ServerInfo?.Version;
+            Volatile.Write(ref connection.Tools, proxies);
+            connection.ToolsSource = "backend";
+            connection.State = "connected";
+            connection.Error = null;
+            connection.NextRetry = null;
+            connection.ConnectedAt = DateTimeOffset.UtcNow;
+        }
+        SaveManifest(connection, listed.Select(t => t.ProtocolTool));
+        return process;
+    }
+
+    private string? Collision(Connection connection, IEnumerable<MountedTool> proxies)
+    {
+        var taken = new HashSet<string>(CodexishRuntime.ToolNames, StringComparer.Ordinal);
+        foreach (var other in connections.Where(c => !ReferenceEquals(c, connection)))
+            foreach (var tool in Volatile.Read(ref other.Tools)) taken.Add(tool.ProtocolTool.Name);
+        var mine = new HashSet<string>(StringComparer.Ordinal);
         foreach (var proxy in proxies)
-            if (!mapped.Add(proxy.ProtocolTool.Name) || names.Contains(proxy.ProtocolTool.Name))
-                throw new InvalidOperationException($"Mounted tool name '{proxy.ProtocolTool.Name}' collides with another tool; choose a different mount id.");
-        names.UnionWith(mapped);
-        connection.Tools.AddRange(proxies);
-        connection.Version = connection.Client.ServerInfo?.Version;
-        lock (connection.Sync) connection.State = "connected";
-        // An exit during the handshake raised Exited while the mount was still starting, so it is handled here.
-        if (Exited(process)) OnExited(connection, process);
+            if (!mine.Add(proxy.ProtocolTool.Name) || taken.Contains(proxy.ProtocolTool.Name)) return proxy.ProtocolTool.Name;
+        return null;
+    }
+
+    private string ManifestPath(Connection connection) =>
+        Path.Combine(owner.Config.StateDir, "browser-profiles", connection.Config.Id + ".manifest.json");
+
+    // The tool list a backend last reported, so ChatGPT's tool list does not shrink after a reboot or a crash.
+    private void SaveManifest(Connection connection, IEnumerable<Tool> tools)
+    {
+        try
+        {
+            var document = new JsonObject
+            {
+                ["mount"] = connection.Config.Id,
+                ["saved_at"] = DateTimeOffset.UtcNow.ToString("o"),
+                ["server_version"] = connection.Version,
+                ["tools"] = new JsonArray(tools.Select(t => JsonSerializer.SerializeToNode(t, McpJsonUtilities.DefaultOptions)).ToArray())
+            };
+            string path = ManifestPath(connection);
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            ServerConfig.WriteAtomically(path, new UTF8Encoding(false).GetBytes(document.ToJsonString()), null);
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or JsonException or NotSupportedException)
+        {
+            Console.Error.WriteLine($"browser[{connection.Config.Id}] the tool manifest could not be saved: {error.GetType().Name}: {error.Message}");
+        }
+    }
+
+    private void LoadManifest(Connection connection)
+    {
+        string path = ManifestPath(connection);
+        if (!File.Exists(path)) return;
+        try
+        {
+            var tools = (JsonNode.Parse(File.ReadAllText(path))?["tools"] as JsonArray ?? [])
+                .Select(node => node?.Deserialize<Tool>(McpJsonUtilities.DefaultOptions))
+                .OfType<Tool>().Where(t => !string.IsNullOrEmpty(t.Name)).ToArray();
+            var proxies = tools.Select(t => new MountedTool(this, connection, t)).ToArray();
+            if (Collision(connection, proxies) is { } name)
+            {
+                Console.Error.WriteLine($"browser[{connection.Config.Id}] the saved tool list is not listed: '{name}' collides with another tool.");
+                return;
+            }
+            Volatile.Write(ref connection.Tools, proxies);
+            connection.ToolsSource = "manifest";
+        }
+        catch (Exception error) when (error is JsonException or IOException or UnauthorizedAccessException or NotSupportedException or InvalidOperationException)
+        {
+            Console.Error.WriteLine($"browser[{connection.Config.Id}] the saved tool list could not be read: {error.GetType().Name}: {error.Message}");
+        }
     }
 
     private static bool Exited(Process process)
@@ -257,30 +407,15 @@ public sealed class BrowserMounts(CodexishRuntime runtime) : IAsyncDisposable
         catch (Exception) { return "unknown"; }
     }
 
-    // A backend that exits on its own releases its session and job at once, so its tools answer BROWSER_UNAVAILABLE
-    // and closing the kill-on-close job ends any browser it left behind.
-    private void OnExited(Connection connection, Process process)
-    {
-        lock (connection.Sync)
-        {
-            if (connection.State != "connected") return;
-            connection.State = "exited";
-            connection.Error = $"The backend process exited with code {ExitCode(process)}; its tools answer BROWSER_UNAVAILABLE until the server restarts.";
-        }
-        _ = CloseSession(connection);
-        CloseJob(connection);
-        Report(connection);
-    }
-
     // For tests: whether a mount still holds a session, a job handle and a process object.
-    internal (string State, bool Session, bool Job, int? ProcessId) Resources(string id)
+    internal (string State, bool Session, bool Job, int? ProcessId, int Attempts, DateTimeOffset? NextRetry, string ToolsSource) Resources(string id)
     {
         var connection = connections.Single(c => c.Config.Id == id);
         lock (connection.Sync)
         {
             int? pid = null;
             try { pid = connection.Process?.Id; } catch (Exception) { }
-            return (connection.State, connection.Client is not null, connection.Job != 0, pid);
+            return (connection.State, connection.Client is not null, connection.Job != 0, pid, connection.Attempts, connection.NextRetry, connection.ToolsSource);
         }
     }
 
@@ -291,8 +426,10 @@ public sealed class BrowserMounts(CodexishRuntime runtime) : IAsyncDisposable
 
     private void Report(Connection connection)
     {
-        Console.Error.WriteLine($"browser[{connection.Config.Id}] {connection.State}: {connection.Error}");
-        try { owner.Store.Event("browser_mount_unavailable", connection.Config.Id, new { state = connection.State, error = connection.Error }); }
+        string state, error;
+        lock (connection.Sync) { state = connection.State; error = connection.Error ?? ""; }
+        Console.Error.WriteLine($"browser[{connection.Config.Id}] {state}: {error}");
+        try { owner.Store.Event("browser_mount_unavailable", connection.Config.Id, new { state, error, attempts = connection.Attempts, next_retry = connection.NextRetry }); }
         catch (Exception) { /* diagnostics cannot replace the mount state */ }
     }
 
@@ -378,29 +515,17 @@ public sealed class BrowserMounts(CodexishRuntime runtime) : IAsyncDisposable
         return exited;
     }
 
-    // Cancels in-flight backend calls so shutdown does not wait on a browser that never answers.
+    // Cancels in-flight backend calls and ends supervision, so shutdown does not wait on a browser that never answers.
     public void Stop() { try { stopping.Cancel(); } catch (ObjectDisposedException) { } }
 
     public async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref disposed, 1) != 0) return;
         Stop();
-        foreach (var connection in connections)
-        {
-            bool active;
+        await Task.WhenAll(connections.Select(c => c.Loop)).ConfigureAwait(false);
+        foreach (var connection in connections.Where(c => c.Supervised))
             lock (connection.Sync)
-            {
-                active = connection.State == "connected";
-                // A stop in progress is not a backend exiting on its own.
-                if (active) connection.State = "stopping";
-            }
-            bool exited = await StopConnection(connection).ConfigureAwait(false);
-            lock (connection.Sync)
-            {
-                if (active) connection.State = exited ? "stopped" : "exited_unknown";
-                else if (!exited) connection.State = "exited_unknown";
-            }
-        }
+                if (connection.State == "not_started") connection.State = "stopped";
     }
 
     internal static JsonElement WrapSchema(JsonElement backendSchema, bool readOnly)
@@ -581,11 +706,26 @@ public sealed class BrowserMounts(CodexishRuntime runtime) : IAsyncDisposable
             {
                 // Grants are read on every call: the backend is an executing process under the root's shell grant.
                 mounts.owner.Workspace.Resolve(connection.Config.RootId, "", readOnly ? Grant.Read | Grant.Shell : Grant.Read | Grant.Write | Grant.Shell);
-                var client = connection.Client;
-                if (client is null || connection.State != "connected")
-                    return Reply.Error("BROWSER_UNAVAILABLE", $"Browser backend '{connection.Config.Id}' is {connection.State}; nothing was sent to it.",
-                        details: new { mount = connection.Config.Id, state = connection.State, error = connection.Error },
-                        recovery: "host_capabilities shows the mount state and error");
+                McpClient? client;
+                string state;
+                string? lastError;
+                int attempts;
+                DateTimeOffset? next;
+                lock (connection.Sync)
+                {
+                    client = connection.Client;
+                    state = connection.State;
+                    lastError = connection.Error;
+                    attempts = connection.Attempts;
+                    next = connection.NextRetry;
+                }
+                // A mount that is down is being restarted; the answer says when, never that the tool is gone for good.
+                if (client is null || state != "connected")
+                    return Reply.Error("BROWSER_UNAVAILABLE",
+                        $"Browser backend '{connection.Config.Id}' is {state}; nothing was sent to it. CODEXish keeps restarting it" +
+                        (next is { } at ? $"; the next attempt is at {at:o}." : "."),
+                        details: new { mount = connection.Config.Id, state, last_error = lastError, attempts, next_retry = next },
+                        recovery: "call again after next_retry; host_capabilities shows the mount state");
                 using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellation, mounts.stopping.Token);
                 linked.Token.ThrowIfCancellationRequested();
                 var parameters = arguments.EnumerateObject().ToDictionary(p => p.Name, p => p.Value.Clone());
@@ -625,7 +765,7 @@ public sealed class BrowserMounts(CodexishRuntime runtime) : IAsyncDisposable
                 return Reply.Error(dispatched && !readOnly ? "EXECUTION_UNKNOWN" : "BROWSER_UNAVAILABLE",
                     "The browser transport did not produce a confirmed result; do not replay an uncertain action.",
                     dispatched ? uncertain : "none",
-                    details: new { mount = connection.Config.Id, state = connection.State, provider_error = error.GetType().Name },
+                    details: new { mount = connection.Config.Id, state = connection.State, next_retry = connection.NextRetry, provider_error = error.GetType().Name },
                     recovery: "inspect the browser before replanning");
             }
         }

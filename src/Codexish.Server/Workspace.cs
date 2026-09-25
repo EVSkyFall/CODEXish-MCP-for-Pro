@@ -12,28 +12,46 @@ public static class PathRules
     // Windows paths are case-insensitive and Linux paths are not; the fence uses the platform's own rule.
     public static readonly StringComparison Compare =
         OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+
+    // The one containment test. A separator is appended only when the root does not already end with one, so a
+    // drive root such as G:\ (or /) contains its children instead of being compared against G:\\.
+    public static bool IsInside(string root, string candidate)
+    {
+        if (candidate.Equals(root, Compare)) return true;
+        string prefix = System.IO.Path.EndsInDirectorySeparator(root) ? root : root + System.IO.Path.DirectorySeparatorChar;
+        return candidate.StartsWith(prefix, Compare);
+    }
 }
 
 // D5: inputs are root_id plus a relative path. Resolution normalizes first, then every opened handle is
 // compared against the root's own final path, so a path swapped between the check and the open is caught.
-public sealed class Workspace
+// Roots are read on every call: a root directory that appears, disappears or is re-pointed later needs no restart.
+public sealed class Workspace(ServerConfig config)
 {
-    private readonly ServerConfig config;
-    private readonly Dictionary<string, string> finalPaths = new(StringComparer.OrdinalIgnoreCase);
-
-    public Workspace(ServerConfig config)
-    {
-        this.config = config;
-        foreach (var root in config.Roots) finalPaths[root.Id] = ResolveFinalPath(root.Path);
-    }
-
-    public string FinalPathOf(string rootId) => finalPaths[rootId];
+    public string FinalPathOf(string rootId) => ResolveFinalPath(config.Root(rootId).Path);
 
     private static string ResolveFinalPath(string path)
     {
         using SafeFileHandle? handle = Native.OpenDirectory(path);
         string? final = handle is null ? null : Native.FinalPath(handle);
         return System.IO.Path.TrimEndingDirectorySeparator(final ?? System.IO.Path.GetFullPath(path));
+    }
+
+    // The FIFO key for a root's files and shell queues. Two roots over the same files must share one queue, so the
+    // key is the canonical full path of the outermost configured root that contains this one. It is computed without
+    // touching the disk, so a root on an unreachable drive cannot slow the calls of any other root.
+    public string QueueKey(string rootId)
+    {
+        var root = config.Roots.FirstOrDefault(r => r.Id.Equals(rootId, StringComparison.OrdinalIgnoreCase));
+        if (root is null) return "unconfigured:" + rootId;
+        static string Canonical(string path) => System.IO.Path.TrimEndingDirectorySeparator(System.IO.Path.GetFullPath(path));
+        string key = Canonical(root.Path);
+        foreach (var other in config.Roots)
+        {
+            string candidate = Canonical(other.Path);
+            if (candidate.Length < key.Length && PathRules.IsInside(candidate, key)) key = candidate;
+        }
+        return OperatingSystem.IsWindows() ? key.ToUpperInvariant() : key;
     }
 
     public Target Resolve(string rootId, string? relative, Grant required)
@@ -46,6 +64,11 @@ public sealed class Workspace
             throw new CodexishFault("PERMISSION_DENIED",
                 $"Root '{root.Id}' does not grant {required.ToString().ToLowerInvariant()}. The local user changes grants in codexish.json.",
                 details: new { root_id = root.Id, granted = granted.ToString().ToLowerInvariant() });
+        if (!Directory.Exists(root.Path))
+            throw new CodexishFault("NOT_FOUND",
+                $"Root '{root.Id}' is configured as {root.Path}, which does not exist right now. It works again as soon as the " +
+                "directory exists; nothing was changed.",
+                details: new { root_id = root.Id, path = root.Path, exists = false });
 
         string rel = (relative ?? string.Empty).Trim();
         if (rel is "." or "./" or ".\\") rel = string.Empty;
@@ -64,15 +87,11 @@ public sealed class Workspace
 
         string full = System.IO.Path.TrimEndingDirectorySeparator(
             System.IO.Path.GetFullPath(System.IO.Path.Combine(root.Path, rel)));
-        if (!Inside(root.Path, full))
+        if (!PathRules.IsInside(root.Path, full))
             throw new CodexishFault("OUTSIDE_WORKSPACE", "The normalized path leaves the granted root.");
         RejectReparse(root.Path, full);
-        return new Target(root, full, rel.Replace('\\', '/'), finalPaths[root.Id]);
+        return new Target(root, full, rel.Replace('\\', '/'), ResolveFinalPath(root.Path));
     }
-
-    private static bool Inside(string root, string candidate) =>
-        candidate.Equals(root, PathRules.Compare) ||
-        candidate.StartsWith(root + System.IO.Path.DirectorySeparatorChar, PathRules.Compare);
 
     // Walks from the target up to (not past) the root: a junction or symlink inside the root is refused
     // rather than silently followed, exactly as P0 does.
@@ -116,8 +135,9 @@ public sealed class Workspace
         if (final is null)
             throw new CodexishFault("OUTSIDE_WORKSPACE", "The opened handle's real path could not be verified.");
         final = System.IO.Path.TrimEndingDirectorySeparator(final);
-        bool ok = directory && final.Equals(target.RootFinalPath, PathRules.Compare);
-        ok |= final.StartsWith(target.RootFinalPath + System.IO.Path.DirectorySeparatorChar, PathRules.Compare);
+        bool ok = final.Equals(target.RootFinalPath, PathRules.Compare)
+            ? directory
+            : PathRules.IsInside(target.RootFinalPath, final);
         if (!ok)
             throw new CodexishFault("OUTSIDE_WORKSPACE", "The opened handle resolves outside the granted root.");
     }

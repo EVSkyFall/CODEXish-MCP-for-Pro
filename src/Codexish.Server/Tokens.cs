@@ -49,7 +49,10 @@ public sealed class Tokens(Store store, ServerConfig config)
 
     public (TokenRow? Row, string Reason) Validate(string token, string kind, string audience)
     {
-        var row = store.Token(HashToken(token));
+        TokenRow? row;
+        // A row whose stored values cannot be read is an invalid token, never an error that stops authentication.
+        try { row = store.Token(HashToken(token)); }
+        catch (Exception error) when (Store.IsMalformedValue(error)) { return (null, "malformed_token"); }
         if (row is null) return (null, "unknown_token");
         if (row.Kind != kind) return (null, "wrong_token_kind");
         if (row.Revoked) return (null, "revoked");
@@ -72,6 +75,9 @@ public sealed class Tokens(Store store, ServerConfig config)
     {
         string code = ServerConfig.NewSecret();
         codes[code] = new AuthorizationCode(clientId, redirectUri, challenge, resource, DateTimeOffset.UtcNow + CodeLifetime);
+        // Codes from sign-ins that were never exchanged would otherwise stay in memory for the life of the process.
+        foreach (var stale in codes.Where(c => c.Value.Expires <= DateTimeOffset.UtcNow).Select(c => c.Key).ToArray())
+            codes.TryRemove(stale, out _);
         return code;
     }
 
@@ -102,8 +108,9 @@ public sealed class Tokens(Store store, ServerConfig config)
         return CryptographicOperations.FixedTimeEquals(Encoding.UTF8.GetBytes(computed), Encoding.UTF8.GetBytes(challenge));
     }
 
-    public static bool SecretMatches(string expected, string? offered) =>
-        offered is not null &&
+    // An empty configured secret matches nothing, not even an empty offer.
+    public static bool SecretMatches(string? expected, string? offered) =>
+        !string.IsNullOrEmpty(expected) && offered is not null &&
         CryptographicOperations.FixedTimeEquals(Encoding.UTF8.GetBytes(expected), Encoding.UTF8.GetBytes(offered));
 
     public string Audience => config.Resource;
