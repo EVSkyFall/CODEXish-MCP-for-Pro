@@ -176,6 +176,10 @@ public static class BrowserTests
             Check(BrowserMounts.Invalid(new() { Id = "pw", RootId = "test", Command = "node" }, ids) is null &&
                 BrowserMounts.Invalid(new() { Id = "PW", RootId = "test", Command = "node" }, ids) is { } duplicate && duplicate.Contains("already used", StringComparison.Ordinal),
                 "mount ids that differ only in case are duplicates, because they would share one dedicated profile directory");
+            var reserved = BrowserMounts.NewIdSet();
+            Check(BrowserMounts.Invalid(new() { Id = "dup", RootId = "test", Command = "" }, reserved) is { } missing && missing.Contains("command", StringComparison.Ordinal) &&
+                BrowserMounts.Invalid(new() { Id = "DUP", RootId = "test", Command = "node" }, reserved) is null && reserved.Contains("dup"),
+                "an invalid mount entry does not reserve its id, so a later valid entry may use it");
 
             var wrapped = BrowserMounts.WrapSchema(JsonSerializer.SerializeToElement(new Dictionary<string, object>
             {

@@ -102,28 +102,7 @@ public sealed class ServerConfig
         try { config = Parse(bytes, path); }
         catch (Exception error) when (error is JsonException or InvalidDataException)
         {
-            string broken = path + ".broken-" + UtcStamp(DateTimeOffset.UtcNow);
-            try { File.WriteAllBytes(broken, bytes); }
-            catch (Exception keep) when (keep is IOException or UnauthorizedAccessException) { broken = "(not kept: " + keep.Message + ")"; }
-            string backup = path + ".bak";
-            byte[]? saved = null;
-            ServerConfig? recovered = null;
-            if (File.Exists(backup))
-            {
-                try
-                {
-                    saved = File.ReadAllBytes(backup);
-                    recovered = Parse(saved, backup);
-                }
-                catch (Exception unreadable) when (unreadable is JsonException or InvalidDataException or IOException) { recovered = null; }
-            }
-            if (recovered is null || saved is null)
-                throw new InvalidDataException($"The configuration at {path} could not be read: {error.Message} " +
-                    $"The unreadable file was kept as {broken}, and there is no readable {System.IO.Path.GetFileName(backup)}.", error);
-            WriteAtomically(path, saved, null);
-            config = recovered;
-            recovery = $"The configuration at {path} could not be read ({error.Message}); it was kept as {broken}, and the previous " +
-                $"version {System.IO.Path.GetFileName(backup)} was loaded and restored as the main file.";
+            (config, recovery) = Recover(path, bytes, error);
         }
         config.SourcePath = System.IO.Path.GetFullPath(path);
         config.Validate();
@@ -138,6 +117,66 @@ public sealed class ServerConfig
     private static ServerConfig Parse(byte[] bytes, string path) =>
         JsonSerializer.Deserialize<ServerConfig>(bytes)
             ?? throw new InvalidDataException($"The configuration at {path} is not a JSON object.");
+
+    // The unreadable bytes are kept first. The backup replaces the main file only while that file still holds exactly
+    // those bytes: if another writer saved in between, its newer file is loaded instead, or, when that one is
+    // unreadable as well, the backup is used without overwriting anything.
+    internal static (ServerConfig Config, string Note) Recover(string path, byte[] unreadable, Exception error)
+    {
+        string broken;
+        try { broken = KeepBroken(path, unreadable, DateTimeOffset.UtcNow); }
+        catch (Exception keep) when (keep is IOException or UnauthorizedAccessException) { broken = "(not kept: " + keep.Message + ")"; }
+        byte[]? current = null;
+        try { current = File.ReadAllBytes(path); }
+        catch (Exception gone) when (gone is IOException or UnauthorizedAccessException) { current = null; }
+        bool unchanged = current is not null && current.AsSpan().SequenceEqual(unreadable);
+        if (!unchanged && current is not null)
+            try
+            {
+                return (Parse(current, path), $"The configuration at {path} could not be read ({error.Message}) and was kept as {broken}; " +
+                    "another writer had saved a new version meanwhile, which was loaded instead.");
+            }
+            catch (Exception newer) when (newer is JsonException or InvalidDataException) { /* the newer file is unreadable too */ }
+        string backup = path + ".bak";
+        byte[]? saved = null;
+        ServerConfig? recovered = null;
+        try
+        {
+            if (File.Exists(backup))
+            {
+                saved = File.ReadAllBytes(backup);
+                recovered = Parse(saved, backup);
+            }
+        }
+        catch (Exception unreadableBackup) when (unreadableBackup is JsonException or InvalidDataException or IOException) { recovered = null; }
+        if (recovered is null || saved is null)
+            throw new InvalidDataException($"The configuration at {path} could not be read: {error.Message} " +
+                $"The unreadable file was kept as {broken}, and there is no readable {System.IO.Path.GetFileName(backup)}.", error);
+        if (!unchanged)
+            return (recovered, $"The configuration at {path} could not be read ({error.Message}) and was kept as {broken}; " +
+                $"it changed again while being recovered, so {System.IO.Path.GetFileName(backup)} was loaded without overwriting it.");
+        WriteAtomically(path, saved, null);
+        return (recovered, $"The configuration at {path} could not be read ({error.Message}); it was kept as {broken}, and the previous " +
+            $"version {System.IO.Path.GetFileName(backup)} was loaded and restored as the main file.");
+    }
+
+    // <file>.broken-<utc>, never overwriting an earlier copy: a name that is taken gets -2, -3 and so on.
+    internal static string KeepBroken(string path, byte[] bytes, DateTimeOffset at)
+    {
+        string stem = path + ".broken-" + UtcStamp(at);
+        for (int attempt = 1; ; attempt++)
+        {
+            string candidate = attempt == 1 ? stem : stem + "-" + attempt.ToString(CultureInfo.InvariantCulture);
+            try
+            {
+                using var stream = new FileStream(candidate, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+                stream.Write(bytes);
+                stream.Flush(true);
+                return candidate;
+            }
+            catch (IOException) when (File.Exists(candidate) || Directory.Exists(candidate)) { }
+        }
+    }
 
     // The previous version is kept as <file>.bak, and the file itself is always either the old or the new version.
     public void Save(string path)
@@ -177,8 +216,16 @@ public sealed class ServerConfig
     {
         List<string> warnings = [];
         if (Port is < 0 or > 65535) throw new ArgumentException("port must be between 0 and 65535.");
-        OAuth ??= new();
-        OAuth.RedirectUris ??= [];
+        NormalizeNulls(warnings);
+        // An entry the access policy cannot use is dropped here, so AccessPolicy never sees it.
+        string[] hosts = AllowHosts.Where(AccessPolicy.IsExactHost).Select(h => h!).ToArray();
+        foreach (string? rejected in AllowHosts.Where(h => !AccessPolicy.IsExactHost(h)))
+            warnings.Add($"allow_hosts entry '{rejected ?? "null"}' is not an exact hostname without scheme, port or wildcard and is ignored.");
+        AllowHosts = hosts;
+        string[] origins = AllowOrigins.Where(o => AccessPolicy.NormalizeOrigin(o) is not null).Select(o => o!).ToArray();
+        foreach (string? rejected in AllowOrigins.Where(o => AccessPolicy.NormalizeOrigin(o) is null))
+            warnings.Add($"allow_origins entry '{rejected ?? "null"}' is not an exact http(s) origin and is ignored.");
+        AllowOrigins = origins;
         if (OAuth.AccessTokenHours <= 0)
         {
             warnings.Add($"oauth.access_token_hours is {OAuth.AccessTokenHours}; access tokens last the default 12 hours instead.");
@@ -189,17 +236,6 @@ public sealed class ServerConfig
             warnings.Add($"state_dir is not set; {DefaultDirectory} is used.");
             StateDir = DefaultDirectory;
         }
-        // JSON null for these optional sections means none configured; each browser mount entry is validated on its
-        // own when the mounts start, so one malformed entry cannot stop the server.
-        BrowserMounts ??= [];
-        Tunnel ??= new();
-        Tunnel.Command ??= "";
-        Tunnel.Args ??= [];
-        Retention ??= new();
-        Git ??= new();
-        Git.Path ??= "";
-        AllowHosts ??= [];
-        AllowOrigins ??= [];
         StateDir = System.IO.Path.TrimEndingDirectorySeparator(System.IO.Path.GetFullPath(StateDir));
 
         List<RootConfig> usable = [];
@@ -228,9 +264,6 @@ public sealed class ServerConfig
         if (Roots.Length == 0)
             warnings.Add("No usable root is configured. File, shell and Git tools need one; the desktop tools keep working.");
 
-        Shell ??= new();
-        Shell.Allowed ??= [];
-        Shell.Default ??= "";
         string[] unsupported = Shell.Allowed.Where(n => ShellConfig.Canonical(n) is null).Select(n => n ?? "null").ToArray();
         if (unsupported.Length > 0)
             warnings.Add($"shell.allowed names {string.Join(", ", unsupported)} are not supported and are ignored; supported: {string.Join(", ", ShellConfig.Supported)}.");
@@ -263,6 +296,40 @@ public sealed class ServerConfig
         if (PasswordHashProblem(OAuth.PasswordHash) is { } problem)
             warnings.Add($"oauth.password_hash is not usable ({problem}), so no password can sign in; create a new configuration with --init or the tray setup.");
         Warnings = warnings;
+    }
+
+    // JSON null for any string, list or section means that property's default, so nothing later meets a null.
+    // Each browser mount entry is validated on its own when the mounts start, so one malformed entry cannot stop the
+    // server.
+    private void NormalizeNulls(List<string> warnings)
+    {
+        var defaults = new ServerConfig();
+        PublicUrl ??= defaults.PublicUrl;
+        StateDir ??= defaults.StateDir;
+        ControlToken ??= defaults.ControlToken;
+        AllowHosts ??= [];
+        AllowOrigins ??= [];
+        Roots ??= [];
+        BrowserMounts ??= [];
+        Retention ??= new();
+        Shell ??= new();
+        Shell.Default ??= new ShellConfig().Default;
+        Shell.Allowed ??= new ShellConfig().Allowed;
+        Git ??= new();
+        Git.Path ??= "";
+        OAuth ??= new();
+        OAuth.ClientId ??= new OAuthConfig().ClientId;
+        OAuth.ClientSecret ??= "";
+        OAuth.PasswordHash ??= "";
+        OAuth.RedirectUris ??= [];
+        Tunnel ??= new();
+        Tunnel.Command ??= "";
+        Tunnel.Args ??= [];
+        if (Tunnel.Args.Any(a => a is null))
+        {
+            warnings.Add("tunnel.args contains null entries; they are ignored.");
+            Tunnel.Args = Tunnel.Args.Where(a => a is not null).ToArray();
+        }
     }
 
     // D12: --no-auth is only for a pure loopback configuration. ProbeAccessPolicy always allows loopback hosts,

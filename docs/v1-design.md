@@ -30,12 +30,17 @@ documentation aliases.** A ChatGPT connector function name must match `^[a-zA-Z0
 secrets and a PBKDF2-SHA256 password hash.** `--config <path>` overrides the location; nothing is read from
 environment variables or from any other credential store. A save writes a temporary file in the same directory and
 swaps it in with `File.Replace`, keeping the previous version as `codexish.json.bak`; a file that cannot be parsed
-is kept as `codexish.json.broken-<utc>` and a readable `.bak` is loaded and restored in its place.
+is kept as `codexish.json.broken-<utc>` (created with `CreateNew`, `-2`, `-3` on a collision) and a readable `.bak` is
+loaded. The `.bak` replaces the main file only while that file still holds exactly the bytes that failed to parse;
+if another writer saved in between, its readable version is loaded instead, or the `.bak` is used without
+overwriting anything.
 
 **Decision: nothing optional stops the server.** Only a port outside 0-65535, an unusable `public_url`, an http
 `public_url` with authentication (`TransportRefusal`), `--no-auth` with a public host (`NoAuthRefusal`) and the
 single-instance state lock refuse to start. Every other problem in the file is skipped or replaced by its default
-and reported in the startup log and `host_capabilities.warnings`.
+and reported in the startup log and `host_capabilities.warnings`. That includes a malformed `allow_hosts` or
+`allow_origins` entry, which `AccessPolicy` also skips instead of throwing, and a JSON `null` for any string, list or
+section, which means that property's default.
 
 **Decision: `--init` derives `allow_hosts` from the hostname in `--public-url`, lists the documented ChatGPT
 callback, and accepts repeatable `--redirect-uri` values.** Any https callback is accepted anyway (section 9), so
@@ -217,17 +222,24 @@ cancellation request and reports `side_effects: unknown`.** Cancellation is not 
 `tokens` and `checkpoints`; artifact bytes live as files under `state_dir\artifacts`.**
 
 **Decision: a ledger that SQLite reports as damaged or not a database at startup, including `PRAGMA quick_check`,
-is renamed with its `-wal`/`-shm` files to `ledger.corrupt-<utc>.*` and replaced by a fresh one.** The rebuild is
-reported as `host_capabilities.ledger_rebuilt`; issued tokens are lost with it, so ChatGPT signs in again. A migration
-ignores only a duplicate-column error and logs any other; SQLITE_BUSY, SQLITE_LOCKED and SQLITE_IOERR are retried
-within the command timeout; a row that cannot be read is contained to that row.
+is renamed with its `-wal`, `-shm` and `-journal` files to `ledger.corrupt-<utc>.*` and replaced by a fresh one.**
+The rebuild is reported as `host_capabilities.ledger_rebuilt`; issued tokens are lost with it, so ChatGPT signs in
+again. A migration ignores only a duplicate-column error and logs any other; SQLITE_BUSY, SQLITE_LOCKED and
+SQLITE_IOERR are retried within the command timeout, the schema script and every migration included; a row that
+cannot be read is contained to that row. Diagnostic events are best-effort: one that cannot be written goes to
+stderr and never aborts startup, a call or a process.
 
 **Decision: CODEXish's own state is cleaned by age.** `retention.output_days` (30) covers artifacts, finished
 ledger rows, events, exited processes with their output, expired or revoked tokens, older checkpoints and tray
 logs; `retention.backup_days` (90) covers pre-edit backups, quarantined ledgers and unreadable configuration copies;
 0 keeps forever. A sweep runs about a minute after start and every 6 hours, deletes rows in small batches without
 VACUUM, and never touches running or reattachable processes, queued or running operations, the newest checkpoint,
-live tokens, browser profiles or anything in a root.
+live tokens, browser profiles or anything in a root. Because `state_dir` may lie inside a root, a file is deleted
+only when its whole name is one CODEXish gives its files (`art_<32 hex>.bin`, `<32 hex>.bak`, `tray-<yyyyMMdd>.log`,
+`ledger.corrupt-<stamp>.db[-wal|-shm|-journal]`, `<config file>.broken-<stamp>[-N]`), only directly in its own
+folder, and no directory is ever deleted. An artifact row is deleted only after its file was removed or was already
+absent; an exited process whose job still holds live descendants keeps its row and output until they are gone; a
+read of an artifact whose file vanished answers `ARTIFACT_EXPIRED`.
 
 **Decision: an artifact cursor is bound to the artifact's generation, and a cursor from an earlier generation is
 `CURSOR_INVALID` rather than an offset into different bytes.**

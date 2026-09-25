@@ -192,13 +192,15 @@ public sealed class BrowserMounts : IAsyncDisposable
     internal static string? Invalid(BrowserMountConfig mount, ISet<string> ids)
     {
         if (!Regex.IsMatch(mount.Id, "^[A-Za-z0-9_-]{1,24}$")) return "id must be 1-24 ASCII letters, digits, underscores or hyphens.";
-        if (!ids.Add(mount.Id)) return $"id '{mount.Id}' is already used by an earlier mount (ids are compared without case).";
+        if (ids.Contains(mount.Id)) return $"id '{mount.Id}' is already used by an earlier mount (ids are compared without case).";
         if (string.IsNullOrWhiteSpace(mount.Command)) return "command is required.";
         if (string.IsNullOrWhiteSpace(mount.RootId)) return "root_id is required.";
         if (mount.Kind is not ("playwright" or "custom")) return "kind must be playwright or custom.";
         if (mount.ProfileMode is not ("dedicated" or "existing")) return "profile_mode must be dedicated or existing.";
         if (mount.Args.Any(a => a is null)) return "args must not contain null.";
         if (mount.ReadOnlyTools.Any(t => t is null)) return "read_only_tools must not contain null.";
+        // Only a valid entry takes its id, so an invalid entry cannot block a valid one that follows it.
+        ids.Add(mount.Id);
         return null;
     }
 
@@ -226,12 +228,13 @@ public sealed class BrowserMounts : IAsyncDisposable
         {
             while (!token.IsCancellationRequested)
             {
-                var healthy = Stopwatch.StartNew();
                 string reason;
                 try
                 {
                     lock (connection.Sync) connection.State = "starting";
                     var process = await Connect(connection, token);
+                    // Healthy time counts from a finished handshake and tool listing, not from the process start.
+                    var healthy = Stopwatch.StartNew();
                     connection.Settled.TrySetResult();
                     try { await process.WaitForExitAsync(token); }
                     catch (OperationCanceledException) { break; }
@@ -302,16 +305,29 @@ public sealed class BrowserMounts : IAsyncDisposable
         foreach (string argument in LaunchArguments(mount, profile)) start.ArgumentList.Add(argument);
         var process = Process.Start(start) ?? throw new IOException("The backend process did not start.");
         lock (connection.Sync) connection.Process = process;
-        // A kill-on-close job ends the backend and any browser it launched together with this server.
-        nint job = Native.CreateKillOnCloseJob();
-        if (job != 0 && !Native.AssignProcess(job, process.Handle))
+        StreamClientTransport transport;
+        try
         {
-            Native.CloseJob(job);
-            job = 0;
+            // A kill-on-close job ends the backend and any browser it launched together with this server. It is
+            // recorded before the process handle is used, so a failure below still finds it.
+            nint job = Native.CreateKillOnCloseJob();
+            lock (connection.Sync) connection.Job = job;
+            if (job != 0 && !Native.AssignProcess(job, process.Handle)) CloseJob(connection);
+            _ = Drain(connection, process.StandardError);
+            transport = new StreamClientTransport(process.StandardInput.BaseStream, process.StandardOutput.BaseStream);
         }
-        lock (connection.Sync) connection.Job = job;
-        _ = Drain(connection, process.StandardError);
-        var transport = new StreamClientTransport(process.StandardInput.BaseStream, process.StandardOutput.BaseStream);
+        catch (Exception)
+        {
+            // A backend that could not be wired up is ended with everything it started before the retry.
+            nint job = Interlocked.Exchange(ref connection.Job, (nint)0);
+            if (job != 0)
+            {
+                Native.TerminateJob(job);
+                Native.CloseJob(job);
+            }
+            try { process.Kill(entireProcessTree: true); } catch (Exception) { }
+            throw;
+        }
         var client = await McpClient.CreateAsync(transport, new McpClientOptions
         {
             ClientInfo = new() { Name = "CODEXish browser mount", Version = CodexishRuntime.ServerVersion }

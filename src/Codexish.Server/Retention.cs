@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text.RegularExpressions;
 
 namespace Codexish.Server;
 
@@ -7,13 +8,32 @@ public sealed record SweepReport(DateTimeOffset At, int Rows, int Files, long By
 // P17. Age-based cleanup of CODEXish's own state only: never root contents, user files or Git history. Anything that
 // belongs to a running or reattachable process, queued or running ledger entries, the newest checkpoint, live tokens
 // and browser profiles are never deleted. A failed step is recorded and simply tried again at the next sweep.
-public sealed class Retention(CodexishRuntime runtime)
+// state_dir may lie inside a root, so a file is deleted only when its whole name is one CODEXish itself gives its files;
+// everything else in these folders is left alone, and no directory is ever deleted.
+public sealed partial class Retention(CodexishRuntime runtime)
 {
     public static readonly TimeSpan FirstSweepAfter = TimeSpan.FromMinutes(1);
     public static readonly TimeSpan Interval = TimeSpan.FromHours(6);
     private const int ReportedErrors = 20;
     private readonly object sweeping = new();
     private SweepReport? last;
+
+    [GeneratedRegex("^art_[0-9a-f]{32}$")] private static partial Regex ArtifactId();
+    [GeneratedRegex(@"^art_[0-9a-f]{32}\.bin$")] private static partial Regex ArtifactFile();
+    [GeneratedRegex(@"^[0-9a-f]{32}\.bak$")] private static partial Regex BackupFile();
+    [GeneratedRegex(@"^tray-[0-9]{8}\.log$")] private static partial Regex TrayLog();
+    // ServerConfig.UtcStamp: yyyyMMdd'T'HHmmssfff'Z'.
+    [GeneratedRegex(@"^ledger\.corrupt-(?<stamp>[0-9]{8}T[0-9]{9}Z)\.db(-wal|-shm|-journal)?$")] private static partial Regex QuarantinedLedger();
+
+    public static bool IsArtifactId(string id) => ArtifactId().IsMatch(id);
+    public static bool IsArtifactFile(string name) => ArtifactFile().IsMatch(name);
+    public static bool IsBackupFile(string name) => BackupFile().IsMatch(name);
+    public static bool IsTrayLog(string name) => TrayLog().IsMatch(name);
+    public static bool IsQuarantinedLedger(string name) => QuarantinedLedger().IsMatch(name);
+
+    // <config file name>.broken-<stamp>, with the -2, -3 ... suffix ServerConfig.KeepBroken adds on a collision.
+    public static Regex UnreadableConfiguration(string configFileName) =>
+        new("^" + Regex.Escape(configFileName) + @"\.broken-(?<stamp>[0-9]{8}T[0-9]{9}Z)(-[0-9]+)?$");
 
     public SweepReport? Last => Volatile.Read(ref last);
 
@@ -23,9 +43,10 @@ public sealed class Retention(CodexishRuntime runtime)
         backup_days = runtime.Config.Retention.BackupDays,
         keep_forever_when = "a value of 0",
         schedule = $"{FirstSweepAfter.TotalSeconds:0} s after start, then every {Interval.TotalHours:0} hours",
-        scope = "CODEXish state only: artifacts, finished ledger rows, events, exited processes, expired or revoked tokens, " +
-            "older checkpoints and tray logs after output_days; pre-edit backups, quarantined ledgers and unreadable " +
-            "configuration copies after backup_days. Never root contents, user files, Git history or browser profiles.",
+        scope = "CODEXish state only, and only files named the way CODEXish names them: artifacts, finished ledger rows, " +
+            "events, exited processes, expired or revoked tokens, older checkpoints and tray logs after output_days; " +
+            "pre-edit backups, quarantined ledgers and unreadable configuration copies after backup_days. Never root " +
+            "contents, other files, directories, Git history or browser profiles.",
         last_sweep = Last is { } sweep
             ? new { at = sweep.At, rows = sweep.Rows, files = sweep.Files, bytes = sweep.Bytes, errors = sweep.ErrorCount, error_samples = sweep.Errors }
             : null
@@ -60,24 +81,30 @@ public sealed class Retention(CodexishRuntime runtime)
                 try { action(); }
                 catch (Exception error) { errors.Add($"{name}: {error.GetType().Name}: {error.Message}"); }
             }
-            void Remove(string path)
+            // True when the file is gone afterwards, whether this call removed it or it was already absent.
+            bool Remove(string path)
             {
                 try
                 {
                     var info = new FileInfo(path);
-                    if (!info.Exists) return;
+                    if (!info.Exists) return !Directory.Exists(path);
                     long length = info.Length;
                     info.Delete();
                     files++;
                     bytes += length;
+                    return true;
                 }
                 catch (Exception error) when (error is IOException or UnauthorizedAccessException)
                 {
                     errors.Add($"{path}: {error.GetType().Name}: {error.Message}");
+                    return false;
                 }
             }
-            IEnumerable<string> Files(string directory, string pattern = "*") =>
-                Directory.Exists(directory) ? Directory.EnumerateFiles(directory, pattern) : [];
+            // Only files, and only those whose whole name matches; subdirectories are never entered.
+            IEnumerable<string> Named(string directory, Func<string, bool> ours) =>
+                Directory.Exists(directory)
+                    ? Directory.EnumerateFiles(directory, "*", SearchOption.TopDirectoryOnly).Where(f => ours(Path.GetFileName(f)))
+                    : [];
 
             Step("idle jobs", () => runtime.Processes.ReleaseIdleJobs());
             if (settings.OutputDays > 0)
@@ -94,6 +121,8 @@ public sealed class Retention(CodexishRuntime runtime)
                     List<string> removed = [];
                     foreach (var (processId, _, _) in store.FinishedProcesses(cutoff))
                     {
+                        // Its job still holds live descendants: the row and its output stay until they are gone.
+                        if (runtime.Processes.HoldsJob(processId)) continue;
                         rows += store.DeleteProcess(processId);
                         removed.Add(processId);
                     }
@@ -102,15 +131,13 @@ public sealed class Retention(CodexishRuntime runtime)
                 Step("artifacts", () =>
                 {
                     // Output of a live process is protected even if its row could not be written.
-                    var live = runtime.Processes.Live.Where(p => p.State == "running")
+                    var live = runtime.Processes.Live.Where(p => p.State == "running" || p.JobHandle != 0)
                         .SelectMany(p => new[] { p.StdoutArtifact, p.StderrArtifact }).ToHashSet(StringComparer.Ordinal);
-                    foreach (string id in store.UnreferencedArtifacts(cutoff).Where(id => !live.Contains(id)))
-                    {
-                        Remove(Path.Combine(runtime.Artifacts.Directory, id + ".bin"));
-                        rows += store.DeleteArtifact(id);
-                    }
+                    foreach (string id in store.UnreferencedArtifacts(cutoff).Where(id => IsArtifactId(id) && !live.Contains(id)))
+                        // The row goes only once its file is gone, so a file that could not be removed is retried next time.
+                        if (Remove(Path.Combine(runtime.Artifacts.Directory, id + ".bin"))) rows += store.DeleteArtifact(id);
                     var referenced = store.ReferencedArtifacts().ToHashSet(StringComparer.Ordinal);
-                    foreach (string file in Files(runtime.Artifacts.Directory, "*.bin"))
+                    foreach (string file in Named(runtime.Artifacts.Directory, IsArtifactFile))
                     {
                         string id = Path.GetFileNameWithoutExtension(file);
                         if (File.GetLastWriteTimeUtc(file) < cutoffTime.UtcDateTime && !live.Contains(id) &&
@@ -120,7 +147,7 @@ public sealed class Retention(CodexishRuntime runtime)
                 });
                 Step("tray logs", () =>
                 {
-                    foreach (string file in Files(Path.Combine(state, "logs")))
+                    foreach (string file in Named(Path.Combine(state, "logs"), IsTrayLog))
                         if (File.GetLastWriteTimeUtc(file) < cutoffTime.UtcDateTime) Remove(file);
                 });
             }
@@ -129,27 +156,26 @@ public sealed class Retention(CodexishRuntime runtime)
                 var cutoffTime = Cutoff(now, settings.BackupDays);
                 Step("backups", () =>
                 {
-                    foreach (string file in Files(Path.Combine(state, "backups")))
+                    foreach (string file in Named(Path.Combine(state, "backups"), IsBackupFile))
                         if (File.GetLastWriteTimeUtc(file) < cutoffTime.UtcDateTime) Remove(file);
                 });
                 Step("quarantined ledgers", () =>
                 {
-                    foreach (string file in Files(state, "ledger.corrupt-*"))
-                        if (Aged(file, "ledger.corrupt-") < cutoffTime) Remove(file);
+                    foreach (string file in Named(state, IsQuarantinedLedger))
+                        if (Stamped(QuarantinedLedger().Match(Path.GetFileName(file))) < cutoffTime) Remove(file);
                 });
                 Step("unreadable configurations", () =>
                 {
                     if (runtime.Config.SourcePath is not { } source || Path.GetDirectoryName(source) is not { } directory) return;
-                    string prefix = Path.GetFileName(source) + ".broken-";
-                    foreach (string file in Files(directory, prefix + "*"))
-                        if (Aged(file, prefix) < cutoffTime) Remove(file);
+                    var pattern = UnreadableConfiguration(Path.GetFileName(source));
+                    foreach (string file in Named(directory, pattern.IsMatch))
+                        if (Stamped(pattern.Match(Path.GetFileName(file))) < cutoffTime) Remove(file);
                 });
             }
 
             var report = new SweepReport(now, rows, files, bytes, errors.Count, errors.Take(ReportedErrors).ToArray());
             Volatile.Write(ref last, report);
-            try { store.Event("retention_sweep", null, new { rows, files, bytes, errors = errors.Count }); }
-            catch (Exception) { /* the report above is kept either way */ }
+            store.Event("retention_sweep", null, new { rows, files, bytes, errors = errors.Count });
             if (errors.Count > 0)
                 Console.Error.WriteLine($"retention sweep: {errors.Count} step(s) failed and are retried at the next sweep; first: {errors[0]}");
             return report;
@@ -160,14 +186,11 @@ public sealed class Retention(CodexishRuntime runtime)
     private static DateTimeOffset Cutoff(DateTimeOffset now, int days) =>
         days >= (now - DateTimeOffset.MinValue).TotalDays - 1 ? DateTimeOffset.MinValue : now.AddDays(-days);
 
-    // A quarantined or unreadable copy carries the time it was set aside in its name; the file time is the fallback.
-    private static DateTimeOffset Aged(string file, string prefix)
-    {
-        string name = Path.GetFileName(file);
-        string stamp = name.Length > prefix.Length ? name[prefix.Length..].Split('.')[0] : "";
-        return DateTime.TryParseExact(stamp, "yyyyMMdd'T'HHmmssfff'Z'", CultureInfo.InvariantCulture,
-                DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var parsed)
+    // A quarantined or unreadable copy carries the time it was set aside in its name. A stamp that is not a real
+    // time is kept forever.
+    private static DateTimeOffset Stamped(Match match) =>
+        DateTime.TryParseExact(match.Groups["stamp"].Value, "yyyyMMdd'T'HHmmssfff'Z'", CultureInfo.InvariantCulture,
+            DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var parsed)
             ? new DateTimeOffset(parsed, TimeSpan.Zero)
-            : new DateTimeOffset(File.GetLastWriteTimeUtc(file), TimeSpan.Zero);
-    }
+            : DateTimeOffset.MaxValue;
 }

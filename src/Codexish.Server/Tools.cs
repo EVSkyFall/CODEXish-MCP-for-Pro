@@ -301,7 +301,8 @@ public sealed class CodexishTools(CodexishRuntime runtime)
         "fs_read. Page with output.next_cursor, or use line_from/line_to. The response says whether collection is " +
         "complete, in_progress or incomplete. Text is redacted on read; the local file keeps the raw bytes. " +
         "CURSOR_INVALID: the artifact was replaced, read again from the start. OUTPUT_INCOMPLETE: collection ended " +
-        "before the producer finished, the preserved prefix is still readable from offset 0. " +
+        "before the producer finished, the preserved prefix is still readable from offset 0. ARTIFACT_EXPIRED or " +
+        "NOT_FOUND: retention removed old output, run the producing command again. " +
         "Next tool: artifact_search to find a line in a long log.")]
     public CallToolResult ArtifactRead(
         [Description("artifact_id from a previous result.")] string artifact_id,
@@ -316,7 +317,8 @@ public sealed class CodexishTools(CodexishRuntime runtime)
     [Description("Finds text in a stored artifact without downloading all of it. Returns line number, byte offset, " +
         "column and a redacted preview per match, plus output.next_cursor when the match page is full. Use it to " +
         "locate the failing assertion in a long build log before reading around it with artifact_read. " +
-        "CURSOR_INVALID: search again without a cursor. Next tool: artifact_read with the returned line number.")]
+        "CURSOR_INVALID: search again without a cursor. ARTIFACT_EXPIRED: retention removed the output. " +
+        "Next tool: artifact_read with the returned line number.")]
     public CallToolResult ArtifactSearch(
         [Description("artifact_id from a previous result.")] string artifact_id,
         [Description("Text or regular expression to find.")] string query,

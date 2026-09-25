@@ -10,21 +10,24 @@ public sealed class AccessPolicy
     private readonly HashSet<string> hosts = new(StringComparer.OrdinalIgnoreCase) { "127.0.0.1", "localhost", "[::1]", "::1" };
     private readonly HashSet<string> origins = new(StringComparer.OrdinalIgnoreCase);
 
-    public AccessPolicy(IEnumerable<string>? allowedHosts = null, IEnumerable<string>? allowedOrigins = null)
+    // An entry that is not an exact hostname or origin is ignored here; ServerConfig.Validate reports it as a warning.
+    // One bad entry never keeps the server from starting.
+    public AccessPolicy(IEnumerable<string?>? allowedHosts = null, IEnumerable<string?>? allowedOrigins = null)
     {
-        foreach (string host in allowedHosts ?? [])
+        foreach (string? host in allowedHosts ?? [])
         {
-            if (string.IsNullOrWhiteSpace(host) || host != host.Trim() ||
-                host.IndexOfAny([':', '/', '\\', '*', '@', '?', '#']) >= 0 ||
-                Uri.CheckHostName(host) is not (UriHostNameType.Dns or UriHostNameType.IPv4))
-                throw new ArgumentException("allow_hosts requires exact hostnames without scheme, port or wildcard.");
-            hosts.Add(host);
+            if (!IsExactHost(host)) continue;
+            hosts.Add(host!);
             AllowsPublicHost = true;
         }
-        foreach (string origin in allowedOrigins ?? [])
-            origins.Add(NormalizeOrigin(origin) ?? throw new ArgumentException(
-                "allow_origins requires exact http(s) origins without credentials, path, query or fragment."));
+        foreach (string? origin in allowedOrigins ?? [])
+            if (NormalizeOrigin(origin) is { } normalized) origins.Add(normalized);
     }
+
+    public static bool IsExactHost(string? host) =>
+        !string.IsNullOrWhiteSpace(host) && host == host.Trim() &&
+        host.IndexOfAny([':', '/', '\\', '*', '@', '?', '#']) < 0 &&
+        Uri.CheckHostName(host) is UriHostNameType.Dns or UriHostNameType.IPv4;
 
     public string? RejectionReason(HttpRequest request)
     {
@@ -43,7 +46,7 @@ public sealed class AccessPolicy
     // True when a non-loopback host was configured; --no-auth is refused in that case.
     public bool AllowsPublicHost { get; }
 
-    private static string? NormalizeOrigin(string value)
+    public static string? NormalizeOrigin(string? value)
     {
         if (string.IsNullOrWhiteSpace(value) || value != value.Trim() || value.Contains('\\') ||
             value.Any(char.IsControl) || !Uri.TryCreate(value, UriKind.Absolute, out var uri) ||

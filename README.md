@@ -60,9 +60,13 @@ else that is wrong in the file is skipped or replaced by its
 default and reported as a warning in the startup log and in `host_capabilities.warnings`: a root entry with a bad or
 duplicate id or no path is ignored; a root whose directory does not exist stays configured with `exists=false`, and
 calls on it fail until the directory exists, without a restart; a server with no usable root still serves the
-desktop tools. Saving (the tray's setup and **Edit roots and grants**) writes a temporary file and swaps it in, and
-keeps the previous version as `codexish.json.bak`. If `codexish.json` cannot be parsed, it is kept as
-`codexish.json.broken-<utc>` and a readable `codexish.json.bak` is loaded and restored in its place.
+desktop tools; an `allow_hosts` or `allow_origins` entry that is not an exact hostname or origin is ignored; and
+`null` for any setting means that setting's default (an explicit empty `shell.allowed`, `[]`, still allows no shell).
+Saving (the tray's setup and **Edit roots and grants**) writes a temporary file and swaps it in, and keeps the
+previous version as `codexish.json.bak`. If `codexish.json` cannot be parsed, it is kept as
+`codexish.json.broken-<utc>` (`-2`, `-3` and so on when that name is taken) and a readable `codexish.json.bak` is
+loaded and restored in its place. If another program saved `codexish.json` in the meantime, nothing is overwritten:
+a readable new version is loaded instead, and otherwise the `.bak` is loaded without being restored.
 
 ### Run it
 
@@ -181,10 +185,11 @@ any `GIT_*` variable inherited from the server's environment.
 ### Ledger and retention
 
 The ledger is the SQLite database `codexish.db` in `state_dir`. If SQLite reports it as damaged or not a database at
-startup (including `PRAGMA quick_check`), it and its `-wal`/`-shm` files are renamed to `ledger.corrupt-<utc>.*`, a
-fresh database is created and `host_capabilities.ledger_rebuilt` says so. **The fresh ledger has no tokens, so the
-ChatGPT connector has to sign in again.** Brief lock or I/O errors from other programs are retried within the normal
-command timeout, and a row that cannot be read affects only the response that needed it.
+startup (including `PRAGMA quick_check`), it and its `-wal`, `-shm` and `-journal` files are renamed to
+`ledger.corrupt-<utc>.*`, a fresh database is created and `host_capabilities.ledger_rebuilt` says so. **The fresh
+ledger has no tokens, so the ChatGPT connector has to sign in again.** Brief lock or I/O errors from other programs
+are retried within the normal command timeout, schema upgrades at startup included, and a row that cannot be read
+affects only the response that needed it.
 
 CODEXish deletes its own old state, never your roots, files or Git history:
 
@@ -197,8 +202,16 @@ entries, events, exited processes with their output, expired or revoked tokens, 
 files older than `output_days` are deleted; pre-edit backups, quarantined ledgers and `codexish.json.broken-*` copies
 older than `backup_days` are deleted. A missing section means these defaults, and `0` keeps that state forever.
 Running and reattachable processes, queued or running operations, the newest checkpoint, live tokens and browser
-profiles are never deleted. A failed step is retried at the next sweep; `host_capabilities.retention` shows the
-settings and the last sweep.
+profiles are never deleted, and neither is an exited process whose job still holds a running descendant, nor its
+output, until that descendant ends. A failed step is retried at the next sweep; `host_capabilities.retention` shows
+the settings and the last sweep.
+
+Only files carrying the names CODEXish gives them are deleted: `art_<id>.bin` in `artifacts`, `<id>.bak` in
+`backups`, `tray-<yyyyMMdd>.log` in `logs`, `ledger.corrupt-<utc>.db` (and its sidecars) in `state_dir`, and
+`codexish.json.broken-<utc>` next to the configuration. Any other file in those folders, and every directory, is left
+alone, even when `state_dir` lies inside a root. An artifact's record goes only once its file is gone, so a file
+that cannot be deleted yet is tried again at the next sweep. Reading output that retention removed answers
+`ARTIFACT_EXPIRED` or `NOT_FOUND`; run the command again for fresh output.
 
 ### Browser mounts (slice 3)
 
@@ -240,7 +253,8 @@ tools directory, add this to `codexish.json`:
   Variables whose names look like credentials are never passed, and proxy variables are not passed either.
 - Mounts connect in the background once the server listens, each on its own, so a backend that is slow or never
   answers its handshake delays nothing else. A backend that fails to start or exits is restarted after 1 s, doubling
-  to at most 60 s between attempts, without giving up; five healthy minutes reset the delay. `host_capabilities`
+  to at most 60 s between attempts, without giving up; five healthy minutes after a completed handshake and tool
+  listing reset the delay. `host_capabilities`
   reports each mount's `state` (`starting`, `connected`, `retrying`, `invalid_config`, `stopped`), its attempts, last
   error, next retry time and the last lines of its stderr. Only an entry that is invalid in the file itself
   (`invalid_config`) is not retried.
@@ -261,10 +275,12 @@ tools directory, add this to `codexish.json`:
 ```
 
 `--tray` runs the same server behind a notification-area icon. It first starts itself again in the background with
-a hidden console and exits, so the console window of a shortcut, a double-click or a terminal closes at once and
-closing a terminal no longer ends CODEXish; if that relaunch fails, the tray runs in the original process. One tray
-runs per configuration: a second `--tray` for the same `codexish.json` says "CODEXish is already running; its icon is
-in the notification area" and exits.
+a hidden console and exits as soon as that copy holds the tray (or has found one already running), so the console
+window of a shortcut, a double-click or a terminal closes at once and closing a terminal no longer ends CODEXish; if
+that relaunch fails, or the copy exits before it takes over, the tray runs in the original process. One tray runs
+per configuration file, however its path is spelled (a junction, symbolic link or short name leads to the same
+file): a second `--tray` for the same `codexish.json` says "CODEXish is already running; its icon is in the
+notification area" and exits.
 
 Without a configuration file the tray first shows a setup form: public https origin, local port (3000 unless
 `--port` says otherwise), one project root, a new CODEXish password, the OAuth callback and **Start CODEXish when I
@@ -286,8 +302,10 @@ The server and the owned tunnel are supervised. A failed server start (a busy po
 stops without being asked to, and an owned tunnel that exits without being asked to are retried after 1 s, doubling
 to at most 60 s between attempts, without ever giving up; five minutes of healthy running reset the delay. **Stop
 server and owned tunnel**, **Stop owned tunnel**, **Edit roots and grants** and **Exit** end supervision of what they
-stop until you start it again. The icon's tooltip shows whether each part is running, retrying (with a short cause)
-or stopped, and every failure and restart is in the connection log with its cause.
+stop until you start it again. Starts and stops run one after another, so an automatic start never overtakes a stop
+in progress. If stopping the owned tunnel fails, the server stops anyway and the tunnel failure is reported on its
+own. The icon's tooltip shows whether each part is running, retrying (with a short cause) or stopped, and every
+failure and restart is in the connection log with its cause.
 
 The menu also offers status with roots and processes, pause and resume, stopping session children, revoking all
 tokens, the connection log, **Open configuration folder**, and **Edit roots and grants**, which stops the server and

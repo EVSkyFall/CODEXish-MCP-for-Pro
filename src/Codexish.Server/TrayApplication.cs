@@ -34,12 +34,65 @@ public static class TrayInstance
         return start;
     }
 
-    // One tray per configuration: the name comes from the full configuration path, compared the way the platform does.
-    public static string MutexName(string configPath)
+    // One tray per configuration. The names come from the configuration's final path, so a symlink, a junction or an
+    // 8.3 alias of the same file gives the same names; they are compared the way the platform compares paths.
+    public static string MutexName(string configPath) => @"Local\CODEXish-tray-" + InstanceHash(configPath);
+
+    // Set by the relaunched tray once it holds the mutex, or once it found another tray holding it.
+    public static string ReadyEventName(string configPath) => @"Local\CODEXish-tray-ready-" + InstanceHash(configPath);
+
+    private static string InstanceHash(string configPath)
+    {
+        string canonical = CanonicalPath(configPath);
+        if (OperatingSystem.IsWindows()) canonical = canonical.ToUpperInvariant();
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(canonical)))[..32];
+    }
+
+    // The final path (GetFinalPathNameByHandle) of the configuration file, or, before that file exists, of its deepest
+    // existing parent with the rest of the path appended; GetFullPath when neither can be resolved.
+    public static string CanonicalPath(string configPath)
     {
         string full = Path.GetFullPath(configPath);
-        if (OperatingSystem.IsWindows()) full = full.ToUpperInvariant();
-        return @"Local\CODEXish-tray-" + Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(full)))[..32];
+        if (!OperatingSystem.IsWindows()) return full;
+        string? existing = full;
+        string rest = "";
+        while (existing is not null && !File.Exists(existing) && !Directory.Exists(existing))
+        {
+            rest = rest.Length == 0 ? Path.GetFileName(existing) : Path.Combine(Path.GetFileName(existing), rest);
+            existing = Path.GetDirectoryName(existing);
+        }
+        if (existing is null) return full;
+        using var handle = Native.OpenDirectory(existing);
+        string? final = handle is null ? null : Native.FinalPath(handle);
+        if (final is null) return full;
+        final = Path.TrimEndingDirectorySeparator(final);
+        return rest.Length == 0 ? final : Path.Combine(final, rest);
+    }
+
+    // Whether a relaunched tray took over: it either signaled that it holds the mutex (or found the running tray), or
+    // it exited first, in which case the caller runs the tray itself. There is no timeout; whichever happens decides.
+    public static bool ChildTookOver(Process child, EventWaitHandle ready)
+    {
+        using var exited = new ProcessExit(child);
+        int first = WaitHandle.WaitAny([ready, exited]);
+        return first == 0 || ready.WaitOne(0);
+    }
+
+    private sealed class ProcessExit : WaitHandle
+    {
+        public ProcessExit(Process process) =>
+            SafeWaitHandle = new Microsoft.Win32.SafeHandles.SafeWaitHandle(process.Handle, ownsHandle: false);
+    }
+
+    public static void SignalReady(string configPath)
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        try
+        {
+            if (EventWaitHandle.TryOpenExisting(ReadyEventName(configPath), out var ready))
+                using (ready) ready.Set();
+        }
+        catch (Exception error) when (error is UnauthorizedAccessException or IOException or WaitHandleCannotBeOpenedException) { }
     }
 
     // Null when a live tray already holds the mutex for this configuration.
@@ -73,8 +126,8 @@ public static class TrayApplication
     {
 #if WINDOWS
         options ??= new TrayOptions();
-        // A relaunch that fails leaves the tray in this process, exactly as before.
-        if (!smoke && arguments is not null && !arguments.Contains(TrayInstance.DetachedMarker) && Relaunch(arguments))
+        // A relaunch that fails, or whose child exits before it took over, leaves the tray in this process.
+        if (!smoke && arguments is not null && !arguments.Contains(TrayInstance.DetachedMarker) && Relaunch(path, arguments))
             return Task.FromResult(0);
         var completion = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
         var thread = new Thread(() =>
@@ -87,6 +140,8 @@ public static class TrayApplication
                 if (!smoke)
                 {
                     instance = TrayInstance.TryAcquire(path);
+                    // Either way a tray runs for this configuration now, so a waiting launcher can close.
+                    TrayInstance.SignalReady(path);
                     if (instance is null)
                     {
                         Forms.MessageBox.Show("CODEXish is already running; its icon is in the notification area.", "CODEXish",
@@ -136,15 +191,25 @@ public static class TrayApplication
 #endif
     }
 #if WINDOWS
-    private static bool Relaunch(string[] arguments)
+    // True only once the detached child holds the tray mutex, or found the tray that does. If it exits first, or the
+    // relaunch cannot be set up at all, this process runs the tray itself.
+    private static bool Relaunch(string path, string[] arguments)
     {
         try
         {
+            using var ready = new EventWaitHandle(false, EventResetMode.ManualReset, TrayInstance.ReadyEventName(path));
             var (executable, hosted) = TrayInstance.SelfLaunch();
             using var child = Process.Start(TrayInstance.DetachedStart(executable, hosted, arguments));
-            return child is not null;
+            if (child is null) return false;
+            if (TrayInstance.ChildTookOver(child, ready)) return true;
+            Console.Error.WriteLine($"The detached tray exited with code {child.ExitCode} before it took over; the tray runs in this process.");
+            return false;
         }
-        catch (Exception error) when (error is System.ComponentModel.Win32Exception or InvalidOperationException or IOException) { return false; }
+        catch (Exception error)
+        {
+            Console.Error.WriteLine("The tray runs in this process; the detached relaunch failed: " + error.GetType().Name + ": " + error.Message);
+            return false;
+        }
     }
 
     private sealed class Context : Forms.ApplicationContext

@@ -17,12 +17,15 @@ internal static class HardeningTests
         Tolerance(temp);
         await MissingRoot(temp, password);
         ConfigurationFiles(temp, password);
+        ConcurrentConfiguration(temp, password);
+        await MalformedEntries(temp, password);
         DriveRoot(temp, password);
         await Secrets(temp, password);
         ShellResolution(temp);
         GitResolution(temp);
         await LedgerRebuild(temp, password);
         LedgerRows(temp);
+        await MigrationUnderLock(temp);
         await Orphans(temp, password);
         await Retention(temp, password);
     }
@@ -155,6 +158,120 @@ internal static class HardeningTests
         catch (InvalidDataException failure) { error = failure.Message; }
         Check(error is not null && error.Contains("could not be read") && Directory.GetFiles(directory, "codexish.json.broken-*").Length == 2,
             "without a readable .bak the real parse error is raised and the unreadable file is still kept");
+    }
+
+    // C1 and C2: recovery never overwrites a file another writer saved in between, and an unreadable copy never
+    // overwrites an earlier one.
+    private static void ConcurrentConfiguration(string temp, string password)
+    {
+        string directory = Path.Combine(temp, "config-race");
+        Directory.CreateDirectory(Path.Combine(directory, "proj"));
+        string path = Path.Combine(directory, "codexish.json");
+        var config = ServerConfig.Create("https://race.test", password, [("proj", Path.Combine(directory, "proj"))], [], 3000,
+            Path.Combine(directory, "state"));
+        config.Save(path);
+        config.Port = 3001;
+        config.Save(path);
+        byte[] failed = Encoding.UTF8.GetBytes("{ \"port\": ");
+        var parseError = new JsonException("simulated parse failure");
+        // Another writer saved a readable version after the unreadable bytes were read.
+        config.Port = 3002;
+        config.Save(path);
+        var (newer, loadedNote) = ServerConfig.Recover(path, failed, parseError);
+        Check(newer.Port == 3002 && ServerConfig.Load(path).Port == 3002 && loadedNote.Contains("another writer", StringComparison.Ordinal),
+            "when another writer saved a readable file in between, that file is loaded and the backup is not restored over it");
+        // Another writer left a different unreadable file: the backup is used and nothing is overwritten.
+        byte[] other = Encoding.UTF8.GetBytes("{ \"port\": 99");
+        File.WriteAllBytes(path, other);
+        var (fallback, keptNote) = ServerConfig.Recover(path, failed, parseError);
+        Check(fallback.Port == 3001 && File.ReadAllBytes(path).SequenceEqual(other) && keptNote.Contains("without overwriting", StringComparison.Ordinal),
+            "when the file changed to something unreadable again, the backup is loaded without overwriting that newer file");
+
+        var at = DateTimeOffset.UtcNow;
+        string first = ServerConfig.KeepBroken(path, [1], at), second = ServerConfig.KeepBroken(path, [2], at), third = ServerConfig.KeepBroken(path, [3], at);
+        var recognized = global::Codexish.Server.Retention.UnreadableConfiguration("codexish.json");
+        Check(first == path + ".broken-" + ServerConfig.UtcStamp(at) && second == first + "-2" && third == first + "-3" &&
+              File.ReadAllBytes(first).SequenceEqual(new byte[] { 1 }) && File.ReadAllBytes(second).SequenceEqual(new byte[] { 2 }) &&
+              File.ReadAllBytes(third).SequenceEqual(new byte[] { 3 }) && new[] { first, second, third }.All(f => recognized.IsMatch(Path.GetFileName(f))),
+            "an unreadable copy never overwrites an earlier one: a taken name gets -2, -3, and retention still recognizes each");
+    }
+
+    // C3 and C4: malformed access entries and JSON nulls anywhere become warnings or defaults, never a failed start.
+    private static async Task MalformedEntries(string temp, string password)
+    {
+        string directory = Path.Combine(temp, "malformed");
+        string root = Path.Combine(directory, "proj");
+        Directory.CreateDirectory(root);
+        static string Json(string value) => JsonSerializer.Serialize(value);
+        string entriesPath = Path.Combine(directory, "entries.json");
+        File.WriteAllText(entriesPath, $$"""
+            {
+              "public_url": "https://entries.test",
+              "state_dir": {{Json(Path.Combine(directory, "entries-state"))}},
+              "roots": [{ "id": "proj", "path": {{Json(root)}} }],
+              "allow_hosts": ["good.example", "bad host", null, "*.wild.example", "host:8080", "http://scheme.example"],
+              "allow_origins": ["https://ok.example", "not an origin", null, "https://path.example/x"],
+              "oauth": { "client_secret": "secret", "password_hash": {{Json(ServerConfig.HashPassword(password))}} },
+              "control_token": "control"
+            }
+            """);
+        var entries = ServerConfig.Load(entriesPath);
+        bool Warned(string field, string entry) => entries.Warnings.Any(w => w.StartsWith($"{field} entry '{entry}'", StringComparison.Ordinal));
+        Check(entries.AllowHosts.SequenceEqual(["good.example"]) && entries.AllowOrigins.SequenceEqual(["https://ok.example", "https://entries.test"]) &&
+              new[] { "bad host", "null", "*.wild.example", "host:8080", "http://scheme.example" }.All(h => Warned("allow_hosts", h)) &&
+              new[] { "not an origin", "null", "https://path.example/x" }.All(o => Warned("allow_origins", o)),
+            "malformed allow_hosts and allow_origins entries are skipped with a warning each, and the valid entries are kept");
+        Check(new AccessPolicy(["bad host", null, "good.example", "::::", ""], ["nope", null, "https://ok.example", "ftp://x.example"]).AllowsPublicHost &&
+              !new AccessPolicy(["bad host", null], [null, "nope"]).AllowsPublicHost,
+            "the access policy skips entries it cannot use instead of throwing, and keeps the valid ones");
+        using (var runtime = new CodexishRuntime(entries))
+        {
+            // Entries that reach the host without passing validation still cannot stop it.
+            entries.AllowHosts = ["bad host", "good.example"];
+            entries.AllowOrigins = ["nope", "https://ok.example"];
+            await using var app = CodexishHost.Build(runtime, 0, _ => { });
+            Check(app.Services is not null, "a host whose configuration still carries malformed access entries builds");
+        }
+
+        // C4: JSON null for every string, list and section, first at the top level. state_dir is null here, so this
+        // configuration is only loaded, never run.
+        string nullsPath = Path.Combine(directory, "nulls.json");
+        File.WriteAllText(nullsPath, """
+            { "public_url": null, "allow_hosts": null, "allow_origins": null, "state_dir": null, "roots": null, "shell": null,
+              "git": null, "oauth": null, "control_token": null, "browser_mounts": null, "tunnel": null, "retention": null }
+            """);
+        var empty = ServerConfig.Load(nullsPath);
+        Check(empty.PublicUrl == "" && empty.AllowHosts.Length == 0 && empty.AllowOrigins.Length == 0 &&
+              empty.StateDir == Path.TrimEndingDirectorySeparator(Path.GetFullPath(ServerConfig.DefaultDirectory)) && empty.Roots.Length == 0 &&
+              empty.Shell.EffectiveDefault == "pwsh" && empty.Git.Path == "" && empty.OAuth.ClientId == new OAuthConfig().ClientId &&
+              empty.OAuth.RedirectUris.Length == 0 && empty.ControlToken == "" && empty.BrowserMounts.Length == 0 &&
+              empty.Tunnel.Command == "" && empty.Tunnel.Args.Length == 0 && empty.Retention.OutputDays == 30 &&
+              empty.Warnings.Any(w => w.Contains("state_dir is not set", StringComparison.Ordinal)),
+            "JSON null for every top-level string, list and section loads as that property's default");
+
+        // Then inside sections, root entries and browser mount entries, with a configuration the server really runs.
+        string nestedPath = Path.Combine(directory, "nested.json");
+        File.WriteAllText(nestedPath, $$"""
+            {
+              "public_url": "https://nested.test", "state_dir": {{Json(Path.Combine(directory, "nested-state"))}},
+              "roots": [null, { "id": null, "path": null }, { "id": "proj", "path": {{Json(root)}} }],
+              "shell": { "default": null, "allowed": null }, "git": { "path": null },
+              "oauth": { "client_id": null, "client_secret": null, "redirect_uris": null, "password_hash": null },
+              "tunnel": { "command": null, "args": [null, "--flag"] }, "retention": {},
+              "browser_mounts": [null, { "id": null, "root_id": null, "kind": null, "command": null, "args": null, "profile_mode": null, "read_only_tools": null }],
+              "allow_hosts": [null], "allow_origins": [null], "control_token": null
+            }
+            """);
+        var nested = ServerConfig.Load(nestedPath);
+        using (var runtime = new CodexishRuntime(nested))
+        {
+            var mounts = JsonSerializer.SerializeToElement(runtime.Browsers.Describe()).GetProperty("mounted");
+            Check(nested.Roots.Select(r => r.Id).SequenceEqual(["proj"]) && nested.Shell.EffectiveDefault == "pwsh" && nested.Git.Path == "" &&
+                  nested.OAuth.ClientId == new OAuthConfig().ClientId && nested.OAuth.RedirectUris.Length == 0 && nested.Tunnel.Args.SequenceEqual(["--flag"]) &&
+                  mounts.GetArrayLength() == 2 && mounts.EnumerateArray().All(m => m.GetProperty("state").GetString() == "invalid_config") &&
+                  Status(new CodexishTools(runtime).HostCapabilities()) == "succeeded",
+                "JSON null inside sections, root entries and browser mount entries loads as defaults, and the server runs with them");
+        }
     }
 
     // P4: a root set to the drive root resolves its children. Only reads happen; nothing is written at the drive root.
@@ -349,6 +466,54 @@ internal static class HardeningTests
         Check(permanent == 1 && spent == 1, "an error that is not transient, or a transient one past the command timeout, surfaces at once");
     }
 
+    // S2: migrations that meet another connection's write lock wait it out instead of leaving a column missing.
+    private static async Task MigrationUnderLock(string temp)
+    {
+        string path = Path.Combine(temp, "migration-lock.db");
+        string connectionString = new SqliteConnectionStringBuilder { DataSource = path, Pooling = false }.ToString();
+        using (var setup = new SqliteConnection(connectionString))
+        {
+            setup.Open();
+            using var command = setup.CreateCommand();
+            // The two tables as an earlier build wrote them, before the migrated columns existed.
+            command.CommandText = """
+                CREATE TABLE tokens(hash TEXT PRIMARY KEY, kind TEXT NOT NULL, client_id TEXT NOT NULL, audience TEXT NOT NULL,
+                    expires_at TEXT NOT NULL, revoked INTEGER NOT NULL, pkce_used INTEGER NOT NULL DEFAULT 0);
+                CREATE TABLE processes(process_id TEXT PRIMARY KEY, pid INTEGER NOT NULL, start_time INTEGER NOT NULL,
+                    state TEXT NOT NULL, exit_code INTEGER, lifetime TEXT NOT NULL, root_id TEXT NOT NULL,
+                    stdout_artifact TEXT, stderr_artifact TEXT);
+                """;
+            command.ExecuteNonQuery();
+        }
+        using var holder = new SqliteConnection(connectionString);
+        holder.Open();
+        void Holder(string sql)
+        {
+            using var command = holder.CreateCommand();
+            command.CommandText = sql;
+            command.ExecuteNonQuery();
+        }
+        Holder("BEGIN EXCLUSIVE");
+        var opening = Task.Run(() => new Store(path));
+        bool waited;
+        try
+        {
+            await Task.Delay(500);
+            waited = !opening.IsCompleted;
+        }
+        finally { Holder("COMMIT"); }
+        using var store = await opening;
+        bool Columns(string sql)
+        {
+            try { store.Execute(sql); return true; }
+            catch (SqliteException) { return false; }
+        }
+        Check(waited && store.MigrationErrors.Count == 0 &&
+              Columns("UPDATE tokens SET family=family, scope=scope, revoked_at=revoked_at WHERE 0") &&
+              Columns("UPDATE processes SET updated_at=updated_at WHERE 0"),
+            "migrations that meet another connection's write lock wait for it, and every migrated column exists afterwards");
+    }
+
     // P9 and P10: a child is never orphaned by a failure after it started, and exited processes release their handles.
     private static async Task Orphans(string temp, string password)
     {
@@ -388,7 +553,8 @@ internal static class HardeningTests
         }
     }
 
-    // P17: age-based cleanup of CODEXish's own state, with everything that must survive checked as well.
+    // P17 and R1-R4: age-based cleanup of CODEXish's own state, and only of files it named itself, with everything that
+    // must survive checked as well.
     private static async Task Retention(string temp, string password)
     {
         string directory = Path.Combine(temp, "retention");
@@ -426,15 +592,18 @@ internal static class HardeningTests
         void Process(string id, string state, string when, string output) =>
             Sql("INSERT INTO processes(process_id,pid,start_time,state,exit_code,lifetime,root_id,stdout_artifact,stderr_artifact,updated_at) VALUES($id,1,1,$s,0,'persistent','proj',$a,NULL,$n)",
                 ("$id", id), ("$s", state), ("$a", output), ("$n", when));
-        string exitedOutput = Artifact("art_exited_old", old);
-        Process("proc_exited_old", "exited", old, "art_exited_old");
-        string runningOutput = Artifact("art_running_old", old);
-        Process("proc_running_old", "running", old, "art_running_old");
-        string recentOutput = Artifact("art_exited_recent", old);
-        Process("proc_exited_recent", "exited", recent, "art_exited_recent");
-        string loose = Artifact("art_loose_old", old);
-        string fresh = Artifact("art_loose_recent", recent);
-        string orphan = Path.Combine(runtime.Artifacts.Directory, "art_orphan.bin");
+        static string NewId() => "art_" + Guid.NewGuid().ToString("N");
+        string exitedId = NewId(), runningId = NewId(), recentId = NewId(), looseId = NewId(), freshId = NewId(), absentId = NewId();
+        string exitedOutput = Artifact(exitedId, old);
+        Process("proc_exited_old", "exited", old, exitedId);
+        string runningOutput = Artifact(runningId, old);
+        Process("proc_running_old", "running", old, runningId);
+        string recentOutput = Artifact(recentId, old);
+        Process("proc_exited_recent", "exited", recent, recentId);
+        string loose = Artifact(looseId, old);
+        string fresh = Artifact(freshId, recent);
+        Artifact(absentId, old, file: false);
+        string orphan = Path.Combine(runtime.Artifacts.Directory, NewId() + ".bin");
         File.WriteAllText(orphan, "no row");
         File.SetLastWriteTimeUtc(orphan, now.AddDays(-40).UtcDateTime);
 
@@ -444,14 +613,39 @@ internal static class HardeningTests
             File.SetLastWriteTimeUtc(path, now.AddDays(-days).UtcDateTime);
             return path;
         }
-        string oldBackup = Aged(Path.Combine(config.StateDir, "backups", "old.bak"), 100);
-        string keptBackup = Aged(Path.Combine(config.StateDir, "backups", "kept.bak"), 40);
-        string oldLog = Aged(Path.Combine(config.StateDir, "logs", "tray-old.log"), 40);
-        string todayLog = Aged(Path.Combine(config.StateDir, "logs", "tray-today.log"), 0);
-        string profile = Aged(Path.Combine(config.StateDir, "browser-profiles", "pw", "Preferences"), 400);
-        string quarantine = Touch(Path.Combine(config.StateDir, "ledger.corrupt-" + ServerConfig.UtcStamp(now.AddDays(-100)) + ".db"));
+        string state = config.StateDir;
+        string Day(int daysAgo) => now.AddDays(-daysAgo).ToString("yyyyMMdd", System.Globalization.CultureInfo.InvariantCulture);
+        string oldBackup = Aged(Path.Combine(state, "backups", Guid.NewGuid().ToString("N") + ".bak"), 100);
+        string keptBackup = Aged(Path.Combine(state, "backups", Guid.NewGuid().ToString("N") + ".bak"), 40);
+        string oldLog = Aged(Path.Combine(state, "logs", $"tray-{Day(40)}.log"), 40);
+        string todayLog = Aged(Path.Combine(state, "logs", $"tray-{Day(0)}.log"), 0);
+        string profile = Aged(Path.Combine(state, "browser-profiles", "pw", "Preferences"), 400);
+        string quarantine = Touch(Path.Combine(state, "ledger.corrupt-" + ServerConfig.UtcStamp(now.AddDays(-100)) + ".db"));
         string brokenOld = Touch(config.SourcePath + ".broken-" + ServerConfig.UtcStamp(now.AddDays(-100)));
         string brokenNew = Touch(config.SourcePath + ".broken-" + ServerConfig.UtcStamp(now.AddDays(-10)));
+
+        // R1: state_dir may lie inside a root, so files CODEXish did not name must survive however old they are. Each
+        // folder the sweep reads gets the same user files, plus names that only resemble CODEXish's own.
+        string configDirectory = Path.GetDirectoryName(config.SourcePath)!;
+        string ancient = ServerConfig.UtcStamp(now.AddDays(-400));
+        string hex = Guid.NewGuid().ToString("N");
+        string[] folders = [runtime.Artifacts.Directory, Path.Combine(state, "backups"), Path.Combine(state, "logs"), state, configDirectory];
+        List<string> foreign = folders.SelectMany(folder => new[] { "notes.txt", "report.log", "a.bak", "x.bin" }
+            .Select(name => Aged(Path.Combine(folder, name), 400))).ToList();
+        foreach (var (folder, name) in new[]
+        {
+            (runtime.Artifacts.Directory, "art_" + hex + ".bin.txt"), (runtime.Artifacts.Directory, "ART_" + hex.ToUpperInvariant() + ".bin"),
+            (runtime.Artifacts.Directory, "art_notes.bin"), (Path.Combine(state, "backups"), "notes-" + hex + ".bak"),
+            (Path.Combine(state, "logs"), "tray-2020.log"), (Path.Combine(state, "logs"), "tray-20200101.log.txt"),
+            (state, "ledger.corrupt-notes.db"), (state, "ledger.corrupt-" + ancient + ".db.txt"),
+            (configDirectory, "codexish.json.broken-notes"), (configDirectory, "other.json.broken-" + ancient)
+        })
+            foreign.Add(Aged(Path.Combine(folder, name), 400));
+        string lookalike = Path.Combine(state, "logs", $"tray-{Day(400)}.log");
+        Directory.CreateDirectory(lookalike);
+        Directory.SetLastWriteTimeUtc(lookalike, now.AddDays(-400).UtcDateTime);
+        // A row whose id CODEXish never issues, pointing at the user's x.bin.
+        Artifact("x", old, file: false);
 
         var report = runtime.Retention.Sweep(now);
         bool Row(string sql) => store.ExecuteCount(sql) > 0;
@@ -466,20 +660,87 @@ internal static class HardeningTests
         Check(store.Process("proc_exited_old") is null && !File.Exists(exitedOutput) && store.Process("proc_running_old") is not null &&
               File.Exists(runningOutput) && store.Process("proc_exited_recent") is not null && File.Exists(recentOutput),
             "an exited process past output_days goes with its output, while a running process and a recent exit keep theirs");
-        Check(!File.Exists(loose) && store.Artifact("art_loose_old") is null && File.Exists(fresh) && !File.Exists(orphan),
+        Check(!File.Exists(loose) && store.Artifact(looseId) is null && File.Exists(fresh) && store.Artifact(freshId) is not null && !File.Exists(orphan),
             "old unreferenced artifacts and orphaned artifact files are removed, recent ones stay");
+        Check(store.Artifact(absentId) is null, "an old artifact row whose file is already gone is removed");
         Check(!File.Exists(oldBackup) && File.Exists(keptBackup) && !File.Exists(oldLog) && File.Exists(todayLog) && File.Exists(profile) &&
               !File.Exists(quarantine) && !File.Exists(brokenOld) && File.Exists(brokenNew),
             "backups, quarantined ledgers and unreadable configuration copies go after backup_days, tray logs after output_days, and browser profiles stay");
+        Check(foreign.All(File.Exists) && Directory.Exists(lookalike) && store.Artifact("x") is not null,
+            "files CODEXish did not name survive in every folder the sweep reads, as do a directory named like a tray log and a row whose id CODEXish never issues");
         var described = Data(tools.HostCapabilities()).GetProperty("retention");
         Check(described.GetProperty("output_days").GetInt32() == 30 && described.GetProperty("backup_days").GetInt32() == 90 &&
-              described.GetProperty("last_sweep").GetProperty("files").GetInt32() == report.Files && report.Files >= 7 && report.Bytes > 0,
-            "host_capabilities reports the retention settings and the last sweep");
+              described.GetProperty("last_sweep").GetProperty("files").GetInt32() == report.Files && report.Files == 7 && report.Bytes > 0,
+            "host_capabilities reports the retention settings and the last sweep, which removed exactly the seven expired CODEXish files");
+
+        // R2: a file that cannot be removed keeps its row, so the next sweep tries again. Only Windows refuses to delete
+        // a file that is open.
+        if (OperatingSystem.IsWindows())
+        {
+            string lockedId = NewId();
+            string locked = Artifact(lockedId, old);
+            SweepReport held;
+            using (new FileStream(locked, FileMode.Open, FileAccess.Read, FileShare.None))
+                held = runtime.Retention.Sweep(now);
+            Check(held.ErrorCount == 1 && held.Errors[0].Contains(lockedId, StringComparison.Ordinal) && File.Exists(locked) && store.Artifact(lockedId) is not null,
+                "an artifact whose file cannot be removed keeps its row, and the failure is reported");
+            var retried = runtime.Retention.Sweep(now);
+            Check(retried.ErrorCount == 0 && !File.Exists(locked) && store.Artifact(lockedId) is null,
+                "the next sweep removes that file and then its row");
+        }
+        else Skip("retention with a locked artifact file: only Windows refuses to delete an open file");
+
+        // R3: an exited process whose job still holds a live process keeps its row and its output until that process ends.
+        if (OperatingSystem.IsWindows())
+        {
+            var quick = await tools.ShellRun("proj", "retention-held-1", executable: Path.Combine(Environment.SystemDirectory, "cmd.exe"),
+                args: ["/c", "exit", "0"], wait_ms: 60000);
+            string processId = Data(quick).GetProperty("process_id").GetString()!;
+            var managed = runtime.Processes.Lookup(processId);
+            for (int attempt = 0; attempt < 200 && !managed.Released; attempt++) await Task.Delay(50);
+            var start = new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "PING.EXE"))
+            {
+                UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true
+            };
+            foreach (string argument in new[] { "-n", "120", "127.0.0.1" }) start.ArgumentList.Add(argument);
+            using var descendant = System.Diagnostics.Process.Start(start)!;
+            nint job = Native.CreateKillOnCloseJob();
+            bool assigned = Native.AssignProcess(job, descendant.Handle);
+            managed.CloseJob();
+            lock (managed.JobSync) managed.JobHandle = job;
+            Sql("UPDATE processes SET updated_at=$o WHERE process_id=$id", ("$o", old), ("$id", processId));
+            Sql("UPDATE artifacts SET created_at=$o WHERE id=$a OR id=$b", ("$o", old), ("$a", managed.StdoutArtifact), ("$b", managed.StderrArtifact));
+            string heldOutput = Path.Combine(runtime.Artifacts.Directory, managed.StdoutArtifact + ".bin");
+            runtime.Retention.Sweep(now);
+            Check(assigned && managed.Released && store.Process(processId) is not null && File.Exists(heldOutput) &&
+                  store.Artifact(managed.StdoutArtifact) is not null && runtime.Processes.HoldsJob(processId),
+                "an exited process whose job still holds a live descendant keeps its row and its output");
+            descendant.Kill();
+            descendant.WaitForExit();
+            for (int attempt = 0; attempt < 200 && Native.ActiveProcesses(job) != 0; attempt++) await Task.Delay(50);
+            runtime.Retention.Sweep(now);
+            Check(store.Process(processId) is null && !File.Exists(heldOutput) && store.Artifact(managed.StdoutArtifact) is null &&
+                  !runtime.Processes.HoldsJob(processId),
+                "once that descendant has ended, the next sweep closes the job and removes the row and its output");
+        }
+        else Skip("retention of a process whose job holds descendants: job objects exist only on Windows");
+
+        // R4: bytes that vanished answer ARTIFACT_EXPIRED; an artifact whose row went as well answers NOT_FOUND.
+        var saved = runtime.Artifacts.Save(Encoding.UTF8.GetBytes("line one\nline two\n"), "text/plain", "test", null);
+        File.Delete(saved.Path);
+        var expired = tools.ArtifactRead(saved.Id);
+        string Message(ModelContextProtocol.Protocol.CallToolResult result) =>
+            result.StructuredContent!.Value.GetProperty("error").GetProperty("message").GetString() ?? "";
+        Check(Error(expired) == "ARTIFACT_EXPIRED" && Message(expired).Contains("output_days", StringComparison.Ordinal) &&
+              Error(tools.ArtifactRead(saved.Id, line_from: 1)) == "ARTIFACT_EXPIRED" && Error(tools.ArtifactSearch(saved.Id, "line")) == "ARTIFACT_EXPIRED",
+            "reading or searching an artifact whose file vanished answers ARTIFACT_EXPIRED with the reason");
+        var removed = tools.ArtifactRead(looseId);
+        Check(Error(removed) == "NOT_FOUND" && Message(removed).Contains("retention", StringComparison.Ordinal),
+            "an artifact that retention removed entirely answers NOT_FOUND and names retention as a cause");
 
         config.Retention.OutputDays = 0;
         Sql("INSERT INTO events(utc,kind,ref,json) VALUES($o,'kept-forever',NULL,'{}')", ("$o", old));
         runtime.Retention.Sweep(now);
         Check(store.Events("kept-forever").Count == 1, "output_days 0 keeps that state forever");
-        await Task.CompletedTask;
     }
 }

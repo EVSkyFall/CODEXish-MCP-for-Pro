@@ -138,6 +138,7 @@ public sealed class ProcessSupervisor(Store store, Artifacts artifacts, ServerCo
         // could escape supervision; that race is not closed here (CREATE_SUSPENDED would be needed).
         nint job = 0;
         ManagedProcess? managed = null;
+        bool persisted = false;
         try
         {
             string supervision = lifetime == "session" ? "process_tree_fallback" : "not_supervised_persistent";
@@ -176,22 +177,32 @@ public sealed class ProcessSupervisor(Store store, Artifacts artifacts, ServerCo
             };
             processes[managed.ProcessId] = managed;
             Persist(managed);
+            persisted = true;
+            // Diagnostic events never throw (Store.Event), so from here nothing can end the child.
             store.Event("process_start", managed.ProcessId, new { pid = managed.Pid, lifetime = managed.Lifetime, root = cwd.Root.Id, display, interpreter });
             managed.Collection = Collect(managed);
             return managed;
         }
         catch (Exception error)
         {
-            // Nothing may keep running that no handle describes: the child and its tree end before the error surfaces.
+            // The essential records (the process row, its artifacts, the job) could not be made: nothing may keep running
+            // that no handle describes, so the child and its tree end before the error surfaces.
             int pid = 0;
             try { pid = process.Id; } catch (InvalidOperationException) { }
             if (!Native.TerminateJob(job))
                 try { process.Kill(entireProcessTree: true); } catch (Exception) { /* it already exited */ }
             Native.CloseJob(job);
-            if (managed is not null) processes.TryRemove(managed.ProcessId, out _);
+            if (managed is not null)
+            {
+                processes.TryRemove(managed.ProcessId, out _);
+                // A row already written must not stay "running" for a child that no longer exists.
+                if (persisted)
+                    try { store.UpsertProcess(new ProcessRow(managed.ProcessId, managed.Pid, managed.StartTime, "exited_unknown_code", null,
+                        managed.Lifetime, managed.RootId, managed.StdoutArtifact, managed.StderrArtifact)); }
+                    catch (Exception) { /* a restart turns a stale running row into exited_unknown_code as well */ }
+            }
             process.Dispose();
-            try { store.Event("process_start_failed", null, new { pid, error = error.GetType().Name, message = error.Message, cleanup = "terminated" }); }
-            catch (Exception) { /* the error below is the report */ }
+            store.Event("process_start_failed", null, new { pid, error = error.GetType().Name, message = error.Message, cleanup = "terminated" });
             throw new CodexishFault("EXECUTION_FAILED",
                 $"The child started but could not be recorded ({error.GetType().Name}: {error.Message}); it was terminated with its descendants.",
                 "unknown", details: new { pid, cleanup = "terminated" });
@@ -294,6 +305,9 @@ public sealed class ProcessSupervisor(Store store, Artifacts artifacts, ServerCo
         }
         return closed;
     }
+
+    // An exited process whose job still holds live descendants: retention keeps its row and output until they are gone.
+    public bool HoldsJob(string processId) => processes.TryGetValue(processId, out var managed) && managed.JobHandle != 0;
 
     // Retention removed these rows; the in-memory entries of exited processes go with them.
     public void Forget(IEnumerable<string> processIds)

@@ -84,9 +84,11 @@ public sealed class Store : IDisposable
         return connection;
     }
 
+    // Every statement, the migrations included, goes through WithRetry, so a lock held for a moment by another
+    // connection cannot leave a column missing.
     private void Initialize(SqliteConnection connection)
     {
-        Run(connection, """
+        RunRetried(connection, """
             PRAGMA journal_mode=WAL;
             PRAGMA synchronous=FULL;
             CREATE TABLE IF NOT EXISTS invocations(id TEXT PRIMARY KEY, digest TEXT NOT NULL, tool TEXT NOT NULL,
@@ -104,7 +106,7 @@ public sealed class Store : IDisposable
             """);
         foreach (var (table, column, definition) in Migrations)
         {
-            try { Run(connection, $"ALTER TABLE {table} ADD COLUMN {column} {definition}"); }
+            try { RunRetried(connection, $"ALTER TABLE {table} ADD COLUMN {column} {definition}"); }
             catch (SqliteException error) when (error.Message.Contains("duplicate column name", StringComparison.OrdinalIgnoreCase)) { }
             catch (SqliteException error) when (!IsCorrupt(error))
             {
@@ -121,7 +123,7 @@ public sealed class Store : IDisposable
         string stamp = ServerConfig.UtcStamp(at);
         string directory = System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(path)) ?? ".";
         List<string> moved = [];
-        foreach (string suffix in new[] { "", "-wal", "-shm" })
+        foreach (string suffix in new[] { "", "-wal", "-shm", "-journal" })
         {
             string source = path + suffix;
             if (!File.Exists(source)) continue;
@@ -168,6 +170,9 @@ public sealed class Store : IDisposable
         command.CommandText = sql;
         command.ExecuteNonQuery();
     }
+
+    private void RunRetried(SqliteConnection connection, string sql) =>
+        WithRetry(() => { Run(connection, sql); return 0; }, transientBudget);
 
     private static string? Scalar(SqliteConnection connection, string sql)
     {
@@ -234,9 +239,21 @@ public sealed class Store : IDisposable
         }
     }
 
-    public void Event(string kind, string? reference, object payload) =>
-        Execute("INSERT INTO events(utc,kind,ref,json) VALUES($utc,$kind,$ref,$json)",
-            ("$utc", Now), ("$kind", kind), ("$ref", reference), ("$json", JsonSerializer.Serialize(payload)));
+    // Events are diagnostics: one that cannot be written goes to stderr and never aborts startup, a tool call or a
+    // process.
+    public void Event(string kind, string? reference, object payload)
+    {
+        try
+        {
+            Execute("INSERT INTO events(utc,kind,ref,json) VALUES($utc,$kind,$ref,$json)",
+                ("$utc", Now), ("$kind", kind), ("$ref", reference), ("$json", JsonSerializer.Serialize(payload)));
+        }
+        catch (Exception error)
+        {
+            try { Console.Error.WriteLine($"event {kind} was not recorded: {error.GetType().Name}: {error.Message}"); }
+            catch (IOException) { /* nowhere left to report it */ }
+        }
+    }
 
     public List<(long Seq, string Utc, string Kind, string? Reference, string? Json)> Events(string? kind = null) =>
         ReadAll("SELECT seq,utc,kind,ref,json FROM events WHERE ($kind IS NULL OR kind=$kind) ORDER BY seq",

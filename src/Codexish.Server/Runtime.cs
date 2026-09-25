@@ -84,8 +84,8 @@ public sealed class CodexishRuntime : IDisposable
         {
             // A start that fails here releases the state directory, so the next attempt in this process is not
             // refused by a lock this one still holds.
-            Store?.Dispose();
-            instanceLock.Dispose();
+            try { Store?.Dispose(); }
+            finally { instanceLock.Dispose(); }
             throw;
         }
     }
@@ -221,22 +221,42 @@ public sealed class CodexishRuntime : IDisposable
         "operation_cancel", "session_checkpoint", "computer_observe", "computer_query_ui", "computer_act"
     ];
 
+    // Every step runs even when an earlier one fails, and the store and the state-directory lock are released in
+    // nested finally blocks, so a later start in this process is never refused by a lock this one still holds. The
+    // first failure is rethrown once everything has run.
     public void Dispose()
     {
         if (disposed) return;
         disposed = true;
-        sweeps.Cancel();
-        // A sweep in progress finishes its current statement set before the store closes.
-        try { sweepLoop.GetAwaiter().GetResult(); } catch (Exception) { /* a failed sweep was already reported */ }
-        sweeps.Dispose();
-        Browsers.Stop();
-        Ledger.Dispose();
-        Processes.Dispose();
-        // The thread pool keeps a caller's UI synchronization context from deadlocking the asynchronous disposal.
-        Task.Run(() => Browsers.DisposeAsync().AsTask()).GetAwaiter().GetResult();
-        if (desktop.IsValueCreated) desktop.Value.Dispose();
-        Store.Event("server_stop", null, new { });
-        Store.Dispose();
-        instanceLock.Dispose();
+        Exception? first = null;
+        void Step(Action action)
+        {
+            try { action(); }
+            catch (Exception error) { first ??= error; }
+        }
+        try
+        {
+            Step(sweeps.Cancel);
+            // A sweep in progress finishes its current statement set before the store closes.
+            Step(() =>
+            {
+                try { sweepLoop.GetAwaiter().GetResult(); }
+                catch (Exception) { /* a failed sweep was already reported */ }
+            });
+            Step(sweeps.Dispose);
+            Step(Browsers.Stop);
+            Step(Ledger.Dispose);
+            Step(Processes.Dispose);
+            // The thread pool keeps a caller's UI synchronization context from deadlocking the asynchronous disposal.
+            Step(() => Task.Run(() => Browsers.DisposeAsync().AsTask()).GetAwaiter().GetResult());
+            Step(() => { if (desktop.IsValueCreated) desktop.Value.Dispose(); });
+            Step(() => Store.Event("server_stop", null, new { }));
+        }
+        finally
+        {
+            try { Store.Dispose(); }
+            finally { instanceLock.Dispose(); }
+        }
+        if (first is not null) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(first).Throw();
     }
 }

@@ -2,6 +2,56 @@
 
 Updated 2026-09-17. Mainline **A / PR #4** is unchanged. Desktop **PR #5 remains Draft**. No merge, force push, branch deletion, or whole-product completion is reported.
 
+## Review fixes (pass 3) — local Windows results (2026-09-26)
+
+Branch `feat/v1-connect-hardening`, on top of 16167ec; the runs below used the uncommitted working tree on the authorized Windows 11 PC with portable SDK 10.0.401. Nothing here involved ChatGPT, a tunnel, a notification icon, the user's configuration, the real Startup folder or port 38451. For current behavior this section supersedes the P3, P7, P8, P14, P17, P18 and P21 rows of the pass 2 table below.
+
+| Item | What it does |
+| --- | --- |
+| R1 retention names | A file is deleted only when its whole name is one CODEXish gives its files, and only directly in its own folder: `artifacts\art_<32 hex>.bin` (the database-driven removal also requires the id `art_<32 hex>`), `backups\<32 hex>.bak`, `logs\tray-<yyyyMMdd>.log`, `ledger.corrupt-<yyyyMMdd>T<HHmmssfff>Z.db[-wal\|-shm\|-journal]` in state_dir and `<config file name>.broken-<same stamp>[-N]` next to the configuration. No directory is deleted. |
+| R2 artifact rows | An artifact row is deleted only after its file was removed or was already absent; a file that cannot be removed keeps its row, is named in the sweep report and is retried at the next sweep. |
+| R3 held jobs | An exited process whose in-memory entry still holds a job handle (live descendants) keeps its row and its output; once the job is idle, a sweep closes it and removes both. |
+| R4 expired artifacts | `artifact_read` and `artifact_search` on a row whose file vanished answer `ARTIFACT_EXPIRED` with the artifact id; an artifact whose row is gone as well answers `NOT_FOUND`, naming retention as a possible cause. Both tool descriptions say so. |
+| C1 `.bak` restore | Recovery keeps the unreadable bytes first and reads the main file again: a readable version another writer saved meanwhile is loaded; a different unreadable version leaves the `.bak` loaded without overwriting; only a file that still holds exactly the failed bytes is replaced by the `.bak`. |
+| C2 broken copies | `.broken-<utc>` is created with `CreateNew`; a taken name gets `-2`, `-3` and so on. |
+| C3 access entries | `Validate` skips a malformed `allow_hosts` or `allow_origins` entry (JSON null included) with a warning per entry; `AccessPolicy` skips what it cannot use and never throws. |
+| C4 JSON null | Null for any string, list or section, at the top level and inside `shell`, `git`, `oauth` and `tunnel`, becomes the property's default before validation; null `tunnel.args` entries are dropped with a warning; root and mount entries already handled null. `shell.allowed: null` therefore means the default list, while an explicit `[]` still allows no shell. |
+| S1 events | `Store.Event` is best-effort everywhere (`ledger_rebuilt`, `migration_failed`, `server_start`, process, retention and all other events): a failed write goes to stderr only. |
+| S2 migrations | The schema script and each `ALTER TABLE` run through `WithRetry` within the command timeout. |
+| S3 quarantine | A `-journal` sidecar moves with the database. |
+| L1 process start | After `Process.Start`, a failed row insert, artifact creation or job bookkeeping still kills the tree and now also marks a row already written as `exited_unknown_code`; a failed diagnostic event cannot end a process. |
+| L2 cleanup | `CodexishRuntime.Dispose` runs every step, releases the store and the state-directory lock in nested `finally` blocks and then rethrows the first failure (a failed sweep loop stays swallowed as before). The tray's host and runtime release and a failed start's candidate disposal are nested the same way. A failing tunnel stop is logged, the server still stops, and `StopAsync` then throws "The server stopped, but stopping the owned tunnel failed: …". |
+| L3 child setup | In the tray tunnel and the browser backend, a failure after `Process.Start` (handle access, job assignment, reader setup) terminates the job or kills the tree and closes the job before the retry. The browser job is recorded before the handle is used, and the tunnel clears its references before releasing them. |
+| L4 lifecycle | Start, Stop, StartTunnel, StopTunnel and StartConfigured (which the P19 reload start uses) run one at a time under one lifecycle semaphore per controller. |
+| L5 relaunch | The launcher creates the manual-reset event `Local\CODEXish-tray-ready-<hash>`, starts the detached copy and waits, with no timeout, for that event or the copy's exit. The copy sets the event right after taking the mutex, or before showing the already-running message. A copy that exits first leaves the tray to the launcher, which logs the exit code to stderr. |
+| L6 instance names | The mutex and the event hash the configuration's final path (`GetFinalPathNameByHandle`). Before the file exists, the deepest existing parent is resolved and the rest appended, so the names do not change when first-run setup creates the file. `GetFullPath` is the fallback, compared case-insensitively on Windows. |
+| B1 mount ids | A mount id is reserved only after the whole entry validates. |
+| B2 healthy clock | The five-minute healthy clock starts after the handshake and tool listing. |
+
+| Command | Result |
+| --- | --- |
+| Release build, server | 0 warnings, 0 errors |
+| Server project copy with its Windows conditions set to false (net10.0, no WPF/Windows Forms), offline restore | 0 warnings, 0 errors; a compile check on Windows, not a Linux run |
+| `--self-test`, two runs on the final source (two more before the last small edit) | SELF_TEST_PASSED 327 (310 before) in each; DESKTOP_CORE_PASSED 56; DESKTOP_REGRESSIONS 11 passed, 0 failed. The dangling-link check printed SKIP as before. |
+| `--browser-tests`, two runs on the final source (two more before) | BROWSER_TESTS_PASSED 54 (53 before) in each |
+| `--tray-tests`, two runs on the final source (two more before) | TRAY_CONTROLLER_PASSED 50 (43 before) in each; the junction check ran |
+
+New checks:
+- Retention R1: user files `notes.txt`, `report.log`, `a.bak` and `x.bin`, backdated 400 days, in `artifacts`, `backups`, `logs`, state_dir and the configuration folder, plus look-alike names, a directory named like a tray log and a database row with the id `x`. The sweep leaves all of them and removes exactly the 7 expired CODEXish files. The existing retention fixture now uses real CODEXish names.
+- Retention R2: an old artifact row whose file is already gone is removed; an artifact held open with `FileShare.None` keeps its row and is reported, and the next sweep removes the file and then the row.
+- Retention R3: a live `PING.EXE` is assigned to a real kill-on-close job and set as an exited process's job. A real grandchild would inherit the output pipes and keep the process `running`, so this arranges the state directly. The row and output survive a sweep; after the descendant ends, the next sweep removes both.
+- Retention R4: `ARTIFACT_EXPIRED` from `artifact_read` (bytes and lines) and `artifact_search`, and `NOT_FOUND` naming retention.
+- Configuration C1: `Recover` with a newer readable file, and with a newer unreadable file.
+- Configuration C2: three `KeepBroken` calls with one stamp give the base name, `-2` and `-3`, all recognized by retention.
+- Configuration C3: warnings per malformed entry, `AccessPolicy` with malformed entries, and a host that builds with unvalidated entries.
+- Configuration C4: a file with every top-level property null (loaded only, never run, because its state_dir is the default), and a file with nulls inside sections, root and mount entries, which a runtime then serves.
+- Store S2: `BEGIN EXCLUSIVE` from a second connection held for 500 ms while a `Store` opens an old-schema database.
+- Tray L2: `FailNextTunnelStop`, a tray-test-only injection point.
+- Tray L5 and L6: the ready-event name shares the mutex hash; names are equal through a directory junction (`mklink /J` in the test folder) for an existing and a not-yet-existing file; `ChildTookOver` returns false for a stub that exits with code 3 before signaling and true for a signaled, still-running stub.
+- Browser B1: an invalid entry `dup` does not block a valid `DUP`.
+
+The first two runs of each suite predate one follow-up: `Runtime.Dispose` swallowing a failed sweep loop again, as it did before pass 3. Not run and not claimed: the real detached relaunch and the ready handshake with `--tray`, the mutex message box, the configuration-error balloon and the other tray UI (`--tray`, `--tray-smoke-test`), an actual Windows sign-in, `--self-test-desktop`, `--self-test-desktop-http`, `--browser-live-test`, the P0 self-test, CI, a Linux run, and any use of ChatGPT, Tailscale or cloudflared.
+
 ## Availability hardening (pass 2) — local Windows results (2026-09-26)
 
 Branch `feat/v1-connect-hardening`, on top of 7f07d65; the runs below used the uncommitted working tree on the authorized Windows 11 PC with portable SDK 10.0.401. Nothing here involved ChatGPT, a tunnel, a notification icon, the user's configuration, the real Startup folder or port 38451.

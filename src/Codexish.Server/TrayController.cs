@@ -147,9 +147,25 @@ public sealed class TrayController(ServerConfig config) : IAsyncDisposable
     private static string Describe(Exception error) =>
         error.GetType().Name + ": " + error.Message.Split('\n', 2)[0].TrimEnd('\r');
 
+    // Start, stop and their tunnel counterparts run one at a time, so an automatic start can never overtake a stop that
+    // is still in progress, while a start requested after the stop completed simply proceeds.
+    private readonly SemaphoreSlim lifecycle = new(1, 1);
+
+    private async Task Transition(Func<Task> action)
+    {
+        await lifecycle.WaitAsync();
+        try { await action(); }
+        finally { lifecycle.Release(); }
+    }
+
+    // Self-test injection point for a failing tunnel stop. Never set outside --tray-tests.
+    internal bool FailNextTunnelStop { get; set; }
+
     // Returns once the first attempt has an outcome. A failed attempt is not thrown: supervision keeps retrying and
     // Status and Diagnostics carry the cause.
-    public async Task StartAsync()
+    public Task StartAsync() => Transition(StartCore);
+
+    private async Task StartCore()
     {
         if (ServerConfig.TransportRefusal(config, false) is { } refusal) throw new ArgumentException(refusal);
         Supervision watch;
@@ -169,7 +185,9 @@ public sealed class TrayController(ServerConfig config) : IAsyncDisposable
     // The tunnel starts only on request: its menu item, --start, or the end of first-run setup. Starting the server
     // alone never starts it. It inherits the tray's environment on purpose, because tunnel tools commonly read their
     // settings from environment variables.
-    public async Task StartTunnelAsync()
+    public Task StartTunnelAsync() => Transition(StartTunnelCore);
+
+    private async Task StartTunnelCore()
     {
         if (string.IsNullOrWhiteSpace(config.Tunnel.Command)) throw new InvalidOperationException("Configure tunnel.command and tunnel.args; no tunnel is downloaded or selected automatically.");
         Supervision watch;
@@ -187,12 +205,13 @@ public sealed class TrayController(ServerConfig config) : IAsyncDisposable
         await watch.Settled.Task;
     }
 
-    // --tray --start and the end of first-run setup: the server, then the configured tunnel, both supervised.
-    public async Task StartConfiguredAsync()
+    // --tray --start, the end of first-run setup and a configuration that loads after an error: the server, then the
+    // configured tunnel, both supervised, as one transition.
+    public Task StartConfiguredAsync() => Transition(async () =>
     {
-        await StartAsync();
-        if (!string.IsNullOrWhiteSpace(config.Tunnel.Command)) await StartTunnelAsync();
-    }
+        await StartCore();
+        if (!string.IsNullOrWhiteSpace(config.Tunnel.Command)) await StartTunnelCore();
+    });
 
     public async Task<string> ControlAsync(string action)
     {
@@ -213,7 +232,7 @@ public sealed class TrayController(ServerConfig config) : IAsyncDisposable
         finally { gate.Release(); }
     }
 
-    public async Task StopTunnelAsync()
+    public Task StopTunnelAsync() => Transition(async () =>
     {
         Supervision? owned;
         lock (sync) { owned = tunnelWatch; tunnelWatch = null; }
@@ -221,29 +240,45 @@ public sealed class TrayController(ServerConfig config) : IAsyncDisposable
         await gate.WaitAsync();
         try { await StopTunnelCore(); }
         finally { gate.Release(); }
-    }
+    });
 
-    public async Task StopAsync()
+    // A tunnel that cannot be stopped never keeps the server running: the server is still stopped, and the tunnel
+    // failure is logged and reported afterwards on its own.
+    public Task StopAsync() => Transition(async () =>
     {
         Supervision? server, owned;
         lock (sync) { server = serverWatch; owned = tunnelWatch; serverWatch = tunnelWatch = null; }
         await End(owned);
         await End(server);
+        Exception? tunnelFailure = null;
         await gate.WaitAsync();
         try
         {
-            await StopTunnelCore();
-            if (app is null) return;
-            await StopHost();
-            Log("Server stopped. Persistent child lifetime remains unchanged.");
+            try { await StopTunnelCore(); }
+            catch (Exception error)
+            {
+                tunnelFailure = error;
+                Log("Stopping the owned tunnel failed: " + Describe(error));
+            }
+            if (app is not null)
+            {
+                await StopHost();
+                Log("Server stopped. Persistent child lifetime remains unchanged.");
+            }
         }
         finally { gate.Release(); }
-    }
+        if (tunnelFailure is not null)
+            throw new InvalidOperationException("The server stopped, but stopping the owned tunnel failed: " + Describe(tunnelFailure), tunnelFailure);
+    });
 
     public async ValueTask DisposeAsync()
     {
-        await StopAsync();
-        gate.Dispose();
+        try { await StopAsync(); }
+        finally
+        {
+            lifecycle.Dispose();
+            gate.Dispose();
+        }
     }
 
     private async Task End(Supervision? watch)
@@ -322,31 +357,38 @@ public sealed class TrayController(ServerConfig config) : IAsyncDisposable
             }
             catch
             {
-                if (host is not null) await host.DisposeAsync();
-                candidate.Dispose();
+                // The candidate runtime holds the state-directory lock; it is released whatever the host does.
+                try { if (host is not null) await host.DisposeAsync(); }
+                finally { candidate.Dispose(); }
                 throw;
             }
         }
         finally { gate.Release(); }
     }
 
+    // Each release runs whatever the step before it did, so the runtime and its state-directory lock are always freed.
     private async Task StopHost()
     {
-        if (app is null) return;
-        // Browser calls in flight are cancelled before the host drains its requests, so a backend that never
-        // answers cannot hold the stop.
-        runtime?.Browsers.Stop();
+        var host = app;
+        var owned = runtime;
+        if (host is null) return;
         try
         {
-            await app.StopAsync();
-            await app.DisposeAsync();
+            // Browser calls in flight are cancelled before the host drains its requests, so a backend that never
+            // answers cannot hold the stop.
+            owned?.Browsers.Stop();
+            await host.StopAsync();
         }
         finally
         {
-            app = null;
-            runtime?.Dispose();
-            runtime = null;
-            ServerChanged(null);
+            try { await host.DisposeAsync(); }
+            finally
+            {
+                app = null;
+                runtime = null;
+                try { owned?.Dispose(); }
+                finally { ServerChanged(null); }
+            }
         }
     }
 
@@ -426,17 +468,35 @@ public sealed class TrayController(ServerConfig config) : IAsyncDisposable
             var start = new ProcessStartInfo(config.Tunnel.Command) { UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true, CreateNoWindow = true };
             foreach (string argument in config.Tunnel.Args) start.ArgumentList.Add(argument.Replace("{port}", address.Port.ToString(), StringComparison.Ordinal));
             var process = Process.Start(start) ?? throw new IOException("Tunnel process did not start.");
-            // A kill-on-close job ends the tunnel and its descendants with this process, even when the tray is killed.
-            CloseTunnelJob();
-            nint job = Native.CreateKillOnCloseJob();
-            if (job != 0 && !Native.AssignProcess(job, process.Handle)) { Native.CloseJob(job); job = 0; }
-            if (job == 0 && OperatingSystem.IsWindows()) Log("The owned tunnel could not be placed in a job object; it may outlive a tray that is killed.");
-            lock (sync) { tunnel = process; tunnelJob = job; }
-            async Task Drain(StreamReader reader) { while (await reader.ReadLineAsync() is { } line) Log("Tunnel: " + line); }
-            stdout = Drain(process.StandardOutput);
-            stderr = Drain(process.StandardError);
-            Log("Owned tunnel process started; remote connectivity is not yet verified.");
-            return process;
+            nint job = 0;
+            try
+            {
+                // A kill-on-close job ends the tunnel and its descendants with this process, even when the tray is killed.
+                CloseTunnelJob();
+                job = Native.CreateKillOnCloseJob();
+                if (job != 0 && !Native.AssignProcess(job, process.Handle)) { Native.CloseJob(job); job = 0; }
+                if (job == 0 && OperatingSystem.IsWindows()) Log("The owned tunnel could not be placed in a job object; it may outlive a tray that is killed.");
+                async Task Drain(StreamReader reader) { while (await reader.ReadLineAsync() is { } line) Log("Tunnel: " + line); }
+                var output = Drain(process.StandardOutput);
+                var errors = Drain(process.StandardError);
+                lock (sync) { tunnel = process; tunnelJob = job; }
+                stdout = output;
+                stderr = errors;
+                Log("Owned tunnel process started; remote connectivity is not yet verified.");
+                return process;
+            }
+            catch
+            {
+                // A tunnel that started but could not be set up ends with its tree before the next attempt. Nothing may
+                // keep referring to the process or the job handle that are released here.
+                lock (sync)
+                    if (ReferenceEquals(tunnel, process)) { tunnel = null; tunnelJob = 0; }
+                if (!Native.TerminateJob(job))
+                    try { process.Kill(entireProcessTree: true); } catch (Exception) { /* it already exited */ }
+                Native.CloseJob(job);
+                process.Dispose();
+                throw;
+            }
         }
         finally { gate.Release(); }
     }
@@ -456,6 +516,11 @@ public sealed class TrayController(ServerConfig config) : IAsyncDisposable
         lock (sync) job = tunnelJob;
         if (live && !Native.TerminateJob(job)) tunnel.Kill(entireProcessTree: true);
         CloseTunnelJob();
+        if (FailNextTunnelStop)
+        {
+            FailNextTunnelStop = false;
+            throw new IOException("Injected failure while stopping the owned tunnel (tray tests only).");
+        }
         await tunnel.WaitForExitAsync();
         // The output of a tree this stop ended is complete once its pipes close. A tunnel that had already exited by
         // itself may have left a descendant holding them, so its readers are left to finish on their own.
@@ -597,6 +662,20 @@ public static class TrayTests
             Check(!busy.Running && !busy.TunnelRunning && busy.Status == "server stopped, tunnel stopped",
                 "stopping the server stops the owned tunnel and neither is restarted");
 
+            // A tunnel stop that throws never keeps the server running; its failure is reported on its own.
+            await busy.StartConfiguredAsync();
+            busy.FailNextTunnelStop = true;
+            string? stopFailure = null;
+            try { await busy.StopAsync(); }
+            catch (InvalidOperationException error) { stopFailure = error.Message; }
+            Check(stopFailure is not null && stopFailure.StartsWith("The server stopped, but stopping the owned tunnel failed: IOException", StringComparison.Ordinal) &&
+                  !busy.Running && busy.Address is null && Count(busy, "Stopping the owned tunnel failed: IOException") == 1,
+                "a tunnel stop that throws still stops the server, and the tunnel failure is reported separately");
+            Check(await Eventually(() => !busy.TunnelRunning, 30), "the owned tunnel was ended before its stop failed");
+            await busy.StopTunnelAsync();
+            Check(!busy.Running && !busy.TunnelRunning && busy.Status == "server stopped, tunnel stopped" && Count(busy, "Owned tunnel stopped.") >= 2,
+                "the failed tunnel stop can be completed afterwards");
+
             // A directory where the database file belongs makes every attempt fail right after the state directory
             // lock is taken. Once it is gone, a later attempt must be able to take the lock again.
             Directory.CreateDirectory(Path.Combine(directory, "blocked-root"));
@@ -647,6 +726,65 @@ public static class TrayTests
                 third.Dispose();
             }
             else Console.WriteLine("TRAY SKIP single-instance mutex: the tray exists only on Windows");
+            string ready = TrayInstance.ReadyEventName(configPath), mutex = TrayInstance.MutexName(configPath);
+            Check(ready != mutex && ready[ready.LastIndexOf('-')..] == mutex[mutex.LastIndexOf('-')..] &&
+                  ready == TrayInstance.ReadyEventName(OperatingSystem.IsWindows() ? configPath.ToUpperInvariant() : configPath),
+                "the relaunch's ready event is named from the same hash as the tray mutex");
+            if (OperatingSystem.IsWindows())
+            {
+                // The names come from the final path: a junction to the configuration's folder yields the same names,
+                // both for an existing file and for one that does not exist yet.
+                string real = Path.Combine(directory, "real-config"), alias = Path.Combine(directory, "alias-config");
+                Directory.CreateDirectory(real);
+                File.WriteAllText(Path.Combine(real, "codexish.json"), "{}");
+                var link = new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "cmd.exe"))
+                {
+                    UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true
+                };
+                foreach (string argument in new[] { "/c", "mklink", "/J", alias, real }) link.ArgumentList.Add(argument);
+                using (var mklink = Process.Start(link)!)
+                {
+                    mklink.StandardOutput.ReadToEnd();
+                    mklink.StandardError.ReadToEnd();
+                    mklink.WaitForExit();
+                }
+                if (Directory.Exists(alias))
+                {
+                    Check(TrayInstance.MutexName(Path.Combine(alias, "codexish.json")) == TrayInstance.MutexName(Path.Combine(real, "codexish.json")) &&
+                          TrayInstance.ReadyEventName(Path.Combine(alias, "codexish.json")) == TrayInstance.ReadyEventName(Path.Combine(real, "codexish.json")) &&
+                          TrayInstance.MutexName(Path.Combine(alias, "later.json")) == TrayInstance.MutexName(Path.Combine(real, "later.json")),
+                        "a configuration reached through a junction gets the tray names of its final path, whether or not the file exists yet");
+                    Directory.Delete(alias);
+                }
+                else Console.WriteLine("TRAY SKIP junction alias: mklink /J could not create a junction here");
+
+                // The launcher waits for the relaunched tray's signal or its exit, whichever comes first, with no timeout.
+                using var signal = new EventWaitHandle(false, EventResetMode.ManualReset, ready);
+                Process Stub(string program, params string[] arguments)
+                {
+                    var start = new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, program))
+                    {
+                        UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true
+                    };
+                    foreach (string argument in arguments) start.ArgumentList.Add(argument);
+                    return Process.Start(start)!;
+                }
+                using (var quitter = Stub("cmd.exe", "/c", "exit", "3"))
+                    Check(!TrayInstance.ChildTookOver(quitter, signal) && quitter.HasExited && quitter.ExitCode == 3 && !signal.WaitOne(0),
+                        "a relaunched tray that exits before it signals leaves the tray to the launching process");
+                TrayInstance.SignalReady(configPath + ".nobody-waits");
+                TrayInstance.SignalReady(configPath);
+                using (var runner = Stub("PING.EXE", "-n", "60", "127.0.0.1"))
+                {
+                    bool tookOver = TrayInstance.ChildTookOver(runner, signal);
+                    bool stillRunning = !runner.HasExited;
+                    runner.Kill();
+                    runner.WaitForExit();
+                    Check(tookOver && stillRunning && signal.WaitOne(0),
+                        "a relaunched tray that signals takes over while it keeps running, so the launcher never waits for its exit");
+                }
+            }
+            else Console.WriteLine("TRAY SKIP detached relaunch handshake and final-path names: the tray exists only on Windows");
             Directory.CreateDirectory(Path.GetDirectoryName(configPath)!);
             File.WriteAllText(configPath, "{ unreadable");
             var (unreadable, why) = TrayInstance.TryLoad(configPath);
