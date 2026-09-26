@@ -18,6 +18,10 @@ public sealed record TokenRow(string Hash, string Kind, string ClientId, string 
 
 public sealed record LedgerRebuild(DateTimeOffset At, string[] Quarantined, string Reason);
 
+// A client that registered itself through /register (RFC 7591). The secret is stored only as a hash.
+public sealed record ClientRow(string ClientId, string? SecretHash, string[] RedirectUris, string AuthMethod, string? Name,
+    string CreatedAt, string? LastSignedInAt);
+
 // D10: one SQLite file in the state directory, WAL, every table the slice needs. All access is serialized on
 // one connection; the ledger relies on the same lock to make acceptance order observable.
 public sealed class Store : IDisposable
@@ -103,6 +107,8 @@ public sealed class Store : IDisposable
             CREATE TABLE IF NOT EXISTS tokens(hash TEXT PRIMARY KEY, kind TEXT NOT NULL, client_id TEXT NOT NULL,
                 audience TEXT NOT NULL, expires_at TEXT NOT NULL, revoked INTEGER NOT NULL, pkce_used INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS checkpoints(seq INTEGER PRIMARY KEY AUTOINCREMENT, utc TEXT NOT NULL, json TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS clients(client_id TEXT PRIMARY KEY, secret_hash TEXT, redirect_uris TEXT NOT NULL,
+                auth_method TEXT NOT NULL, name TEXT, created_at TEXT NOT NULL, last_signed_in_at TEXT);
             """);
         foreach (var (table, column, definition) in Migrations)
         {
@@ -380,6 +386,64 @@ public sealed class Store : IDisposable
         return live.Count;
     }
 
+    public void InsertClient(ClientRow row) =>
+        Execute("INSERT INTO clients(client_id,secret_hash,redirect_uris,auth_method,name,created_at,last_signed_in_at) VALUES($id,$s,$r,$m,$n,$c,NULL)",
+            ("$id", row.ClientId), ("$s", row.SecretHash), ("$r", JsonSerializer.Serialize(row.RedirectUris)), ("$m", row.AuthMethod),
+            ("$n", row.Name), ("$c", row.CreatedAt));
+
+    // A row whose values cannot be read is an unknown client, never an error that stops authorization.
+    public ClientRow? Client(string clientId)
+    {
+        try
+        {
+            return Read("SELECT client_id,secret_hash,redirect_uris,auth_method,name,created_at,last_signed_in_at FROM clients WHERE client_id=$id",
+                MapClient, ("$id", clientId));
+        }
+        catch (Exception error) when (IsMalformedValue(error))
+        {
+            Interlocked.Increment(ref malformedRows);
+            return null;
+        }
+    }
+
+    public bool ClientExists(string clientId) =>
+        Read("SELECT client_id FROM clients WHERE client_id=$id", r => r.GetString(0), ("$id", clientId)) is not null;
+
+    public List<ClientRow> Clients() =>
+        ReadAll("SELECT client_id,secret_hash,redirect_uris,auth_method,name,created_at,last_signed_in_at FROM clients ORDER BY created_at, rowid",
+            MapClient);
+
+    private static ClientRow MapClient(SqliteDataReader r)
+    {
+        string[] uris;
+        try { uris = JsonSerializer.Deserialize<string[]>(r.GetString(2)) ?? throw new FormatException("redirect_uris is null"); }
+        catch (JsonException error) { throw new FormatException("redirect_uris is not a JSON array of strings", error); }
+        return new ClientRow(r.GetString(0), r.IsDBNull(1) ? null : r.GetString(1), uris, r.GetString(3),
+            r.IsDBNull(4) ? null : r.GetString(4), r.GetString(5), r.IsDBNull(6) ? null : r.GetString(6));
+    }
+
+    public void MarkClientSignedIn(string clientId, string at) =>
+        Execute("UPDATE clients SET last_signed_in_at=$a WHERE client_id=$id", ("$a", at), ("$id", clientId));
+
+    // A registration that never completed a sign-in and holds no live token. A client that signed in is never selected.
+    private const string UnusedClient =
+        "last_signed_in_at IS NULL AND client_id NOT IN (SELECT client_id FROM tokens WHERE revoked=0)";
+
+    // Keeps the newest unused registrations and removes older ones beyond that number.
+    public int EvictUnusedClients(int keep) =>
+        ExecuteCount($"DELETE FROM clients WHERE client_id IN (SELECT client_id FROM clients WHERE {UnusedClient} " +
+            "ORDER BY created_at DESC, rowid DESC LIMIT -1 OFFSET $k)", ("$k", keep));
+
+    // Every registered client goes, and every token issued to a registered client id is revoked, including tokens of a
+    // client removed earlier. The configured static client is never touched, whatever its id looks like.
+    public (int Removed, int Revoked) RemoveRegisteredClients(string now, string staticClientId)
+    {
+        int removed = ExecuteCount("DELETE FROM clients WHERE client_id <> $static", ("$static", staticClientId));
+        int revoked = ExecuteCount("UPDATE tokens SET revoked=1,revoked_at=$n WHERE revoked=0 AND substr(client_id,1,4)='dcr_' AND client_id <> $static",
+            ("$n", now), ("$static", staticClientId));
+        return (removed, revoked);
+    }
+
     public void AddCheckpoint(string json) =>
         Execute("INSERT INTO checkpoints(utc,json) VALUES($n,$j)", ("$n", Now), ("$j", json));
 
@@ -428,6 +492,10 @@ public sealed class Store : IDisposable
             r => (r.GetString(0), r.IsDBNull(1) ? null : r.GetString(1), r.IsDBNull(2) ? null : r.GetString(2)), ("$c", cutoff));
 
     public int DeleteProcess(string processId) => ExecuteCount("DELETE FROM processes WHERE process_id=$id", ("$id", processId));
+
+    // A client that has signed in is never removed by age.
+    public int DeleteUnusedClients(string cutoff) =>
+        DeleteInBatches("clients", "client_id", $"{UnusedClient} AND created_at < $c", ("$c", cutoff));
 
     // Artifacts that no remaining process row refers to, so the output of a process is kept exactly as long as the process.
     public List<string> UnreferencedArtifacts(string cutoff) =>

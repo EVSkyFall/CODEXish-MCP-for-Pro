@@ -2,6 +2,58 @@
 
 Updated 2026-09-17. Mainline **A / PR #4** is unchanged. Desktop **PR #5 remains Draft**. No merge, force push, branch deletion, or whole-product completion is reported.
 
+## Dynamic Client Registration (pass 4) — local Windows results (2026-09-26)
+
+Branch `feat/v1-connect-hardening`, on top of 00c2b9c (Draft PR #7); the runs below used the uncommitted working tree on the authorized Windows 11 PC with portable SDK 10.0.401. Nothing here involved ChatGPT, a tunnel, a notification icon, the user's configuration or install, the real Startup folder or port 38451. Why: ChatGPT Plugins (Settings → Security and login → Developer mode; ChatGPT Plugins → +) documents only CIMD and DCR for client registration, and a server with only a pre-registered client can fail there.
+
+| Item | What it does |
+| --- | --- |
+| D1 metadata | `registration_endpoint: <public_url>/register`; `token_endpoint_auth_methods_supported: ["client_secret_basic", "client_secret_post", "none"]`; `client_id_metadata_document_supported` is not advertised. |
+| D2 `POST /register` | Takes a JSON body and answers `201`. `redirect_uris` is required: absolute https without a fragment, or http on `localhost`, `127.0.0.1` or `[::1]`; a bad or missing entry is `400 invalid_redirect_uri`, naming the entry. A body that is not a JSON object is `400 invalid_client_metadata`. `client_secret_basic` (the default) and `client_secret_post` get a generated secret stored as a SHA-256 hash; `none` makes a public client; any other method is replaced by `client_secret_basic` in the response. `grant_types` and `response_types` are always answered as `["authorization_code", "refresh_token"]` and `["code"]`, and unknown fields are ignored. `client_name` loses control and formatting characters (which include bidi overrides) and is cut to 200 characters without splitting a surrogate pair. The response carries `client_id` (`dcr_` + 32 hex), `client_id_issued_at`, `client_secret` and `client_secret_expires_at: 0` when a secret exists, the stored `redirect_uris`, `token_endpoint_auth_method`, `grant_types`, `response_types`, `client_name`, and `Cache-Control: no-store`. The endpoint needs no bearer token and has no Origin requirement; the Host allowlist still applies. Registrations and refusals appear in the connection log (`registered oauth client …`, `rejected oauth stage=register …`). |
+| D3 storage | New table `clients` (`client_id`, `secret_hash`, `redirect_uris` JSON, `auth_method`, `name`, `created_at`, `last_signed_in_at`), created with the schema. Only unused registrations are bounded: registrations that never signed in and hold no live token, keeping the newest `ClientRegistry.UnusedLimit` (1,000; tests lower it) with the oldest evicted first. Retention removes them after `output_days`. Neither step can select a client that has signed in or holds a live token, and `revoke-tokens` keeps clients. |
+| D4 `/authorize` | Accepts the static client and every registered client. A registered client's `redirect_uri` must equal one it registered, otherwise the local error page; a registered public client must send an S256 `code_challenge`. Errors before the password go to a listed or registered callback as redirects with `iss`; an unknown client or unregistered callback gets the local error page. For a registered client the sign-in page shows "<name> wants to connect to this PC." (or "An unnamed client") above the unchanged destination line. A successful sign-in sets `last_signed_in_at`. The static client's page and any-https policy are unchanged. |
+| D5 `/token` | A confidential registered client authenticates with its own secret (Basic or form). A public one sends its `client_id` and no secret, and its code must carry a PKCE challenge that the `code_verifier` verifies. The "no client_id, secret only" rule applies only to the static client, and conflicting Basic and form ids are refused. Codes, access tokens and refresh tokens carry the client that obtained them, and a code or refresh from another client is `invalid_grant`. Refresh behaves as in pass 1 for every client (kept, not rotated, no expiry by default). An unknown or removed client is `401 invalid_client`, and a token whose registered client no longer exists is refused on `/mcp` as well. |
+| D6 static client | `codexish-chatgpt` with the configured secret is unchanged; every pass-1 check passes as before. A static `client_id` that happens to look like `dcr_…` is excluded from the registered-client checks. |
+| D7 visibility | `/control/status` (and so the tray's status window) lists `registered_clients` with id, name, auth method, created, last sign-in and callback hosts, never a secret or its hash. `/control/remove-clients` and the new tray item **Remove registered clients** remove every registered client and revoke its tokens, with no confirmation beyond the click. |
+
+| Command | Result |
+| --- | --- |
+| Release build, server | 0 warnings, 0 errors |
+| Server project copy with its Windows conditions set to false (net10.0, no WPF/Windows Forms), offline restore | 0 warnings, 0 errors; a compile check on Windows, not a Linux run |
+| `--self-test`, two runs on the final source | SELF_TEST_PASSED 357 (327 before) in each; DESKTOP_CORE_PASSED 56; DESKTOP_REGRESSIONS 11 passed, 0 failed. The dangling-link check printed SKIP as before. |
+| `--browser-tests`, two runs | BROWSER_TESTS_PASSED 54 in each (unchanged) |
+| `--tray-tests`, two runs | TRAY_CONTROLLER_PASSED 51 (50 before) in each |
+
+The new checks run through the real in-process HTTP host, except where a unit is named:
+- Metadata: the registration endpoint and auth methods are advertised, and CIMD is absent.
+- Registration:
+  - A confidential client and a public client register; the public one has http callbacks on 127.0.0.1, localhost and [::1].
+  - Unknown fields are ignored, and the secret is stored hashed.
+  - An http callback on another host, a fragment, missing `redirect_uris` and a non-JSON body are refused.
+  - The redirect rules and name cleaning are also checked as units.
+  - An unsupported auth method is substituted and reported.
+  - A foreign Host is refused while a foreign Origin is not.
+- Authorize:
+  - The sign-in page names the registered client.
+  - An unregistered callback and an unknown id get the local error page with no redirect.
+  - A public client without PKCE gets an error redirect with `iss` and no code.
+  - A client without a name is shown as unnamed.
+- Token:
+  - Sign-in records `last_signed_in_at`.
+  - A confidential exchange without its secret is `invalid_client`, and with it succeeds with tokens bound to the client; Basic works, and the secret alone without `client_id` does not.
+  - A public exchange without the verifier fails, with the verifier it succeeds, and a code redeemed by another client fails.
+  - Refresh from the other registered client, or from the static client, fails.
+  - Four concurrent confidential refreshes and two repeated public ones succeed with the same refresh token.
+- Visibility and removal:
+  - The status listing shows the registered clients and contains no secret or hash.
+  - Removal revokes both clients' access and refresh tokens (`invalid_client` at `/token`) while a static token keeps working, and a removed client cannot sign in again without registering.
+- Clean-up:
+  - With `UnusedLimit` 3, a signed-in client and the three newest of five unused registrations remain.
+  - A retention sweep removes an old unused registration and keeps a signed-in one, a recent one and one that holds a live token.
+- The tray reaches `remove-clients` through the controller.
+
+Known gap: client ID metadata documents (CIMD) are not implemented. Not run and not claimed: registration and sign-in with the real ChatGPT Plugins flow, the new tray menu item in the UI, `--tray-smoke-test`, `--self-test-desktop`, `--self-test-desktop-http`, `--browser-live-test`, the P0 self-test, CI, a Linux run, and any use of Tailscale or cloudflared.
+
 ## Review fixes (pass 3) — local Windows results (2026-09-26)
 
 Branch `feat/v1-connect-hardening`, on top of 16167ec; the runs below used the uncommitted working tree on the authorized Windows 11 PC with portable SDK 10.0.401. Nothing here involved ChatGPT, a tunnel, a notification icon, the user's configuration, the real Startup folder or port 38451. For current behavior this section supersedes the P3, P7, P8, P14, P17, P18 and P21 rows of the pass 2 table below.

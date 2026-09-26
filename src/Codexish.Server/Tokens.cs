@@ -56,6 +56,9 @@ public sealed class Tokens(Store store, ServerConfig config)
         if (row is null) return (null, "unknown_token");
         if (row.Kind != kind) return (null, "wrong_token_kind");
         if (row.Revoked) return (null, "revoked");
+        // Removing registered clients revokes their tokens; this also covers a token issued while the removal ran.
+        if (ClientRegistry.IsRegisteredId(row.ClientId) && !string.Equals(row.ClientId, config.OAuth.ClientId, StringComparison.Ordinal) &&
+            !store.ClientExists(row.ClientId)) return (null, "unknown_client");
         // With refresh_token_days <= 0 a refresh token does not expire, including one stored with a finite expiry
         // under the earlier rotating scheme.
         bool expires = kind != "refresh" || config.OAuth.RefreshTokenDays > 0;

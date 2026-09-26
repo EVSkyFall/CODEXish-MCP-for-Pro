@@ -44,7 +44,8 @@ public sealed partial class Retention(CodexishRuntime runtime)
         keep_forever_when = "a value of 0",
         schedule = $"{FirstSweepAfter.TotalSeconds:0} s after start, then every {Interval.TotalHours:0} hours",
         scope = "CODEXish state only, and only files named the way CODEXish names them: artifacts, finished ledger rows, " +
-            "events, exited processes, expired or revoked tokens, older checkpoints and tray logs after output_days; " +
+            "events, exited processes, expired or revoked tokens, older checkpoints, client registrations that never signed in " +
+            "and tray logs after output_days; " +
             "pre-edit backups, quarantined ledgers and unreadable configuration copies after backup_days. Never root " +
             "contents, other files, directories, Git history or browser profiles.",
         last_sweep = Last is { } sweep
@@ -116,6 +117,7 @@ public sealed partial class Retention(CodexishRuntime runtime)
                 Step("events", () => rows += store.DeleteEvents(cutoff));
                 Step("checkpoints", () => rows += store.DeleteOldCheckpoints(cutoff));
                 Step("tokens", () => rows += store.DeleteDeadTokens(cutoff, runtime.Config.OAuth.RefreshTokenDays > 0));
+                Step("registered clients", () => rows += store.DeleteUnusedClients(cutoff));
                 Step("processes", () =>
                 {
                     List<string> removed = [];

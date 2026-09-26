@@ -40,7 +40,9 @@ public static class CodexishHost
 
         app.Use(async (context, next) =>
         {
-            string? reason = access.RejectionReason(context.Request);
+            // Client registration is public by design, so only the Host allowlist applies to it.
+            bool registration = string.Equals(context.Request.Path.Value?.TrimEnd('/'), "/register", StringComparison.OrdinalIgnoreCase);
+            string? reason = access.RejectionReason(context.Request, checkOrigin: !registration);
             if (reason is not null)
             {
                 // JSON escaping prevents untrusted header values from forging extra log lines.
@@ -89,6 +91,7 @@ public static class CodexishHost
         });
 
         MapMetadata(app, runtime);
+        MapRegistration(app, runtime, log);
         MapAuthorize(app, runtime, log);
         MapToken(app, runtime, log);
         MapControl(app, runtime, log);
@@ -119,10 +122,13 @@ public static class CodexishHost
             issuer = Base(runtime, request),
             authorization_endpoint = Base(runtime, request) + "/authorize",
             token_endpoint = Base(runtime, request) + "/token",
+            // RFC 7591. Client ID metadata documents are deliberately not advertised: a client that sees them offered
+            // tries them first and would not fall back to registration.
+            registration_endpoint = Base(runtime, request) + "/register",
             response_types_supported = new[] { "code" },
             grant_types_supported = new[] { "authorization_code", "refresh_token" },
             code_challenge_methods_supported = new[] { "S256" },
-            token_endpoint_auth_methods_supported = new[] { "client_secret_post", "client_secret_basic" },
+            token_endpoint_auth_methods_supported = new[] { ClientRegistry.Basic, ClientRegistry.Post, ClientRegistry.Public },
             scopes_supported = new[] { "mcp" },
             // Every authorization redirect carries iss (RFC 9207). Without this flag ChatGPT registers a
             // per-connection callback instead of its stable one.
@@ -130,10 +136,55 @@ public static class CodexishHost
         }));
     }
 
-    // Listed: the redirect_uri is in oauth.redirect_uris. Any other https callback is accepted as well, but it is
-    // never sent an error redirect before the password has been accepted.
+    // RFC 7591. Public by design: no bearer token and no Origin requirement; the Host allowlist still applies. Unused
+    // registrations are bounded by ClientRegistry.UnusedLimit and removed by retention after output_days.
+    private static void MapRegistration(WebApplication app, CodexishRuntime runtime, Action<string> log)
+    {
+        app.MapPost("/register", async (HttpRequest request) =>
+        {
+            request.HttpContext.Response.Headers.CacheControl = "no-store";
+            JsonElement body;
+            try
+            {
+                using var document = await JsonDocument.ParseAsync(request.Body);
+                body = document.RootElement.Clone();
+            }
+            catch (JsonException)
+            {
+                log("rejected oauth stage=register reason=invalid_client_metadata detail=\"not JSON\"");
+                return RegistrationError("invalid_client_metadata", "The registration request must be a JSON object (RFC 7591).");
+            }
+            try
+            {
+                var (registered, error, description) = runtime.Clients.Register(body);
+                if (registered is null)
+                {
+                    log($"rejected oauth stage=register reason={error} detail={JsonSerializer.Serialize(description)}");
+                    runtime.Store.Event("oauth_rejected", "register", new { reason = error, detail = description });
+                    return RegistrationError(error!, description!);
+                }
+                var hosts = ((string[])registered["redirect_uris"]).Select(ClientRegistry.Host).Distinct(StringComparer.Ordinal);
+                log($"registered oauth client client_id={registered["client_id"]} auth_method={registered["token_endpoint_auth_method"]} " +
+                    $"name={JsonSerializer.Serialize(registered.GetValueOrDefault("client_name"))} redirect_hosts={JsonSerializer.Serialize(hosts)}");
+                return Results.Json(registered, statusCode: StatusCodes.Status201Created);
+            }
+            catch (Microsoft.Data.Sqlite.SqliteException error)
+            {
+                log($"failed oauth stage=register reason=storage detail={JsonSerializer.Serialize(error.Message)}");
+                return Results.Json(new { error = "server_error", error_description = "The registration could not be stored; try again." },
+                    statusCode: StatusCodes.Status500InternalServerError);
+            }
+        });
+    }
+
+    private static IResult RegistrationError(string error, string description) =>
+        Results.Json(new { error, error_description = description }, statusCode: StatusCodes.Status400BadRequest);
+
+    // Listed: the redirect_uri is in oauth.redirect_uris, or it is one a registered client registered. Any other https
+    // callback is accepted for the static client as well, but it is never sent an error redirect before the password has
+    // been accepted. Registered and ClientName describe a client that registered itself through /register.
     private sealed record AuthorizeRequest(string ClientId, string RedirectUri, bool Listed, string? State,
-        string? Challenge, string? ChallengeMethod, string? Scope, string? Resource);
+        string? Challenge, string? ChallengeMethod, string? Scope, string? Resource, bool Registered, string? ClientName);
 
     private static void MapAuthorize(WebApplication app, CodexishRuntime runtime, Action<string> log)
     {
@@ -181,7 +232,15 @@ public static class CodexishHost
                 return Results.Content(LoginForm(parsed!, retryNonce, "Incorrect password."),
                     "text/html; charset=utf-8", statusCode: StatusCodes.Status401Unauthorized);
             }
-            string code = runtime.Tokens.IssueCode(parsed!.ClientId, parsed.RedirectUri, parsed.Challenge,
+            // A registered client that has signed in is never evicted or removed by age. A failed write is logged; the
+            // sign-in itself still succeeds, and the client's live tokens protect it as well.
+            if (parsed!.Registered)
+                try { runtime.Clients.MarkSignedIn(parsed.ClientId); }
+                catch (Microsoft.Data.Sqlite.SqliteException error)
+                {
+                    log($"failed oauth stage=authorize reason=sign_in_time_not_recorded client_id={parsed.ClientId} detail={JsonSerializer.Serialize(error.Message)}");
+                }
+            string code = runtime.Tokens.IssueCode(parsed.ClientId, parsed.RedirectUri, parsed.Challenge,
                 parsed.Resource ?? Audience(runtime, request));
             runtime.Store.Event("oauth_code_issued", parsed.ClientId,
                 new { redirect_uri = parsed.RedirectUri, listed = parsed.Listed, pkce = parsed.Challenge is not null });
@@ -202,21 +261,41 @@ public static class CodexishHost
     {
         var oauth = runtime.Config.OAuth;
         // client_id and redirect_uri are validated before anything is redirected anywhere.
-        if (string.IsNullOrEmpty(clientId) || !string.Equals(clientId, oauth.ClientId, StringComparison.Ordinal))
+        bool configured = !string.IsNullOrEmpty(clientId) && string.Equals(clientId, oauth.ClientId, StringComparison.Ordinal);
+        ClientRow? registered = configured ? null : runtime.Clients.Find(clientId);
+        if (!configured && registered is null)
         {
             log($"rejected oauth stage=authorize reason=unknown_client offered_client_id={JsonSerializer.Serialize(clientId ?? "")}");
-            return (null, Results.Content(ErrorPage("Unknown client_id. Check the connector configuration."),
+            return (null, Results.Content(ErrorPage("Unknown client_id. Check the connector configuration, or connect it again so it can register."),
                 "text/html; charset=utf-8", statusCode: StatusCodes.Status400BadRequest));
         }
-        bool listed = !string.IsNullOrEmpty(redirectUri) && oauth.RedirectUris.Contains(redirectUri, StringComparer.Ordinal);
-        if (!listed && !IsHttpsCallback(redirectUri))
+        bool listed;
+        if (registered is not null)
         {
-            // The offered value is logged so a callback that is not https can be listed with --redirect-uri.
-            log($"rejected oauth stage=authorize reason=redirect_uri_mismatch offered_redirect_uri={JsonSerializer.Serialize(redirectUri ?? "")}");
-            runtime.Store.Event("oauth_rejected", "authorize", new { reason = "redirect_uri_mismatch", offered = redirectUri });
-            return (null, Results.Content(ErrorPage(
-                "redirect_uri must be an absolute https URI without a fragment. The offered value was logged; a callback that is not https has to be listed with --redirect-uri when you run --init."),
-                "text/html; charset=utf-8", statusCode: StatusCodes.Status400BadRequest));
+            // A registered client chose its callbacks itself, so only those are accepted, exactly as registered.
+            listed = !string.IsNullOrEmpty(redirectUri) && registered.RedirectUris.Contains(redirectUri, StringComparer.Ordinal);
+            if (!listed)
+            {
+                log($"rejected oauth stage=authorize reason=redirect_uri_not_registered client_id={registered.ClientId} " +
+                    $"offered_redirect_uri={JsonSerializer.Serialize(redirectUri ?? "")}");
+                runtime.Store.Event("oauth_rejected", "authorize", new { reason = "redirect_uri_not_registered", client_id = registered.ClientId, offered = redirectUri });
+                return (null, Results.Content(ErrorPage(
+                    "redirect_uri is not one of the redirect_uris this client registered. Connect the client again so it registers its current callback."),
+                    "text/html; charset=utf-8", statusCode: StatusCodes.Status400BadRequest));
+            }
+        }
+        else
+        {
+            listed = !string.IsNullOrEmpty(redirectUri) && oauth.RedirectUris.Contains(redirectUri, StringComparer.Ordinal);
+            if (!listed && !IsHttpsCallback(redirectUri))
+            {
+                // The offered value is logged so a callback that is not https can be listed with --redirect-uri.
+                log($"rejected oauth stage=authorize reason=redirect_uri_mismatch offered_redirect_uri={JsonSerializer.Serialize(redirectUri ?? "")}");
+                runtime.Store.Event("oauth_rejected", "authorize", new { reason = "redirect_uri_mismatch", offered = redirectUri });
+                return (null, Results.Content(ErrorPage(
+                    "redirect_uri must be an absolute https URI without a fragment. The offered value was logged; a callback that is not https has to be listed with --redirect-uri when you run --init."),
+                    "text/html; charset=utf-8", statusCode: StatusCodes.Status400BadRequest));
+            }
         }
         // A listed callback receives the remaining errors as OAuth error redirects. Any other https callback sees them
         // on the local error page: redirecting there before the password is accepted would make /authorize an
@@ -234,24 +313,24 @@ public static class CodexishHost
             log("rejected oauth stage=authorize reason=unsupported_code_challenge_method");
             return (null, Fail("invalid_request", "code_challenge_method must be S256."));
         }
+        // Without a secret, PKCE is the only thing that binds the code to the client that asked for it.
+        if (registered is not null && ClientRegistry.IsPublic(registered) && string.IsNullOrEmpty(challenge))
+        {
+            log($"rejected oauth stage=authorize reason=pkce_required_for_public_client client_id={registered.ClientId}");
+            return (null, Fail("invalid_request", "A public client must send a code_challenge with code_challenge_method=S256."));
+        }
         if (!listed) log($"accepted oauth redirect_uri outside configured list host={Destination(redirectUri!)}");
         // Neither the requested scope nor the resource indicator refuses a request: the grant is always mcp for
         // <public_url>/mcp.
         NoteResource(resource, issuer, log);
-        return (new AuthorizeRequest(clientId, redirectUri!, listed, state, string.IsNullOrEmpty(challenge) ? null : challenge,
-            challengeMethod, scope, string.IsNullOrEmpty(resource) ? null : resource), null);
+        return (new AuthorizeRequest(clientId!, redirectUri!, listed, state, string.IsNullOrEmpty(challenge) ? null : challenge,
+            challengeMethod, scope, string.IsNullOrEmpty(resource) ? null : resource, registered is not null, registered?.Name), null);
     }
 
     private static bool IsHttpsCallback(string? value) =>
         Uri.TryCreate(value, UriKind.Absolute, out var uri) && uri.Scheme == Uri.UriSchemeHttps && uri.Fragment.Length == 0;
 
-    // Punycode rather than Unicode, so a look-alike name cannot pass for the host it imitates.
-    private static string Destination(string redirectUri)
-    {
-        if (!Uri.TryCreate(redirectUri, UriKind.Absolute, out var uri)) return redirectUri;
-        string host = uri.HostNameType == UriHostNameType.IPv6 ? uri.Host : uri.IdnHost;
-        return uri.IsDefaultPort ? host : $"{host}:{uri.Port}";
-    }
+    private static string Destination(string redirectUri) => ClientRegistry.Host(redirectUri);
 
     private static void NoteResource(string? resource, string origin, Action<string> log)
     {
@@ -287,10 +366,11 @@ public static class CodexishHost
         button{margin-top:12px;width:100%;padding:10px;border:0;border-radius:8px;background:#18181b;color:#fff;font-size:15px}
         .dest{margin:0 0 16px;padding:10px 12px;border:1px solid #d4d4d8;border-radius:8px;background:#fafafa;font-size:13px;color:#3f3f46}
         .dest strong{display:block;margin-top:2px;font-size:18px;color:#18181b;overflow-wrap:anywhere}
+        .who{margin:0 0 8px;color:#18181b;font-size:14px;overflow-wrap:anywhere}
         .err{color:#b91c1c;font-size:13px;margin-bottom:12px}</style></head><body>
         <form method="post" action="/authorize">
         <h1>CODEXish</h1><p>Sign in to connect this Windows PC.</p>
-        <div class="dest">After sign-in you will return to <strong>{{Encode(Destination(request.RedirectUri))}}</strong></div>
+        {{Requester(request)}}<div class="dest">After sign-in you will return to <strong>{{Encode(Destination(request.RedirectUri))}}</strong></div>
         {{Message(message)}}
         <input type="password" name="password" autocomplete="current-password" autofocus required>
         <input type="hidden" name="response_type" value="code">
@@ -308,6 +388,11 @@ public static class CodexishHost
     private static string Message(string? message) =>
         message is null ? "" : $"<div class=\"err\">{Encode(message)}</div>";
 
+    // The name a registered client gave itself. Anyone can register any name, so the destination host below it stays
+    // the thing to check.
+    private static string Requester(AuthorizeRequest request) => !request.Registered ? "" :
+        $"<p class=\"who\"><strong>{Encode(request.ClientName ?? "An unnamed client")}</strong> wants to connect to this PC.</p>";
+
     private static string ErrorPage(string message) => $"""
         <!doctype html><html lang="en"><head><meta charset="utf-8"><title>CODEXish</title></head>
         <body style="font:16px system-ui;padding:24px"><h1 style="font-size:18px">Authorization refused</h1>
@@ -322,7 +407,8 @@ public static class CodexishHost
             if (!request.HasFormContentType) return TokenError("invalid_request", "Use application/x-www-form-urlencoded.");
             var form = await request.ReadFormAsync();
             var oauth = runtime.Config.OAuth;
-            if (!ClientAuthenticated(request, form, oauth, out string clientReason))
+            var (client, clientReason) = AuthenticateClient(runtime, request, form);
+            if (client is null)
             {
                 log($"rejected oauth stage=token reason={clientReason}");
                 runtime.Store.Event("oauth_rejected", "token", new { reason = clientReason });
@@ -345,15 +431,23 @@ public static class CodexishHost
                     log("rejected oauth stage=token reason=redirect_uri_mismatch");
                     return TokenError("invalid_grant", "redirect_uri does not match the authorization request.");
                 }
-                if (!string.Equals(code.ClientId, oauth.ClientId, StringComparison.Ordinal))
+                if (!string.Equals(code.ClientId, client.Id, StringComparison.Ordinal))
+                {
+                    log("rejected oauth stage=token reason=code_issued_to_other_client");
                     return TokenError("invalid_grant", "The code was issued to a different client.");
+                }
+                if (client.Public && code.Challenge is null)
+                {
+                    log("rejected oauth stage=token reason=pkce_required_for_public_client");
+                    return TokenError("invalid_grant", "A public client's code must carry a PKCE challenge.");
+                }
                 // Delta 8: PKCE is mandatory exactly when the authorization request carried a challenge.
                 if (!Tokens.VerifyPkce(code.Challenge, form["code_verifier"].ToString()))
                 {
                     log("rejected oauth stage=token reason=pkce_verification_failed");
                     return TokenError("invalid_grant", "code_verifier does not match the code_challenge.");
                 }
-                return Issue(runtime, oauth, audience, code.Challenge is not null, Tokens.NewFamily(), null);
+                return Issue(runtime, oauth, client.Id, audience, code.Challenge is not null, Tokens.NewFamily(), null);
             }
             if (grant == "refresh_token")
             {
@@ -364,24 +458,30 @@ public static class CodexishHost
                     log($"rejected oauth stage=token reason=refresh_{reason}");
                     return TokenError("invalid_grant", $"The refresh token is {reason}.");
                 }
+                if (!string.Equals(row.ClientId, client.Id, StringComparison.Ordinal))
+                {
+                    log("rejected oauth stage=token reason=refresh_token_of_other_client");
+                    return TokenError("invalid_grant", "The refresh token was issued to a different client.");
+                }
                 // Neither rotated nor consumed: rotation's replay revocation disconnected the connector whenever a
-                // refresh response was lost in the tunnel or two refreshes raced. The client secret required above
-                // keeps a leaked refresh token useless on its own.
+                // refresh response was lost in the tunnel or two refreshes raced. A confidential client's secret, required
+                // above, keeps a leaked refresh token useless on its own.
                 runtime.Tokens.Renew(refresh);
-                return Issue(runtime, oauth, audience, row.PkceUsed, row.Family, refresh);
+                return Issue(runtime, oauth, client.Id, audience, row.PkceUsed, row.Family, refresh);
             }
             return TokenError("unsupported_grant_type", "Use authorization_code or refresh_token.");
         });
     }
 
-    // A refresh grant hands back the refresh token it presented; only the authorization code grant creates one.
-    private static IResult Issue(CodexishRuntime runtime, OAuthConfig oauth, string audience, bool pkceUsed,
+    // A refresh grant hands back the refresh token it presented; only the authorization code grant creates one. Every
+    // token carries the client it was issued to.
+    private static IResult Issue(CodexishRuntime runtime, OAuthConfig oauth, string clientId, string audience, bool pkceUsed,
         string family, string? refresh)
     {
         var now = DateTimeOffset.UtcNow;
         var accessLifetime = TimeSpan.FromHours(oauth.AccessTokenHours);
-        string access = runtime.Tokens.Issue("access", oauth.ClientId, audience, now + accessLifetime, pkceUsed, family);
-        refresh ??= runtime.Tokens.Issue("refresh", oauth.ClientId, audience, Tokens.RefreshExpiry(oauth, now), pkceUsed, family);
+        string access = runtime.Tokens.Issue("access", clientId, audience, now + accessLifetime, pkceUsed, family);
+        refresh ??= runtime.Tokens.Issue("refresh", clientId, audience, Tokens.RefreshExpiry(oauth, now), pkceUsed, family);
         return Results.Json(new
         {
             access_token = access,
@@ -395,10 +495,15 @@ public static class CodexishHost
     private static IResult TokenError(string error, string description, int status = StatusCodes.Status400BadRequest) =>
         Results.Json(new { error, error_description = description }, statusCode: status);
 
-    // A client_id that is present, in the form or in Basic credentials, must be this client's. Without one, the secret
-    // alone identifies the single configured client. The secret is always required.
-    private static bool ClientAuthenticated(HttpRequest request, IFormCollection form, OAuthConfig oauth, out string reason)
+    private sealed record TokenClient(string Id, bool Public);
+
+    // The static client: a client_id that is present must be its own, and without one the secret alone identifies it;
+    // its secret is always required. A registered confidential client needs its client_id and its own secret (Basic or
+    // form); a registered public client sends its client_id and no secret, and PKCE binds its code instead. An unknown
+    // or removed client fails.
+    private static (TokenClient? Client, string Reason) AuthenticateClient(CodexishRuntime runtime, HttpRequest request, IFormCollection form)
     {
+        var oauth = runtime.Config.OAuth;
         string? basicId = null;
         string secret;
         string header = request.Headers.Authorization.ToString();
@@ -406,23 +511,29 @@ public static class CodexishHost
         {
             string decoded;
             try { decoded = Encoding.UTF8.GetString(Convert.FromBase64String(header[6..].Trim())); }
-            catch (FormatException) { reason = "malformed_basic_credentials"; return false; }
+            catch (FormatException) { return (null, "malformed_basic_credentials"); }
             int separator = decoded.IndexOf(':');
-            if (separator < 0) { reason = "malformed_basic_credentials"; return false; }
+            if (separator < 0) return (null, "malformed_basic_credentials");
             basicId = Uri.UnescapeDataString(decoded[..separator]);
             secret = Uri.UnescapeDataString(decoded[(separator + 1)..]);
         }
         else secret = form["client_secret"].ToString();
-        foreach (string? offered in new[] { basicId, form["client_id"].ToString() })
-            if (!string.IsNullOrEmpty(offered) && !string.Equals(offered, oauth.ClientId, StringComparison.Ordinal))
-            {
-                reason = "unknown_client";
-                return false;
-            }
-        if (secret.Length == 0) { reason = "missing_client_secret"; return false; }
-        if (!Tokens.SecretMatches(oauth.ClientSecret, secret)) { reason = "wrong_client_secret"; return false; }
-        reason = "ok";
-        return true;
+        string formId = form["client_id"].ToString();
+        if (!string.IsNullOrEmpty(basicId) && formId.Length > 0 && !string.Equals(basicId, formId, StringComparison.Ordinal))
+            return (null, "conflicting_client_id");
+        string clientId = !string.IsNullOrEmpty(basicId) ? basicId : formId;
+        if (clientId.Length == 0 || string.Equals(clientId, oauth.ClientId, StringComparison.Ordinal))
+        {
+            if (secret.Length == 0) return (null, "missing_client_secret");
+            if (!Tokens.SecretMatches(oauth.ClientSecret, secret)) return (null, "wrong_client_secret");
+            return (new TokenClient(oauth.ClientId, false), "ok");
+        }
+        var registered = runtime.Clients.Find(clientId);
+        if (registered is null) return (null, "unknown_client");
+        if (ClientRegistry.IsPublic(registered)) return (new TokenClient(registered.ClientId, true), "ok");
+        if (secret.Length == 0) return (null, "missing_client_secret");
+        if (!ClientRegistry.SecretMatches(registered, secret)) return (null, "wrong_client_secret");
+        return (new TokenClient(registered.ClientId, false), "ok");
     }
 
     // D11. Never reachable through the tunnel Host, never an MCP tool.
@@ -461,13 +572,24 @@ public static class CodexishHost
             new { killed = runtime.Processes.KillSessionChildren(), scope = "lifetime=session processes started by this server" }));
         app.MapPost("/control/revoke-tokens", (HttpContext context) => Guard(context, () =>
             new { revoked = runtime.Tokens.RevokeAll(), note = "Every issued access and refresh token is now invalid." }));
+        app.MapPost("/control/remove-clients", (HttpContext context) => Guard(context, () =>
+        {
+            var (removed, revoked) = runtime.Clients.RemoveAll();
+            return new
+            {
+                removed, revoked,
+                note = "Every client that registered itself is removed and its tokens are revoked; the configured client is unchanged. " +
+                       "A connector registers again the next time it connects."
+            };
+        }));
         app.MapGet("/control/status", (HttpContext context) => Guard(context, () => new
         {
             paused = runtime.Ledger.Paused,
             processes = runtime.Processes.Live.Select(runtime.Processes.Describe),
             roots = runtime.Config.Roots.Select(r => new { r.Id, r.Path, r.Read, r.Write, r.Shell }),
             state_dir = runtime.Config.StateDir,
-            authentication = runtime.AuthDisabled ? "disabled" : "oauth_bearer"
+            authentication = runtime.AuthDisabled ? "disabled" : "oauth_bearer",
+            registered_clients = runtime.Clients.Describe()
         }));
     }
 }

@@ -29,13 +29,14 @@ public sealed class AccessPolicy
         host.IndexOfAny([':', '/', '\\', '*', '@', '?', '#']) < 0 &&
         Uri.CheckHostName(host) is UriHostNameType.Dns or UriHostNameType.IPv4;
 
-    public string? RejectionReason(HttpRequest request)
+    // checkOrigin false: only the Host allowlist applies, for an endpoint that is public by design (client registration).
+    public string? RejectionReason(HttpRequest request, bool checkOrigin = true)
     {
         string host;
         try { host = request.Host.Host; }
         catch (FormatException) { return "invalid_host"; }
         if (!hosts.Contains(host)) return "host_not_allowed";
-        if (!request.Headers.ContainsKey("Origin")) return null;
+        if (!checkOrigin || !request.Headers.ContainsKey("Origin")) return null;
         string? normalized = NormalizeOrigin(request.Headers.Origin.ToString());
         if (normalized is null) return "invalid_origin";
         if (origins.Contains(normalized)) return null;

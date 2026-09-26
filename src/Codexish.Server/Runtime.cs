@@ -20,6 +20,7 @@ public sealed class CodexishRuntime : IDisposable
     public ProcessSupervisor Processes { get; }
     public GitService Git { get; }
     public Tokens Tokens { get; }
+    public ClientRegistry Clients { get; }
     public BrowserMounts Browsers { get; }
     public bool AuthDisabled { get; }
     public string HooksDirectory { get; }
@@ -73,6 +74,7 @@ public sealed class CodexishRuntime : IDisposable
             Processes = new ProcessSupervisor(Store, Artifacts, config);
             Git = new GitService(config, Workspace, Artifacts, Store, HooksDirectory);
             Tokens = new Tokens(Store, config);
+            Clients = new ClientRegistry(Store, config);
             Browsers = new BrowserMounts(this);
             RecoveredInvocations = Store.RecoverInvocations();
             RecoveredProcesses = Processes.Recover();

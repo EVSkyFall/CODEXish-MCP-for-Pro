@@ -103,39 +103,67 @@ cloudflared tunnel --url http://127.0.0.1:<port>
 Its `https://….trycloudflare.com` URL changes on every start, so each time `public_url` and `allow_hosts` in
 `codexish.json` must be updated (or `--init` rerun) and the connector registered again.
 
-### Connect the ChatGPT connector
+### Connect ChatGPT
+
+1. In ChatGPT, open **Settings → Security and login** and turn on **Developer mode**.
+2. Open **ChatGPT Plugins**, choose **+**, and enter a name, a description and the MCP URL `<public_url>/mcp`.
+3. ChatGPT registers itself with this server through Dynamic Client Registration (RFC 7591) and opens the CODEXish
+   sign-in page. Check the host it names, then sign in with your CODEXish password, not your OpenAI password.
+
+If a dialog offers manual OAuth client fields instead, enter the static client from `codexish.json`; it keeps working
+next to registered clients.
 
 | Field | Value |
 | --- | --- |
-| MCP endpoint | `<public_url>/mcp` |
+| MCP URL | `<public_url>/mcp` |
+| Registration | `<public_url>/register`, advertised as `registration_endpoint`; client ID metadata documents (CIMD) are not offered |
 | Authorization URL | `<public_url>/authorize` |
 | Token URL | `<public_url>/token` |
-| Client ID | `codexish-chatgpt` (from `codexish.json`) |
-| Client secret | printed by `--init`, stored in `codexish.json`; required on every token request |
+| Manual client ID | `codexish-chatgpt` (from `codexish.json`) |
+| Manual client secret | printed by `--init`, stored in `codexish.json`; required on every token request of the static client |
 | Scope | any value, or none; the server always grants `mcp`, its only scope |
-| Callback | any absolute `https` URI without a fragment; one that is not https must be listed in `oauth.redirect_uris` |
-| PKCE | S256, required whenever the client sends a `code_challenge` |
+| Callback | a registered client: exactly one of the `redirect_uris` it registered; the static client: any absolute `https` URI without a fragment, and one that is not https must be listed in `oauth.redirect_uris` |
+| PKCE | S256; required for a registered public client, and whenever a client sends a `code_challenge` |
 | Refresh | the refresh token is kept, not rotated, and does not expire (`oauth.refresh_token_days` 0); access tokens last `oauth.access_token_hours` (12) |
 
-Signing in opens a single password form served by this server. It names the host the browser returns to, for
-example "After sign-in you will return to chatgpt.com"; check it before you type the password. For a callback
-outside `oauth.redirect_uris`, errors before the password is accepted stay on that local page instead of being
-redirected, and the server logs `accepted oauth redirect_uri outside configured list host=<host>`. A refused
-callback is logged as `rejected oauth stage=authorize reason=redirect_uri_mismatch offered_redirect_uri="..."`. One
-that is not https can be added to `oauth.redirect_uris` in `codexish.json`, or passed as `--redirect-uri` when you run
-`--init`; one with a fragment is never a valid OAuth callback. The token request must repeat the callback of its
-sign-in. A `resource` parameter never causes a refusal: tokens are always issued for `<public_url>/mcp`, and a value
-on another origin is logged as `oauth resource differs from public origin value=...`. Every authorization redirect
-carries `iss`, the metadata says so (`authorization_response_iss_parameter_supported`), and the protected-resource
-document is served at both `/.well-known/oauth-protected-resource` and `/.well-known/oauth-protected-resource/mcp`.
+`POST /register` takes `redirect_uris` (absolute https without a fragment, or http on `localhost`, `127.0.0.1` or
+`[::1]`), `token_endpoint_auth_method` (`client_secret_basic` when absent, `client_secret_post`, or `none` for a
+public client; any other value is replaced by `client_secret_basic` and the response says so) and `client_name`;
+other metadata is ignored. It answers `201` with a `dcr_…` client ID and, unless the client is public, a client
+secret that never expires; the server keeps only its hash. Registering needs no token, so anyone who can reach the
+URL can register, but a registration alone gets nothing: a code is issued only after your password. Registrations
+that never complete a sign-in are anonymous state, so only the newest 1,000 are kept (the oldest unused go first)
+and retention removes them after `output_days`; a client that has signed in stays until you remove it.
+`/control/status` and the tray status list the registered clients (name, method, creation, last sign-in and callback
+hosts, never a secret). **Remove registered clients** in the tray, or `/control/remove-clients`, removes them all and
+revokes their tokens; ChatGPT registers again the next time it connects.
 
-At the token endpoint a `client_id` that is present must match; without one, the client secret (form field or Basic
-credentials) identifies the single configured client. The secret is always required, so a leaked refresh token is
-useless on its own, and refresh tokens are therefore kept instead of rotated: a refresh response lost in the tunnel,
-or two refreshes racing, no longer disconnect the connector. A positive `oauth.refresh_token_days` is still honored,
-counted from the token's last refresh. Configuration files written before this change contain
-`"refresh_token_days": 30`; set it to `0` for refresh tokens that never expire. **Revoke all tokens** in the tray, or
-`/control/revoke-tokens`, ends every access and refresh token.
+Signing in opens a single password form served by this server. For a registered client it shows the name the client
+gave itself ("ChatGPT wants to connect to this PC", or "An unnamed client"); anyone can register any name, so the
+line that matters is the host the browser returns to, for example "After sign-in you will return to chatgpt.com".
+Check it before you type the password. A registered client's callback must be one it registered; any other gets the
+local error page. For a callback of the static client outside `oauth.redirect_uris`, errors before the password is
+accepted stay on that local page instead of being redirected, and the server logs
+`accepted oauth redirect_uri outside configured list host=<host>`. A refused callback is logged as
+`rejected oauth stage=authorize reason=redirect_uri_mismatch offered_redirect_uri="..."`. One that is not https can
+be added to `oauth.redirect_uris` in `codexish.json`, or passed as `--redirect-uri` when you run `--init`; one with a
+fragment is never a valid OAuth callback. The token request must repeat the callback of its sign-in. A `resource`
+parameter never causes a refusal: tokens are always issued for `<public_url>/mcp`, and a value on another origin is
+logged as `oauth resource differs from public origin value=...`. Every authorization redirect carries `iss`, the
+metadata says so (`authorization_response_iss_parameter_supported`), and the protected-resource document is served
+at both `/.well-known/oauth-protected-resource` and `/.well-known/oauth-protected-resource/mcp`.
+
+At the token endpoint every client authenticates the way it registered: a confidential registered client with its
+`client_id` and its secret (Basic or form), a public one with its `client_id` and the PKCE `code_verifier`. For the
+static client a `client_id` that is present must match, and without one its secret (form field or Basic
+credentials) identifies it. Codes and tokens belong to the client that obtained them, a refresh must come from that
+client, and an unknown or removed client gets `invalid_client`. A confidential client's secret is always required,
+so a leaked refresh token is useless on its own, and refresh tokens are therefore kept instead of rotated for every
+client: a refresh response lost in the tunnel, or two refreshes racing, no longer disconnect the connector. A
+positive `oauth.refresh_token_days` is still honored, counted from the token's last refresh. Configuration files
+written before this change contain `"refresh_token_days": 30`; set it to `0` for refresh tokens that never expire.
+**Revoke all tokens** in the tray, or `/control/revoke-tokens`, ends every access and refresh token and keeps the
+registrations.
 
 ### ChatGPT Project custom instructions
 
@@ -162,6 +190,7 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:3000/control/pause         
 Invoke-RestMethod -Method Post -Uri http://127.0.0.1:3000/control/resume        -Headers @{ "X-Codexish-Control" = $t }
 Invoke-RestMethod -Method Post -Uri http://127.0.0.1:3000/control/kill-children -Headers @{ "X-Codexish-Control" = $t }
 Invoke-RestMethod -Method Post -Uri http://127.0.0.1:3000/control/revoke-tokens -Headers @{ "X-Codexish-Control" = $t }
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:3000/control/remove-clients -Headers @{ "X-Codexish-Control" = $t }
 Invoke-RestMethod -Method Get  -Uri http://127.0.0.1:3000/control/status        -Headers @{ "X-Codexish-Control" = $t }
 ```
 
@@ -198,8 +227,8 @@ CODEXish deletes its own old state, never your roots, files or Git history:
 ```
 
 About a minute after start and then every 6 hours, artifacts (command output and stored reads), finished ledger
-entries, events, exited processes with their output, expired or revoked tokens, older checkpoints and the tray's log
-files older than `output_days` are deleted; pre-edit backups, quarantined ledgers and `codexish.json.broken-*` copies
+entries, events, exited processes with their output, expired or revoked tokens, older checkpoints, client
+registrations that never completed a sign-in and the tray's log files older than `output_days` are deleted; pre-edit backups, quarantined ledgers and `codexish.json.broken-*` copies
 older than `backup_days` are deleted. A missing section means these defaults, and `0` keeps that state forever.
 Running and reattachable processes, queued or running operations, the newest checkpoint, live tokens and browser
 profiles are never deleted, and neither is an exited process whose job still holds a running descendant, nor its
@@ -307,9 +336,9 @@ in progress. If stopping the owned tunnel fails, the server stops anyway and the
 own. The icon's tooltip shows whether each part is running, retrying (with a short cause) or stopped, and every
 failure and restart is in the connection log with its cause.
 
-The menu also offers status with roots and processes, pause and resume, stopping session children, revoking all
-tokens, the connection log, **Open configuration folder**, and **Edit roots and grants**, which stops the server and
-saves the file. The connection log window shows the latest 5,000 lines; every line, redacted the same way, is also
+The menu also offers status with roots, processes and registered clients, pause and resume, stopping session
+children, revoking all tokens, **Remove registered clients**, the connection log, **Open configuration folder**, and
+**Edit roots and grants**, which stops the server and saves the file. The connection log window shows the latest 5,000 lines; every line, redacted the same way, is also
 appended to `<state_dir>\logs\tray-<yyyyMMdd>.log`, which the window names and retention removes after
 `output_days`.
 
@@ -365,8 +394,9 @@ grandchild spawned in that moment can escape it (starting suspended would close 
 walks are read whole rather than streamed; continuation cursors for `fs_read`, artifacts and search, and binding
 each cursor to the identity of what it pages through, are incomplete; stored artifacts are not re-verified against
 their hash; backend schemas that use `$dynamicRef` are not rebased; the foreground confirmation window of desktop
-actions is unchanged; and desktop actions on UAC prompts, the secure desktop and higher-integrity windows are
-refused.
+actions is unchanged; desktop actions on UAC prompts, the secure desktop and higher-integrity windows are refused;
+and OAuth client ID metadata documents (CIMD) are not implemented, so clients register through `/register` or use
+the static client.
 
 ## P0 probe
 

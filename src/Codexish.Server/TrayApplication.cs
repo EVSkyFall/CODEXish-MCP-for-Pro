@@ -246,6 +246,7 @@ public static class TrayApplication
             Add("Resume changes", async () => { await Controller().ControlAsync("resume"); });
             Add("Stop session children", async () => { await Controller().ControlAsync("kill-children"); });
             Add("Revoke all tokens", async () => { await Controller().ControlAsync("revoke-tokens"); });
+            Add("Remove registered clients", async () => { await Controller().ControlAsync("remove-clients"); });
             Add("Edit roots and grants", EditRoots);
             Add("Connection log", () =>
             {

@@ -581,6 +581,18 @@ internal static class HardeningTests
         Token("revoked-undated", "refresh", DateTimeOffset.MaxValue.ToString("o"), 1, null);
         Token("live-access", "access", now.AddHours(1).ToString("o"), 0, null);
         Token("kept-refresh", "refresh", old, 0, null);
+        // Client registrations (pass 4): only an old one that never signed in and holds no live token goes.
+        string Registration(string created, string? signedIn)
+        {
+            string id = ClientRegistry.Prefix + Guid.NewGuid().ToString("N");
+            Sql("INSERT INTO clients(client_id,secret_hash,redirect_uris,auth_method,name,created_at,last_signed_in_at) VALUES($id,NULL,'[\"https://ok.example/cb\"]','none',NULL,$c,$s)",
+                ("$id", id), ("$c", created), ("$s", signedIn));
+            return id;
+        }
+        string unusedOld = Registration(old, null), signedInOld = Registration(old, old), unusedRecent = Registration(recent, null);
+        string holdsToken = Registration(old, null);
+        Sql("INSERT INTO tokens(hash,kind,client_id,audience,expires_at,revoked,pkce_used,family,scope,revoked_at) VALUES('client-live',$k,$c,'a',$e,0,1,'','mcp',NULL)",
+            ("$k", "refresh"), ("$c", holdsToken), ("$e", DateTimeOffset.MaxValue.ToString("o")));
         string Artifact(string id, string when, bool file = true)
         {
             string path = Path.Combine(runtime.Artifacts.Directory, id + ".bin");
@@ -657,6 +669,9 @@ internal static class HardeningTests
         Check(store.Token("expired-access") is null && store.Token("revoked-old") is null && store.Token("revoked-undated") is not null &&
               store.Token("live-access") is not null && store.Token("kept-refresh") is not null,
             "expired and revoked tokens past output_days are removed; live tokens and a kept refresh token stay");
+        Check(store.Client(unusedOld) is null && store.Client(signedInOld) is not null && store.Client(unusedRecent) is not null &&
+              store.Client(holdsToken) is not null,
+            "a client registration that never signed in goes after output_days; signed-in, recent and token-holding registrations stay");
         Check(store.Process("proc_exited_old") is null && !File.Exists(exitedOutput) && store.Process("proc_running_old") is not null &&
               File.Exists(runningOutput) && store.Process("proc_exited_recent") is not null && File.Exists(recentOutput),
             "an exited process past output_days goes with its output, while a running process and a recent exit keep theirs");

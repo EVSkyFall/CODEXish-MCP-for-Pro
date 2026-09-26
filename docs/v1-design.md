@@ -230,8 +230,8 @@ cannot be read is contained to that row. Diagnostic events are best-effort: one 
 stderr and never aborts startup, a call or a process.
 
 **Decision: CODEXish's own state is cleaned by age.** `retention.output_days` (30) covers artifacts, finished
-ledger rows, events, exited processes with their output, expired or revoked tokens, older checkpoints and tray
-logs; `retention.backup_days` (90) covers pre-edit backups, quarantined ledgers and unreadable configuration copies;
+ledger rows, events, exited processes with their output, expired or revoked tokens, older checkpoints, client
+registrations that never signed in (and hold no live token) and tray logs; `retention.backup_days` (90) covers pre-edit backups, quarantined ledgers and unreadable configuration copies;
 0 keeps forever. A sweep runs about a minute after start and every 6 hours, deletes rows in small batches without
 VACUUM, and never touches running or reattachable processes, queued or running operations, the newest checkpoint,
 live tokens, browser profiles or anything in a root. Because `state_dir` may lie inside a root, a file is deleted
@@ -261,10 +261,10 @@ form would be rejected as cross-origin.
 nothing, the grant is `mcp`, the token response says `scope: "mcp"`, the scope is stored on the token row, and
 `/mcp` refuses a token that does not carry it. Refusing a scope only ever disconnected a client.
 
-**Decision: refresh tokens of this confidential client are neither rotated nor expired by default.** A refresh
-validates the presented token (known, not revoked, not expired, audience matching), issues a new access token and
-returns the same refresh token. The client secret is required at `/token`, so a leaked refresh token alone is
-useless, while rotation's replay revocation permanently disconnected the connector whenever a refresh response was
+**Decision: refresh tokens are neither rotated nor expired by default, for every client.** A refresh validates the
+presented token (known, not revoked, not expired, audience matching, issued to the client that presents it), issues a
+new access token and returns the same refresh token. A confidential client's secret is required at `/token`, so a
+leaked refresh token alone is useless, while rotation's replay revocation permanently disconnected the connector whenever a refresh response was
 lost in the tunnel or two refreshes raced. `oauth.refresh_token_days` defaults to 0 (no expiry); a positive value is
 honored and counted from the token's last refresh. Refresh tokens stored under the earlier rotating scheme keep
 working, and `revoke-tokens` still revokes every token.
@@ -281,9 +281,29 @@ requires the redirect_uri of the authorization request.
 
 **Decision: authentication is a built-in single-user OAuth 2.1 authorization server on the same listener — no
 external IdP — with `S256` PKCE, opaque 32-byte tokens stored only as SHA-256 hashes with an audience and an
-expiry, a refresh token that is kept rather than rotated, and both `client_secret_post` and `client_secret_basic`.**
-A `client_id` that is present at `/token` must match; without one, the secret alone identifies the single client.
-No `openid-configuration` is served, because no id_token is issued.
+expiry, a refresh token that is kept rather than rotated, `client_secret_post` and `client_secret_basic`, and public
+clients (`none`) with PKCE.** For the static client a `client_id` that is present at `/token` must match, and without
+one its secret alone identifies it. No `openid-configuration` is served, because no id_token is issued.
+
+**Decision: clients may register themselves through Dynamic Client Registration (RFC 7591), and client ID metadata
+documents are not offered.** ChatGPT Plugins documents only CIMD and DCR for client registration, tries CIMD first
+when a server offers it, and needs `registration_endpoint` otherwise; advertising a half-done CIMD would make it skip
+DCR. `POST /register` is public (no bearer token, no Origin requirement; the Host allowlist applies) and answers
+`201` with a `dcr_<32 hex>` client ID. `redirect_uris` is required: absolute https without a fragment, or http on
+`localhost`, `127.0.0.1` or `[::1]` (RFC 8252); a bad entry is `400 invalid_redirect_uri` naming it.
+`client_secret_basic` (the default) and `client_secret_post` receive a secret stored only as a hash, `none` makes a
+public client, and any other method is replaced by `client_secret_basic` in the response. Grant and response types
+are always answered as `authorization_code`/`refresh_token` and `code`; unknown metadata is ignored; `client_name`
+loses control and formatting characters and is cut to 200 characters. At `/authorize` a registered client's
+`redirect_uri` must equal one it registered, a public client must send an S256 `code_challenge`, errors before the
+password go to that registered callback with `iss`, and the sign-in page shows the self-declared name above the
+destination host. At `/token` a confidential client authenticates with its own secret, a public one with its
+`client_id` and a PKCE verifier; codes, access tokens and refresh tokens belong to the client that obtained them, and
+an unknown or removed client is `invalid_client`. A client that has signed in is never removed automatically, and
+`revoke-tokens` keeps registrations. Registrations that never signed in are anonymous, internet-reachable state:
+only the newest 1,000 are kept (the oldest go first) and retention removes them after `output_days`; neither step
+can select a client that has signed in or holds a live token. `/control/remove-clients` and the tray's **Remove
+registered clients** remove every registered client and revoke its tokens. The static client is unchanged.
 
 **Decision: a request to `/mcp` without a valid bearer token is `401` with
 `WWW-Authenticate: Bearer resource_metadata="<public_url>/.well-known/oauth-protected-resource"`, and both
@@ -304,7 +324,7 @@ events table.**
 **Decision: `--no-auth` is accepted only when `allow_hosts` is empty.** The listener is loopback-only and the
 access policy always allows loopback hosts, so an empty allow list really does mean nothing but this machine.
 
-**Decision: `/control/pause`, `/resume`, `/kill-children`, `/revoke-tokens` and `/control/status` are accepted
+**Decision: `/control/pause`, `/resume`, `/kill-children`, `/revoke-tokens`, `/remove-clients` and `/control/status` are accepted
 only when the connection's remote address is loopback and the `Host` header is loopback and the request carries
 `X-Codexish-Control: <control_token>`.** The control API is not an MCP tool and is not reachable through the
 tunnel Host.

@@ -35,6 +35,7 @@ internal static partial class HttpTests
             await Scopes(http, runtime, config, password, rejected);
             await Resources(http, runtime, config, password, rejected);
             await ConcurrentRefresh(http, config, password);
+            await DynamicRegistration(http, runtime, config, password, rejected);
             Configuration(config);
             Check(ServerConfig.NoAuthRefusal(config) is { Length: > 0 },
                 "--no-auth is refused while a public host is allowed");
@@ -164,6 +165,258 @@ internal static partial class HttpTests
         }
         Check(results.All(r => r.Status == HttpStatusCode.OK && r.Refresh == refresh) && results.Select(r => r.Access).Distinct().Count() == 4,
             $"four concurrent refreshes with one refresh token all succeed and hand the same refresh token back ({results.Count(r => r.Status == HttpStatusCode.OK)} of 4)");
+    }
+
+    // Pass 4: RFC 7591 registration for connectors that register themselves (ChatGPT Plugins), next to the unchanged
+    // static client.
+    private static async Task DynamicRegistration(HttpClient http, CodexishRuntime runtime, ServerConfig config, string password,
+        List<string> rejected)
+    {
+        var server = JsonDocument.Parse(await http.GetStringAsync("/.well-known/oauth-authorization-server")).RootElement;
+        Check(server.GetProperty("registration_endpoint").GetString() == config.PublicUrl + "/register" &&
+              server.GetProperty("token_endpoint_auth_methods_supported").EnumerateArray().Select(m => m.GetString())
+                  .SequenceEqual(["client_secret_basic", "client_secret_post", "none"]) &&
+              !server.TryGetProperty("client_id_metadata_document_supported", out _),
+            "the metadata advertises the registration endpoint and public clients, and no client ID metadata documents");
+
+        async Task<(HttpStatusCode Status, JsonElement Body, string? CacheControl)> Register(string json, string? host = null, string? origin = null)
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Post, "/register") { Content = new StringContent(json, Encoding.UTF8, "application/json") };
+            if (host is not null) request.Headers.Host = host;
+            if (origin is not null) request.Headers.Add("Origin", origin);
+            using var response = await http.SendAsync(request);
+            string text = await response.Content.ReadAsStringAsync();
+            return (response.StatusCode, text.Length == 0 ? default : JsonDocument.Parse(text).RootElement.Clone(), response.Headers.CacheControl?.ToString());
+        }
+        static string[] Strings(JsonElement array) => array.EnumerateArray().Select(e => e.GetString()!).ToArray();
+        const string ChatGpt = "https://chatgpt.com/connector_platform_oauth_redirect";
+        const string Loopback = "http://127.0.0.1:33418/callback";
+
+        var confidential = await Register($$"""
+            { "client_name": "ChatGPT", "redirect_uris": ["{{ChatGpt}}"], "token_endpoint_auth_method": "client_secret_post",
+              "grant_types": ["implicit"], "response_types": ["token"], "scope": "everything", "logo_uri": "https://logo.test/x.png",
+              "software_statement": 42 }
+            """, origin: "https://chatgpt.com");
+        var registered = confidential.Body;
+        string confidentialId = registered.GetProperty("client_id").GetString()!;
+        string confidentialSecret = registered.GetProperty("client_secret").GetString()!;
+        Check(confidential.Status == HttpStatusCode.Created && Regex.IsMatch(confidentialId, "^dcr_[0-9a-f]{32}$") && confidentialSecret.Length >= 40 &&
+              registered.GetProperty("client_secret_expires_at").GetInt64() == 0 &&
+              Math.Abs(registered.GetProperty("client_id_issued_at").GetInt64() - DateTimeOffset.UtcNow.ToUnixTimeSeconds()) < 600 &&
+              registered.GetProperty("token_endpoint_auth_method").GetString() == "client_secret_post" &&
+              Strings(registered.GetProperty("redirect_uris")).SequenceEqual([ChatGpt]) &&
+              Strings(registered.GetProperty("grant_types")).SequenceEqual(["authorization_code", "refresh_token"]) &&
+              Strings(registered.GetProperty("response_types")).SequenceEqual(["code"]) &&
+              registered.GetProperty("client_name").GetString() == "ChatGPT" && confidential.CacheControl == "no-store",
+            "a confidential client registers (201) with a dcr_ id, a secret that never expires and the fixed grant and response types");
+        Check(!registered.TryGetProperty("scope", out _) && !registered.TryGetProperty("logo_uri", out _) &&
+              !registered.TryGetProperty("software_statement", out _),
+            "unknown registration metadata is ignored");
+        Check(runtime.Store.Client(confidentialId) is { LastSignedInAt: null } stored && stored.SecretHash == Tokens.HashToken(confidentialSecret),
+            "the registered secret is stored only as a hash");
+
+        var publicClient = await Register($$"""{ "redirect_uris": ["{{Loopback}}", "http://localhost/cb", "http://[::1]:8080/cb"], "token_endpoint_auth_method": "none" }""");
+        string publicId = publicClient.Body.GetProperty("client_id").GetString()!;
+        Check(publicClient.Status == HttpStatusCode.Created && publicClient.Body.GetProperty("token_endpoint_auth_method").GetString() == "none" &&
+              !publicClient.Body.TryGetProperty("client_secret", out _) && !publicClient.Body.TryGetProperty("client_secret_expires_at", out _) &&
+              !publicClient.Body.TryGetProperty("client_name", out _) && runtime.Store.Client(publicId)!.SecretHash is null,
+            "a public client registers without a secret, with http callbacks on 127.0.0.1, localhost and [::1]");
+
+        var plainHttp = await Register("""{ "redirect_uris": ["https://ok.example/cb", "http://example.com/cb"] }""");
+        Check(plainHttp.Status == HttpStatusCode.BadRequest && plainHttp.Body.GetProperty("error").GetString() == "invalid_redirect_uri" &&
+              plainHttp.Body.GetProperty("error_description").GetString()!.Contains("\"http://example.com/cb\"", StringComparison.Ordinal),
+            "an http callback that is not on a loopback host is refused with invalid_redirect_uri naming the entry");
+        var fragment = await Register("""{ "redirect_uris": ["https://ok.example/cb#part"] }""");
+        var missing = await Register("""{ "client_name": "no callbacks" }""");
+        var notJson = await Register("not json");
+        Check(fragment.Status == HttpStatusCode.BadRequest && fragment.Body.GetProperty("error").GetString() == "invalid_redirect_uri" &&
+              missing.Status == HttpStatusCode.BadRequest && missing.Body.GetProperty("error").GetString() == "invalid_redirect_uri" &&
+              notJson.Status == HttpStatusCode.BadRequest && notJson.Body.GetProperty("error").GetString() == "invalid_client_metadata",
+            "a callback with a fragment, missing redirect_uris and a body that is not JSON are refused");
+        Check(!ClientRegistry.IsRegistrableRedirect("https://ok.example/cb#") && !ClientRegistry.IsRegistrableRedirect("http://127.0.0.2/cb") &&
+              !ClientRegistry.IsRegistrableRedirect("javascript:alert(1)") && !ClientRegistry.IsRegistrableRedirect("/relative") &&
+              ClientRegistry.IsRegistrableRedirect("http://localhost:8080/cb") && ClientRegistry.IsRegistrableRedirect("https://chatgpt.com/cb?x=1"),
+            "registrable callbacks are absolute https without a fragment, or http on the three loopback names only");
+
+        var substituted = await Register("""{ "redirect_uris": ["https://ok.example/cb"], "token_endpoint_auth_method": "private_key_jwt", "client_name": "Tool\u0000‮ Name" }""");
+        Check(substituted.Status == HttpStatusCode.Created && substituted.Body.GetProperty("token_endpoint_auth_method").GetString() == "client_secret_basic" &&
+              substituted.Body.TryGetProperty("client_secret", out _) && substituted.Body.GetProperty("client_name").GetString() == "Tool Name",
+            "an unsupported auth method is replaced by client_secret_basic and reported, and control and formatting characters leave the name");
+        Check(ClientRegistry.CleanName(new string('n', 250))!.Length == ClientRegistry.NameLength && ClientRegistry.CleanName("\u0001 \u0002") is null &&
+              ClientRegistry.CleanName(new string('n', 199) + "\U0001F600") == new string('n', 199),
+            "a client name keeps at most 200 characters without splitting a surrogate pair, and an empty one is no name");
+        var foreignHost = await Register($$"""{ "redirect_uris": ["{{ChatGpt}}"] }""", host: "attacker.invalid");
+        Check(foreignHost.Status == HttpStatusCode.Forbidden,
+            "registration needs no bearer token and no matching Origin, while the Host allowlist still applies");
+
+        string Query(string clientId, string redirect, string? challenge) =>
+            $"/authorize?response_type=code&client_id={clientId}&redirect_uri={Uri.EscapeDataString(redirect)}&state=dcr-state&scope=mcp" +
+            (challenge is null ? "" : $"&code_challenge={challenge}&code_challenge_method=S256");
+        async Task<string> Code(string clientId, string redirect, string? challenge)
+        {
+            string page = await http.GetStringAsync(Query(clientId, redirect, challenge));
+            var fields = new Dictionary<string, string>
+            {
+                ["response_type"] = "code", ["client_id"] = clientId, ["redirect_uri"] = redirect, ["state"] = "dcr-state",
+                ["code_challenge"] = challenge ?? "", ["code_challenge_method"] = challenge is null ? "" : "S256", ["scope"] = "mcp",
+                ["resource"] = "", ["nonce"] = NonceField().Match(page).Groups[1].Value, ["password"] = password
+            };
+            using var granted = await http.PostAsync("/authorize", new FormUrlEncodedContent(fields));
+            var location = granted.Headers.Location ?? throw new InvalidOperationException($"sign-in did not redirect: HTTP {(int)granted.StatusCode}");
+            var parsed = QueryHelpers.ParseQuery(location.Query);
+            if (location.GetLeftPart(UriPartial.Path) != redirect || parsed["iss"].ToString() != config.PublicUrl || parsed["state"].ToString() != "dcr-state")
+                throw new InvalidOperationException("sign-in redirected somewhere else: " + location);
+            return parsed["code"].ToString();
+        }
+
+        string form = await http.GetStringAsync(Query(confidentialId, ChatGpt, null));
+        Check(form.Contains("<strong>ChatGPT</strong> wants to connect to this PC.", StringComparison.Ordinal) &&
+              form.Contains("After sign-in you will return to <strong>chatgpt.com</strong>", StringComparison.Ordinal),
+            "the sign-in page names the registered client above the host it returns to");
+        using (var other = await http.GetAsync(Query(confidentialId, "https://chatgpt.com/another/callback", null)))
+            Check(other.StatusCode == HttpStatusCode.BadRequest && other.Headers.Location is null &&
+                  rejected.Any(l => l.Contains("reason=redirect_uri_not_registered", StringComparison.Ordinal)),
+                "a callback the registered client did not register gets the local error page and no redirect");
+        using (var unknown = await http.GetAsync(Query("dcr_" + new string('0', 32), ChatGpt, null)))
+            Check(unknown.StatusCode == HttpStatusCode.BadRequest && unknown.Headers.Location is null,
+                "an unknown client id gets the local error page and no redirect");
+        using (var noPkce = await http.GetAsync(Query(publicId, Loopback, null)))
+        {
+            var target = noPkce.Headers.Location;
+            var parsed = target is null ? null : QueryHelpers.ParseQuery(target.Query);
+            Check(noPkce.StatusCode is HttpStatusCode.Redirect or HttpStatusCode.Found && target!.GetLeftPart(UriPartial.Path) == Loopback &&
+                  parsed!["error"].ToString() == "invalid_request" && parsed["iss"].ToString() == config.PublicUrl && !parsed.ContainsKey("code"),
+                "a public client without PKCE is refused with an error redirect to its registered callback that carries iss");
+        }
+        string unnamed = await http.GetStringAsync(Query(publicId, Loopback, "unused-challenge"));
+        Check(unnamed.Contains("<strong>An unnamed client</strong> wants to connect to this PC.", StringComparison.Ordinal) &&
+              unnamed.Contains("<strong>127.0.0.1:33418</strong>", StringComparison.Ordinal),
+            "a client without a name is shown as an unnamed client");
+
+        async Task<(HttpStatusCode Status, JsonElement Body)> Token(Dictionary<string, string> fields, string? basic = null)
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Post, "/token") { Content = new FormUrlEncodedContent(fields) };
+            if (basic is not null) request.Headers.Authorization = new AuthenticationHeaderValue("Basic", Convert.ToBase64String(Encoding.UTF8.GetBytes(basic)));
+            using var response = await http.SendAsync(request);
+            return (response.StatusCode, JsonDocument.Parse(await response.Content.ReadAsStringAsync()).RootElement.Clone());
+        }
+        static Dictionary<string, string> Exchange(string code, string redirect, string? clientId, string? secret = null, string? verifier = null)
+        {
+            var fields = new Dictionary<string, string> { ["grant_type"] = "authorization_code", ["code"] = code, ["redirect_uri"] = redirect };
+            if (clientId is not null) fields["client_id"] = clientId;
+            if (secret is not null) fields["client_secret"] = secret;
+            if (verifier is not null) fields["code_verifier"] = verifier;
+            return fields;
+        }
+        static Dictionary<string, string> Refresh(string token, string clientId, string? secret)
+        {
+            var fields = new Dictionary<string, string> { ["grant_type"] = "refresh_token", ["refresh_token"] = token, ["client_id"] = clientId };
+            if (secret is not null) fields["client_secret"] = secret;
+            return fields;
+        }
+        static string? ErrorOf(JsonElement body) => body.TryGetProperty("error", out var e) ? e.GetString() : null;
+
+        string confidentialCode = await Code(confidentialId, ChatGpt, null);
+        Check(runtime.Store.Client(confidentialId)!.LastSignedInAt is not null, "a completed sign-in records the client's last sign-in time");
+        var withoutSecret = await Token(Exchange(confidentialCode, ChatGpt, confidentialId));
+        Check(withoutSecret.Status == HttpStatusCode.Unauthorized && ErrorOf(withoutSecret.Body) == "invalid_client",
+            "a confidential registered client cannot exchange its code without its secret");
+        var withSecret = await Token(Exchange(confidentialCode, ChatGpt, confidentialId, confidentialSecret));
+        string confidentialAccess = withSecret.Body.GetProperty("access_token").GetString()!;
+        string confidentialRefresh = withSecret.Body.GetProperty("refresh_token").GetString()!;
+        Check(withSecret.Status == HttpStatusCode.OK && runtime.Store.Token(Tokens.HashToken(confidentialAccess))!.ClientId == confidentialId &&
+              runtime.Store.Token(Tokens.HashToken(confidentialRefresh))!.ClientId == confidentialId &&
+              await McpStatus(http, confidentialAccess) == HttpStatusCode.OK,
+            "with its secret the same code exchanges, and both tokens are bound to the registered client");
+        var viaBasic = await Token(Exchange(await Code(confidentialId, ChatGpt, null), ChatGpt, null), $"{confidentialId}:{confidentialSecret}");
+        var secretOnly = await Token(Exchange(await Code(confidentialId, ChatGpt, null), ChatGpt, null, confidentialSecret));
+        Check(viaBasic.Status == HttpStatusCode.OK && secretOnly.Status == HttpStatusCode.Unauthorized && ErrorOf(secretOnly.Body) == "invalid_client",
+            "a registered client may authenticate with Basic credentials, but its secret without its client_id is not accepted");
+
+        string verifier = ServerConfig.NewSecret(48);
+        string challenge = ServerConfig.Base64Url(SHA256.HashData(Encoding.UTF8.GetBytes(verifier)));
+        var noVerifier = await Token(Exchange(await Code(publicId, Loopback, challenge), Loopback, publicId));
+        Check(noVerifier.Status == HttpStatusCode.BadRequest && ErrorOf(noVerifier.Body) == "invalid_grant",
+            "a public client's exchange without the code_verifier fails");
+        var otherClient = await Token(Exchange(await Code(publicId, Loopback, challenge), Loopback, confidentialId, confidentialSecret, verifier));
+        Check(otherClient.Status == HttpStatusCode.BadRequest && ErrorOf(otherClient.Body) == "invalid_grant" &&
+              rejected.Any(l => l.Contains("reason=code_issued_to_other_client", StringComparison.Ordinal)),
+            "an authorization code only exchanges for the client that obtained it");
+        var publicTokens = await Token(Exchange(await Code(publicId, Loopback, challenge), Loopback, publicId, null, verifier));
+        string publicAccess = publicTokens.Body.GetProperty("access_token").GetString()!;
+        string publicRefresh = publicTokens.Body.GetProperty("refresh_token").GetString()!;
+        Check(publicTokens.Status == HttpStatusCode.OK && runtime.Store.Token(Tokens.HashToken(publicAccess)) is { PkceUsed: true } row &&
+              row.ClientId == publicId && await McpStatus(http, publicAccess) == HttpStatusCode.OK,
+            "a public client exchanges its code with the code_verifier and no secret");
+
+        var fromPublic = await Token(Refresh(confidentialRefresh, publicId, null));
+        var fromStatic = await Token(Refresh(confidentialRefresh, config.OAuth.ClientId, config.OAuth.ClientSecret));
+        var fromConfidential = await Token(Refresh(publicRefresh, confidentialId, confidentialSecret));
+        Check(new[] { fromPublic, fromStatic, fromConfidential }.All(r => r.Status == HttpStatusCode.BadRequest && ErrorOf(r.Body) == "invalid_grant") &&
+              rejected.Any(l => l.Contains("reason=refresh_token_of_other_client", StringComparison.Ordinal)),
+            "a refresh token is accepted only from the client it was issued to");
+        var concurrent = await Task.WhenAll(Enumerable.Range(0, 4).Select(_ => Token(Refresh(confidentialRefresh, confidentialId, confidentialSecret))));
+        var repeated = new[] { await Token(Refresh(publicRefresh, publicId, null)), await Token(Refresh(publicRefresh, publicId, null)) };
+        Check(concurrent.All(r => r.Status == HttpStatusCode.OK && r.Body.GetProperty("refresh_token").GetString() == confidentialRefresh) &&
+              concurrent.Select(r => r.Body.GetProperty("access_token").GetString()).Distinct().Count() == 4 &&
+              repeated.All(r => r.Status == HttpStatusCode.OK && r.Body.GetProperty("refresh_token").GetString() == publicRefresh),
+            "concurrent and repeated refreshes of registered clients keep working and hand the same refresh token back");
+
+        using (var request = new HttpRequestMessage(HttpMethod.Get, "/control/status"))
+        {
+            request.Headers.Add("X-Codexish-Control", config.ControlToken);
+            using var response = await http.SendAsync(request);
+            string text = await response.Content.ReadAsStringAsync();
+            var listed = JsonDocument.Parse(text).RootElement.GetProperty("registered_clients").EnumerateArray().ToArray();
+            var chatgpt = listed.Single(c => c.GetProperty("client_id").GetString() == confidentialId);
+            Check(response.StatusCode == HttpStatusCode.OK && chatgpt.GetProperty("name").GetString() == "ChatGPT" &&
+                  chatgpt.GetProperty("auth_method").GetString() == "client_secret_post" &&
+                  Strings(chatgpt.GetProperty("redirect_hosts")).SequenceEqual(["chatgpt.com"]) &&
+                  chatgpt.GetProperty("last_signed_in_at").ValueKind == JsonValueKind.String &&
+                  chatgpt.GetProperty("created_at").ValueKind == JsonValueKind.String &&
+                  listed.Any(c => c.GetProperty("client_id").GetString() == publicId) &&
+                  !text.Contains(confidentialSecret, StringComparison.Ordinal) &&
+                  !text.Contains(runtime.Store.Client(confidentialId)!.SecretHash!, StringComparison.Ordinal),
+                "the local status lists registered clients with name, method, times and callback hosts, and never a secret or its hash");
+        }
+
+        string staticRedirect = config.OAuth.RedirectUris[0];
+        var staticTokens = await Token(Exchange(await Authorize(http, config, password, staticRedirect, null), staticRedirect,
+            config.OAuth.ClientId, config.OAuth.ClientSecret));
+        string staticAccess = staticTokens.Body.GetProperty("access_token").GetString()!;
+        JsonElement removal;
+        using (var request = new HttpRequestMessage(HttpMethod.Post, "/control/remove-clients"))
+        {
+            request.Headers.Add("X-Codexish-Control", config.ControlToken);
+            using var response = await http.SendAsync(request);
+            removal = JsonDocument.Parse(await response.Content.ReadAsStringAsync()).RootElement.Clone();
+        }
+        var afterConfidential = await Token(Refresh(confidentialRefresh, confidentialId, confidentialSecret));
+        var afterPublic = await Token(Refresh(publicRefresh, publicId, null));
+        Check(removal.GetProperty("removed").GetInt32() == 3 && removal.GetProperty("revoked").GetInt32() >= 4 && runtime.Store.Clients().Count == 0 &&
+              await McpStatus(http, confidentialAccess) == HttpStatusCode.Unauthorized && await McpStatus(http, publicAccess) == HttpStatusCode.Unauthorized &&
+              afterConfidential.Status == HttpStatusCode.Unauthorized && ErrorOf(afterConfidential.Body) == "invalid_client" &&
+              afterPublic.Status == HttpStatusCode.Unauthorized && ErrorOf(afterPublic.Body) == "invalid_client" &&
+              await McpStatus(http, staticAccess) == HttpStatusCode.OK,
+            "removing registered clients ends their access and refresh tokens and leaves the configured client's tokens working");
+        using (var gone = await http.GetAsync(Query(confidentialId, ChatGpt, null)))
+            Check(gone.StatusCode == HttpStatusCode.BadRequest && gone.Headers.Location is null,
+                "a removed client has to register again before it can sign in");
+
+        // Anonymous registrations are bounded; a client that has signed in is never evicted. The limit is lowered here.
+        runtime.Clients.UnusedLimit = 3;
+        try
+        {
+            string used = (await Register($$"""{ "redirect_uris": ["{{ChatGpt}}"] }""")).Body.GetProperty("client_id").GetString()!;
+            await Code(used, ChatGpt, null);
+            List<string> unused = [];
+            for (int i = 0; i < 5; i++)
+                unused.Add((await Register($$"""{ "redirect_uris": ["https://ok.example/cb{{i}}"] }""")).Body.GetProperty("client_id").GetString()!);
+            var remaining = runtime.Store.Clients().Select(c => c.ClientId).ToHashSet(StringComparer.Ordinal);
+            Check(remaining.SetEquals([used, .. unused.Skip(2)]),
+                "beyond the limit the oldest unused registrations are evicted, while the newest ones and a signed-in client stay");
+        }
+        finally { runtime.Clients.UnusedLimit = ClientRegistry.DefaultUnusedLimit; }
     }
 
     private static void Configuration(ServerConfig existing)

@@ -219,7 +219,7 @@ public sealed class TrayController(ServerConfig config) : IAsyncDisposable
         try
         {
             if (app is null || Address is null) throw new InvalidOperationException("Start the server first.");
-            if (action is not ("status" or "pause" or "resume" or "kill-children" or "revoke-tokens")) throw new ArgumentException("Unknown local action.");
+            if (action is not ("status" or "pause" or "resume" or "kill-children" or "revoke-tokens" or "remove-clients")) throw new ArgumentException("Unknown local action.");
             using var client = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
             using var request = new HttpRequestMessage(action == "status" ? HttpMethod.Get : HttpMethod.Post, new Uri(Address, "/control/" + action));
             request.Headers.Add("X-Codexish-Control", config.ControlToken);
@@ -587,6 +587,8 @@ public static class TrayTests
             Check(!JsonDocument.Parse(await controller.ControlAsync("status")).RootElement.GetProperty("paused").GetBoolean(), "resume releases the hold");
             Check(JsonDocument.Parse(await controller.ControlAsync("kill-children")).RootElement.TryGetProperty("killed", out _), "stopping session children reaches the existing controller");
             Check(JsonDocument.Parse(await controller.ControlAsync("revoke-tokens")).RootElement.TryGetProperty("revoked", out _), "token revocation reaches the existing controller");
+            Check(JsonDocument.Parse(await controller.ControlAsync("remove-clients")).RootElement.TryGetProperty("removed", out _),
+                "removing registered clients reaches the existing controller");
             await controller.StopAsync();
             Check(!controller.Running && !controller.TunnelRunning, "stop disposes the host and runtime");
             await controller.StartAsync();
