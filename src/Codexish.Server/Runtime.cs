@@ -20,14 +20,35 @@ public sealed class CodexishRuntime : IDisposable
     public ProcessSupervisor Processes { get; }
     public GitService Git { get; }
     public Tokens Tokens { get; }
+    public ClientRegistry Clients { get; }
     public BrowserMounts Browsers { get; }
     public bool AuthDisabled { get; }
     public string HooksDirectory { get; }
     public IReadOnlyList<object> RecoveredProcesses { get; }
     public (int Cancelled, int Unknown) RecoveredInvocations { get; }
+    public Retention Retention { get; }
 
     private readonly FileStream instanceLock;
+    private readonly CancellationTokenSource sweeps = new();
+    private Task sweepLoop = Task.CompletedTask;
     private bool disposed;
+
+    // Everything that no longer stops the server but should be seen: configuration problems, a rebuilt ledger,
+    // failed migrations and ledger rows that could not be read.
+    public IReadOnlyList<string> Warnings
+    {
+        get
+        {
+            List<string> warnings = [.. Config.Warnings];
+            if (Store.Rebuilt is { } rebuilt)
+                warnings.Add($"The ledger database was unreadable at {rebuilt.At:o} ({rebuilt.Reason}); it was moved aside as " +
+                    $"{string.Join(", ", rebuilt.Quarantined)} and a fresh one was created. Issued tokens were lost, so ChatGPT must sign in again.");
+            warnings.AddRange(Store.MigrationErrors);
+            if (Store.MalformedRowsSkipped > 0)
+                warnings.Add($"{Store.MalformedRowsSkipped} ledger row(s) could not be read and were skipped.");
+            return warnings;
+        }
+    }
 
     public CodexishRuntime(ServerConfig config, bool authDisabled = false)
     {
@@ -42,19 +63,33 @@ public sealed class CodexishRuntime : IDisposable
         Directory.CreateDirectory(Path.Combine(config.StateDir, "backups"));
         instanceLock = new FileStream(Path.Combine(config.StateDir, "instance.lock"),
             FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
-        Store = new Store(Path.Combine(config.StateDir, "codexish.db"));
-        Workspace = new Workspace(config);
-        Artifacts = new Artifacts(Store, Path.Combine(config.StateDir, "artifacts"));
-        Ledger = new Ledger(Store);
-        Files = new FileService(Workspace, Artifacts, Store, config.StateDir);
-        Patches = new PatchService(Workspace, Files, Store);
-        Processes = new ProcessSupervisor(Store, Artifacts, config);
-        Git = new GitService(config, Workspace, Artifacts, Store, HooksDirectory);
-        Tokens = new Tokens(Store, config);
-        Browsers = new BrowserMounts(this);
-        RecoveredInvocations = Store.RecoverInvocations();
-        RecoveredProcesses = Processes.Recover();
-        Store.Event("server_start", null, new { version = ServerVersion, auth = authDisabled ? "disabled" : "oauth" });
+        try
+        {
+            Store = new Store(Path.Combine(config.StateDir, "codexish.db"));
+            Workspace = new Workspace(config);
+            Artifacts = new Artifacts(Store, Path.Combine(config.StateDir, "artifacts"));
+            Ledger = new Ledger(Store);
+            Files = new FileService(Workspace, Artifacts, Store, config.StateDir);
+            Patches = new PatchService(Workspace, Files, Store);
+            Processes = new ProcessSupervisor(Store, Artifacts, config);
+            Git = new GitService(config, Workspace, Artifacts, Store, HooksDirectory);
+            Tokens = new Tokens(Store, config);
+            Clients = new ClientRegistry(Store, config);
+            Browsers = new BrowserMounts(this);
+            RecoveredInvocations = Store.RecoverInvocations();
+            RecoveredProcesses = Processes.Recover();
+            Store.Event("server_start", null, new { version = ServerVersion, auth = authDisabled ? "disabled" : "oauth" });
+            Retention = new Retention(this);
+            sweepLoop = Task.Run(() => Retention.RunAsync(sweeps.Token));
+        }
+        catch
+        {
+            // A start that fails here releases the state directory, so the next attempt in this process is not
+            // refused by a lock this one still holds.
+            try { Store?.Dispose(); }
+            finally { instanceLock.Dispose(); }
+            throw;
+        }
     }
 
     // D14. The harness text a connector shows the model before it plans anything.
@@ -94,14 +129,22 @@ public sealed class CodexishRuntime : IDisposable
             os_isolated_execution = "none verified; no sandbox, job objects supervise lifetime only, not privilege",
             user_privilege_scope = "shell_run, process_start, builds, tests and any git hook run as the logged-in Windows user."
         },
-        roots = Config.Roots.Select(r => new { id = r.Id, path = r.Path, grants = new { r.Read, r.Write, r.Shell } }),
+        roots = Config.Roots.Select(r => new { id = r.Id, path = r.Path, exists = Directory.Exists(r.Path), grants = new { r.Read, r.Write, r.Shell } }),
+        warnings = Warnings,
         tools = ToolNames.Concat(Browsers.Tools.Select(t => t.ProtocolTool.Name)).ToArray(),
         browser = Browsers.Describe(),
         desktop = new { native_available = OperatingSystem.IsWindows(), coordinate_space = "virtual desktop physical pixels", uia_thread = "dedicated MTA", input_tick = "metadata only" },
         unsupported = Unsupported.Select(u => new { feature = u.Feature, reason = u.Reason }),
         limits = Limits.Describe(),
-        shell = new { @default = Config.Shell.Default, allowed = Config.Shell.Allowed },
-        git = new { path = Config.Git.Path, available = Git.Available, read_only = true, execution = GitService.Execution },
+        shell = new
+        {
+            @default = Config.Shell.Default, allowed = Config.Shell.Allowed, usable = Config.Shell.Usable,
+            used_without_shell = Config.Shell.EffectiveDefault,
+            interpreters = Config.Shell.Usable.ToDictionary(s => s, ProcessSupervisor.ResolveShell)
+        },
+        git = new { configured = Config.Git.Path, path = Git.Resolved, available = Git.Available, read_only = true, execution = GitService.Execution },
+        ledger_rebuilt = Store.Rebuilt is { } rebuilt ? new { at = rebuilt.At, quarantined = rebuilt.Quarantined, reason = rebuilt.Reason } : null,
+        retention = Retention.Describe(),
         redaction = Redaction.Disclosure,
         authentication = AuthDisabled ? "disabled (loopback development only)" : "built-in OAuth 2.1 with PKCE, opaque bearer tokens",
         paused = Ledger.Paused,
@@ -126,7 +169,11 @@ public sealed class CodexishRuntime : IDisposable
             is_git_repository = Directory.Exists(Path.Combine(r.Path, ".git")) || File.Exists(Path.Combine(r.Path, ".git"))
         }),
         state_dir = Config.StateDir,
-        state_dir_note = "Outside every root by construction: the ledger, backups and artifacts are not reachable through fs_* tools.",
+        state_dir_note = Config.Roots.Any(r => PathRules.IsInside(r.Path, Config.StateDir) || PathRules.IsInside(Config.StateDir, r.Path))
+            ? "state_dir overlaps a root, so the ledger, backups and artifacts are reachable through that root's tools; see warnings."
+            : "Outside every root: the ledger, backups and artifacts are not reachable through fs_* tools.",
+        warnings = Warnings,
+        git = new { path = Git.Resolved, available = Git.Available },
         execution_boundary = Reply.Boundary,
         processes = Processes.Live.Select(Processes.Describe),
         recorded_processes = Store.Processes().Select(p => new
@@ -140,11 +187,16 @@ public sealed class CodexishRuntime : IDisposable
         next_tool = "fs_list or git_status"
     };
 
+    // A stored checkpoint that is not valid JSON is reported as unreadable in this one response.
     public object? LatestCheckpoint()
     {
         var row = Store.LatestCheckpoint();
         if (row is null) return null;
-        return new { seq = row.Value.Seq, utc = row.Value.Utc, checkpoint = JsonDocument.Parse(row.Value.Json).RootElement.Clone() };
+        try { return new { seq = row.Value.Seq, utc = row.Value.Utc, checkpoint = JsonDocument.Parse(row.Value.Json).RootElement.Clone() }; }
+        catch (JsonException error)
+        {
+            return new { seq = row.Value.Seq, utc = row.Value.Utc, unreadable = true, error = "The stored checkpoint is not valid JSON: " + error.Message };
+        }
     }
 
     public CallToolResult Checkpoint(string goal, string completionCondition, string[] done, string[] remaining, string[] handles)
@@ -171,18 +223,42 @@ public sealed class CodexishRuntime : IDisposable
         "operation_cancel", "session_checkpoint", "computer_observe", "computer_query_ui", "computer_act"
     ];
 
+    // Every step runs even when an earlier one fails, and the store and the state-directory lock are released in
+    // nested finally blocks, so a later start in this process is never refused by a lock this one still holds. The
+    // first failure is rethrown once everything has run.
     public void Dispose()
     {
         if (disposed) return;
         disposed = true;
-        Browsers.Stop();
-        Ledger.Dispose();
-        Processes.Dispose();
-        // The thread pool keeps a caller's UI synchronization context from deadlocking the asynchronous disposal.
-        Task.Run(() => Browsers.DisposeAsync().AsTask()).GetAwaiter().GetResult();
-        if (desktop.IsValueCreated) desktop.Value.Dispose();
-        Store.Event("server_stop", null, new { });
-        Store.Dispose();
-        instanceLock.Dispose();
+        Exception? first = null;
+        void Step(Action action)
+        {
+            try { action(); }
+            catch (Exception error) { first ??= error; }
+        }
+        try
+        {
+            Step(sweeps.Cancel);
+            // A sweep in progress finishes its current statement set before the store closes.
+            Step(() =>
+            {
+                try { sweepLoop.GetAwaiter().GetResult(); }
+                catch (Exception) { /* a failed sweep was already reported */ }
+            });
+            Step(sweeps.Dispose);
+            Step(Browsers.Stop);
+            Step(Ledger.Dispose);
+            Step(Processes.Dispose);
+            // The thread pool keeps a caller's UI synchronization context from deadlocking the asynchronous disposal.
+            Step(() => Task.Run(() => Browsers.DisposeAsync().AsTask()).GetAwaiter().GetResult());
+            Step(() => { if (desktop.IsValueCreated) desktop.Value.Dispose(); });
+            Step(() => Store.Event("server_stop", null, new { }));
+        }
+        finally
+        {
+            try { Store.Dispose(); }
+            finally { instanceLock.Dispose(); }
+        }
+        if (first is not null) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(first).Throw();
     }
 }

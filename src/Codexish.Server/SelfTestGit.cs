@@ -112,6 +112,46 @@ internal static class GitTests
         Check(commits.Length == 1 && commits[0].GetProperty("subject").GetString() == "initial commit",
             "git_log returns real commit metadata");
 
+        // P11: GIT_* variables in the server's own environment never reach the product's git.
+        var inherited = new ProcessStartInfo(git);
+        inherited.Environment["GIT_DIR"] = "elsewhere";
+        inherited.Environment["GIT_PAGER"] = "pager";
+        GitService.PrepareEnvironment(inherited);
+        Check(inherited.Environment.Keys.Where(k => k.StartsWith("GIT_", StringComparison.OrdinalIgnoreCase)).SequenceEqual(["GIT_TERMINAL_PROMPT"]),
+            "product git runs drop every inherited GIT_* variable and set only GIT_TERMINAL_PROMPT");
+        string[] names = ["GIT_DIR", "GIT_WORK_TREE", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"];
+        var saved = names.ToDictionary(n => n, Environment.GetEnvironmentVariable);
+        try
+        {
+            Environment.SetEnvironmentVariable("GIT_DIR", Path.Combine(temp, "not-a-repository"));
+            Environment.SetEnvironmentVariable("GIT_WORK_TREE", temp);
+            Environment.SetEnvironmentVariable("GIT_CONFIG_COUNT", "1");
+            Environment.SetEnvironmentVariable("GIT_CONFIG_KEY_0", "core.pager");
+            Environment.SetEnvironmentVariable("GIT_CONFIG_VALUE_0", Posix(Path.Combine(traps, "pager.sh")));
+            var redirected = await tools.GitStatus("proj");
+            Check(Status(redirected) == "succeeded" && Data(redirected).GetProperty("branch").GetString() == "main" && Directory.GetFiles(markers).Length == 0,
+                "git_status ignores GIT_DIR, GIT_WORK_TREE and GIT_CONFIG_* set in the server's environment");
+        }
+        finally
+        {
+            foreach (var (name, value) in saved) Environment.SetEnvironmentVariable(name, value);
+        }
+
+        // P12: a git.path that no longer exists falls back to git found on PATH or in the Git install locations.
+        string configured = runtime.Config.Git.Path;
+        if (GitService.Locate(Path.Combine(temp, "moved", "git.exe")) is not null)
+        {
+            try
+            {
+                runtime.Config.Git.Path = Path.Combine(temp, "moved", "git.exe");
+                var moved = await tools.GitStatus("proj");
+                Check(Status(moved) == "succeeded" && Data(tools.HostCapabilities()).GetProperty("git").GetProperty("available").GetBoolean(),
+                    "a git.path that no longer exists falls back to the git found on PATH or in the install locations");
+            }
+            finally { runtime.Config.Git.Path = configured; }
+        }
+        else Skip("git fallback check: git is only reachable through git.path on this machine");
+
         // Delta 3a: ref and path come from the model, so option-like values are refused before git is started.
         int before = runtime.Store.Events("git").Count;
         Check(Error(await tools.GitDiff("proj", "--output=x", null, false)) == "INVALID_ARGUMENT", "git_diff refuses an --output= ref");

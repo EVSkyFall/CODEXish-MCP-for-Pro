@@ -44,6 +44,19 @@ public sealed class Artifacts(Store store, string directory)
     public FileStream OpenRead(string id) =>
         new(PathOf(id), FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
 
+    // A row whose bytes are gone, typically removed by retention while this call was on its way, is reported as
+    // expired rather than as a failure of the read.
+    private FileStream OpenStored(string id)
+    {
+        try { return OpenRead(id); }
+        catch (Exception error) when (error is FileNotFoundException or DirectoryNotFoundException)
+        {
+            throw new CodexishFault("ARTIFACT_EXPIRED",
+                $"The stored bytes of artifact '{id}' no longer exist: retention removes artifacts after output_days. Run the command that produced it again for fresh output.",
+                details: new { artifact_id = id });
+        }
+    }
+
     public long Length(string id)
     {
         var info = new FileInfo(PathOf(id));
@@ -81,7 +94,7 @@ public sealed class Artifacts(Store store, string directory)
     }
 
     public ArtifactRow Row(string id) => store.Artifact(id)
-        ?? throw new CodexishFault("NOT_FOUND", $"Unknown artifact_id '{id}'.");
+        ?? throw new CodexishFault("NOT_FOUND", $"Unknown artifact_id '{id}': it was never issued, or retention removed it after output_days.");
 
     public static string Cursor(int generation, long offset) =>
         ServerConfig.Base64Url(Encoding.UTF8.GetBytes($"a1.{generation}.{offset}"));
@@ -100,7 +113,7 @@ public sealed class Artifacts(Store store, string directory)
 
     public byte[] ReadBytes(string id, long offset, int count)
     {
-        using var stream = OpenRead(id);
+        using var stream = OpenStored(id);
         if (offset > stream.Length) return [];
         stream.Position = offset;
         byte[] buffer = new byte[Math.Min(count, Math.Max(0, stream.Length - offset))];
@@ -171,7 +184,7 @@ public sealed class Artifacts(Store store, string directory)
         if (from < 1) throw new CodexishFault("INVALID_ARGUMENT", "line_from is 1-based.");
         int last = to ?? int.MaxValue;
         if (last < from) throw new CodexishFault("INVALID_ARGUMENT", "line_to must not be smaller than line_from.");
-        using var stream = OpenRead(row.Id);
+        using var stream = OpenStored(row.Id);
         using var reader = new StreamReader(stream, new UTF8Encoding(false), true);
         var builder = new StringBuilder();
         int line = 0, returned = 0;
@@ -220,7 +233,7 @@ public sealed class Artifacts(Store store, string directory)
         int lineNumber = 0;
         bool more = false;
         long nextOffset = start;
-        using (var stream = OpenRead(id))
+        using (var stream = OpenStored(id))
         {
             foreach (var (text, lineStart, lineBytes) in TextSearch.Lines(stream))
             {

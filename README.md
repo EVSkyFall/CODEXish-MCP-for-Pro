@@ -17,12 +17,27 @@ Design decisions for v1 are in [docs/v1-design.md](docs/v1-design.md) and the sl
 
 ## v1 slice 1: coding core
 
-### Create a configuration
+### Install
+
+Publish a self-contained build once. The .NET runtime is bundled into the output folder, so running it later needs
+no SDK and no separately installed runtime:
 
 ```powershell
-dotnet run --project src/Codexish.Server -c Release -- --init `
+dotnet publish src/Codexish.Server -c Release -r win-x64 --self-contained true -o "$env:LOCALAPPDATA\Programs\Codexish"
+$codexish = "$env:LOCALAPPDATA\Programs\Codexish\Codexish.Server.exe"
+```
+
+To update, exit the tray (or stop the server) and publish again into the same folder.
+
+### Create a configuration
+
+The tray's first-run form does this for you (see [Tray](#tray-slice-4-windows)). From the command line:
+
+```powershell
+& $codexish --init `
   --password "<a password you choose>" `
   --public-url "https://<your-tunnel-host>" `
+  --port <port> `
   --root "proj=C:\Projects\Example"
 ```
 
@@ -31,38 +46,124 @@ secret and the loopback control token with `RandomNumberGenerator`, stores the p
 and puts the hostname from `--public-url` into `allow_hosts` and its origin into `allow_origins` (the tunnel
 terminates TLS, so the login form's own POST arrives with an https Origin over an http connection).
 `--public-url` must be https unless you run with `--no-auth`, because the access token would otherwise cross
-the tunnel in clear text. Roots may not overlap: one root per directory tree. Repeat `--root id=path` for more roots; each root
-grants read, write and shell unless you edit the file afterwards. `--state-dir` moves the ledger, artifacts and
-backups; it must stay outside every root or the server refuses to start. Add `--redirect-uri <uri>` (repeatable)
-if your connector's callback differs from the default ChatGPT one. **`--init` prints the client secret and the
-control token once. Treat both as passwords.**
+the tunnel in clear text. `--port` is the local listening port (default 3000). Repeat `--root id=path` for more
+roots; each root grants read, write and shell unless you edit the file afterwards. Roots may overlap or nest: each
+call uses the grants of the `root_id` it names, and changes to files reachable through several roots wait in one
+queue. `--state-dir` moves the ledger, artifacts and backups; keep it outside every root, because a root that
+contains it exposes them to that root's tools. Any https callback is accepted (see below), so
+`--redirect-uri <uri>` (repeatable) is only needed for a connector whose callback is not https.
+**`--init` prints the client secret and the control token once. Treat both as passwords.**
+
+Only a `port` outside 0-65535, an unusable `public_url`, an http `public_url` with authentication, `--no-auth`
+with a public host, and another server already running on the same `state_dir` still refuse to start. Everything
+else that is wrong in the file is skipped or replaced by its
+default and reported as a warning in the startup log and in `host_capabilities.warnings`: a root entry with a bad or
+duplicate id or no path is ignored; a root whose directory does not exist stays configured with `exists=false`, and
+calls on it fail until the directory exists, without a restart; a server with no usable root still serves the
+desktop tools; an `allow_hosts` or `allow_origins` entry that is not an exact hostname or origin is ignored; and
+`null` for any setting means that setting's default (an explicit empty `shell.allowed`, `[]`, still allows no shell).
+Saving (the tray's setup and **Edit roots and grants**) writes a temporary file and swaps it in, and keeps the
+previous version as `codexish.json.bak`. If `codexish.json` cannot be parsed, it is kept as
+`codexish.json.broken-<utc>` (`-2`, `-3` and so on when that name is taken) and a readable `codexish.json.bak` is
+loaded and restored in its place. If another program saved `codexish.json` in the meantime, nothing is overwritten:
+a readable new version is loaded instead, and otherwise the `.bak` is loaded without being restored.
 
 ### Run it
 
 ```powershell
-dotnet run --project src/Codexish.Server -c Release
-cloudflared tunnel --url http://127.0.0.1:3000
+& $codexish
 ```
 
 The listener is loopback only; the tunnel is what makes it reachable. Host and Origin checks are not
 authentication — the bearer token is. `--no-auth` is accepted only when `allow_hosts` is empty, that is, for
-loopback development.
+loopback development. To have the server start with Windows and restart by itself, use the
+[tray](#tray-slice-4-windows) with **Start with Windows**.
 
-### Connect the ChatGPT connector
+### Tunnel
+
+Use Tailscale Funnel as the persistent tunnel. Its `https://<machine>.<tailnet>.ts.net` address does not change, so
+it is the `--public-url` and the connector is registered once:
+
+```powershell
+tailscale set --unattended
+tailscale funnel --bg <port>
+```
+
+`--unattended` keeps Tailscale running while you are signed out, and `--bg` keeps the funnel configured across
+restarts. Disable key expiry for this machine in the Tailscale admin console, or it drops off the tailnet when its
+key expires. Give CODEXish a dedicated, uncommon local port: anything listening on the funneled port is published to
+the internet, including another program that takes the port while CODEXish is not running.
+
+For a trial, a cloudflared quick tunnel needs no account:
+
+```powershell
+cloudflared tunnel --url http://127.0.0.1:<port>
+```
+
+Its `https://….trycloudflare.com` URL changes on every start, so each time `public_url` and `allow_hosts` in
+`codexish.json` must be updated (or `--init` rerun) and the connector registered again.
+
+### Connect ChatGPT
+
+1. In ChatGPT, open **Settings → Security and login** and turn on **Developer mode**.
+2. Open **ChatGPT Plugins**, choose **+**, and enter a name, a description and the MCP URL `<public_url>/mcp`.
+3. ChatGPT registers itself with this server through Dynamic Client Registration (RFC 7591) and opens the CODEXish
+   sign-in page. Check the host it names, then sign in with your CODEXish password, not your OpenAI password.
+
+If a dialog offers manual OAuth client fields instead, enter the static client from `codexish.json`; it keeps working
+next to registered clients.
 
 | Field | Value |
 | --- | --- |
-| MCP endpoint | `<public_url>/mcp` |
+| MCP URL | `<public_url>/mcp` |
+| Registration | `<public_url>/register`, advertised as `registration_endpoint`; client ID metadata documents (CIMD) are not offered |
 | Authorization URL | `<public_url>/authorize` |
 | Token URL | `<public_url>/token` |
-| Client ID | `codexish-chatgpt` (from `codexish.json`) |
-| Client secret | printed by `--init`, stored in `codexish.json` |
-| Scope | `mcp` (the only scope this server issues) |
-| PKCE | S256, required whenever the client sends a `code_challenge` |
+| Manual client ID | `codexish-chatgpt` (from `codexish.json`) |
+| Manual client secret | printed by `--init`, stored in `codexish.json`; required on every token request of the static client |
+| Scope | any value, or none; the server always grants `mcp`, its only scope |
+| Callback | a registered client: exactly one of the `redirect_uris` it registered; the static client: any absolute `https` URI without a fragment, and one that is not https must be listed in `oauth.redirect_uris` |
+| PKCE | S256; required for a registered public client, and whenever a client sends a `code_challenge` |
+| Refresh | the refresh token is kept, not rotated, and does not expire (`oauth.refresh_token_days` 0); access tokens last `oauth.access_token_hours` (12) |
 
-Signing in opens a single password form served by this server. If the connector's callback is refused, the
-server prints `rejected oauth stage=authorize reason=redirect_uri_mismatch offered_redirect_uri="..."` — rerun
-`--init` with that value as `--redirect-uri`.
+`POST /register` takes `redirect_uris` (absolute https without a fragment, or http on `localhost`, `127.0.0.1` or
+`[::1]`), `token_endpoint_auth_method` (`client_secret_basic` when absent, `client_secret_post`, or `none` for a
+public client; any other value is replaced by `client_secret_basic` and the response says so) and `client_name`;
+other metadata is ignored. It answers `201` with a `dcr_…` client ID and, unless the client is public, a client
+secret that never expires; the server keeps only its hash. Registering needs no token, so anyone who can reach the
+URL can register, but a registration alone gets nothing: a code is issued only after your password. Registrations
+that never complete a sign-in are anonymous state, so only the newest 1,000 are kept (the oldest unused go first)
+and retention removes them after `output_days`; a client that has signed in stays until you remove it.
+`/control/status` and the tray status list the registered clients (name, method, creation, last sign-in and callback
+hosts, never a secret). **Remove registered clients** in the tray, or `/control/remove-clients`, removes them all and
+revokes their tokens; ChatGPT registers again the next time it connects.
+
+Signing in opens a single password form served by this server. For a registered client it shows the name the client
+gave itself ("ChatGPT wants to connect to this PC", or "An unnamed client"); anyone can register any name, so the
+line that matters is the host the browser returns to, for example "After sign-in you will return to chatgpt.com".
+Check it before you type the password. A registered client's callback must be one it registered; any other gets the
+local error page. For a callback of the static client outside `oauth.redirect_uris`, errors before the password is
+accepted stay on that local page instead of being redirected, and the server logs
+`accepted oauth redirect_uri outside configured list host=<host>`. A refused callback is logged as
+`rejected oauth stage=authorize reason=redirect_uri_mismatch offered_redirect_uri="..."`. One that is not https can
+be added to `oauth.redirect_uris` in `codexish.json`, or passed as `--redirect-uri` when you run `--init`; one with a
+fragment is never a valid OAuth callback. The token request must repeat the callback of its sign-in. A `resource`
+parameter never causes a refusal: tokens are always issued for `<public_url>/mcp`, and a value on another origin is
+logged as `oauth resource differs from public origin value=...`. Every authorization redirect carries `iss`, the
+metadata says so (`authorization_response_iss_parameter_supported`), and the protected-resource document is served
+at both `/.well-known/oauth-protected-resource` and `/.well-known/oauth-protected-resource/mcp`.
+
+At the token endpoint every client authenticates the way it registered: a confidential registered client with its
+`client_id` and its secret (Basic or form), a public one with its `client_id` and the PKCE `code_verifier`. For the
+static client a `client_id` that is present must match, and without one its secret (form field or Basic
+credentials) identifies it. Codes and tokens belong to the client that obtained them, a refresh must come from that
+client, and an unknown or removed client gets `invalid_client`. A confidential client's secret is always required,
+so a leaked refresh token is useless on its own, and refresh tokens are therefore kept instead of rotated for every
+client: a refresh response lost in the tunnel, or two refreshes racing, no longer disconnect the connector. A
+positive `oauth.refresh_token_days` is still honored, counted from the token's last refresh. Configuration files
+written before this change contain `"refresh_token_days": 30`; set it to `0` for refresh tokens that never expire.
+**Revoke all tokens** in the tray, or `/control/revoke-tokens`, ends every access and refresh token and keeps the
+registrations.
 
 ### ChatGPT Project custom instructions
 
@@ -80,7 +181,8 @@ Paste this into the Project's custom instructions so the harness text survives a
 ### Local control
 
 The control API answers only when the connection is loopback, the `Host` header is loopback, and the request
-carries the control token. It is never reachable through the tunnel and it is not an MCP tool.
+carries the control token. It is never reachable through the tunnel and it is not an MCP tool. The examples use the
+default port 3000; use your configured `port`.
 
 ```powershell
 $t = (Get-Content "$env:LOCALAPPDATA\Codexish\codexish.json" | ConvertFrom-Json).control_token
@@ -88,11 +190,57 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:3000/control/pause         
 Invoke-RestMethod -Method Post -Uri http://127.0.0.1:3000/control/resume        -Headers @{ "X-Codexish-Control" = $t }
 Invoke-RestMethod -Method Post -Uri http://127.0.0.1:3000/control/kill-children -Headers @{ "X-Codexish-Control" = $t }
 Invoke-RestMethod -Method Post -Uri http://127.0.0.1:3000/control/revoke-tokens -Headers @{ "X-Codexish-Control" = $t }
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:3000/control/remove-clients -Headers @{ "X-Codexish-Control" = $t }
 Invoke-RestMethod -Method Get  -Uri http://127.0.0.1:3000/control/status        -Headers @{ "X-Codexish-Control" = $t }
 ```
 
 Pause is a hold, not a refusal: while paused, a write is accepted into its queue and returned as `queued` with
 `paused: true`, reads keep working, and the queue drains on resume.
+
+### Shells and Git
+
+A `command` string without `shell` runs in `shell.default`. The supported shells are `pwsh`, `powershell` (Windows
+PowerShell 5.1) and `cmd`, and new configurations allow all three; `shell.allowed` stays your own policy, so a shell
+that is not in it is refused. `pwsh` is looked up on every call: on `PATH`, then the newest
+`%ProgramFiles%\PowerShell\*\pwsh.exe`, then Windows PowerShell. Every result names the `interpreter` that ran the
+command. Unsupported names in `shell.allowed` are ignored with a warning, and a `shell.default` that is not allowed
+falls back to the first allowed shell.
+
+Git is looked up on every call as well: `git.path` when that file exists, then `git` on `PATH`, then
+`%ProgramFiles%\Git\cmd\git.exe`, then `%LOCALAPPDATA%\Programs\Git\cmd\git.exe`, so a moved or upgraded Git keeps
+working without editing the file. `host_capabilities` and `workspace_info` report the path in use. Git runs without
+any `GIT_*` variable inherited from the server's environment.
+
+### Ledger and retention
+
+The ledger is the SQLite database `codexish.db` in `state_dir`. If SQLite reports it as damaged or not a database at
+startup (including `PRAGMA quick_check`), it and its `-wal`, `-shm` and `-journal` files are renamed to
+`ledger.corrupt-<utc>.*`, a fresh database is created and `host_capabilities.ledger_rebuilt` says so. **The fresh
+ledger has no tokens, so the ChatGPT connector has to sign in again.** Brief lock or I/O errors from other programs
+are retried within the normal command timeout, schema upgrades at startup included, and a row that cannot be read
+affects only the response that needed it.
+
+CODEXish deletes its own old state, never your roots, files or Git history:
+
+```json
+"retention": { "output_days": 30, "backup_days": 90 }
+```
+
+About a minute after start and then every 6 hours, artifacts (command output and stored reads), finished ledger
+entries, events, exited processes with their output, expired or revoked tokens, older checkpoints, client
+registrations that never completed a sign-in and the tray's log files older than `output_days` are deleted; pre-edit backups, quarantined ledgers and `codexish.json.broken-*` copies
+older than `backup_days` are deleted. A missing section means these defaults, and `0` keeps that state forever.
+Running and reattachable processes, queued or running operations, the newest checkpoint, live tokens and browser
+profiles are never deleted, and neither is an exited process whose job still holds a running descendant, nor its
+output, until that descendant ends. A failed step is retried at the next sweep; `host_capabilities.retention` shows
+the settings and the last sweep.
+
+Only files carrying the names CODEXish gives them are deleted: `art_<id>.bin` in `artifacts`, `<id>.bak` in
+`backups`, `tray-<yyyyMMdd>.log` in `logs`, `ledger.corrupt-<utc>.db` (and its sidecars) in `state_dir`, and
+`codexish.json.broken-<utc>` next to the configuration. Any other file in those folders, and every directory, is left
+alone, even when `state_dir` lies inside a root. An artifact's record goes only once its file is gone, so a file
+that cannot be deleted yet is tried again at the next sweep. Reading output that retention removed answers
+`ARTIFACT_EXPIRED` or `NOT_FOUND`; run the command again for fresh output.
 
 ### Browser mounts (slice 3)
 
@@ -118,11 +266,11 @@ tools directory, add this to `codexish.json`:
   shims such as `npx` cannot be started this way; run `node` with the path to `cli.js`.
 - `profile_mode: "dedicated"` (the default) keeps the browser's state in `<state_dir>\browser-profiles\<id>`:
   CODEXish appends `--user-data-dir` with that directory for `kind: "playwright"`. A dedicated mount whose own
-  `args` contain `--user-data-dir`, `--cdp-endpoint`, `--extension`, `--storage-state` or `--config` is not started
-  and is reported as `invalid_config`. `profile_mode: "existing"` passes `args` unchanged; choose it only when you
-  deliberately point the backend at an existing profile, CDP endpoint or extension. `{profile_dir}` in `args`
-  expands to the per-mount directory in both modes. `kind: "custom"` mounts another stdio MCP server without
-  profile handling.
+  `args` already contain `--user-data-dir`, `--cdp-endpoint`, `--extension`, `--storage-state` or `--config` starts
+  with those `args` unchanged and without CODEXish's `--user-data-dir`, and `host_capabilities` shows a warning for
+  it. `profile_mode: "existing"` passes `args` unchanged; choose it only when you deliberately point the backend at
+  an existing profile, CDP endpoint or extension. `{profile_dir}` in `args` expands to the per-mount directory in
+  both modes. `kind: "custom"` mounts another stdio MCP server without profile handling.
 - Tools appear as `browser_<id>_<backend tool>`, for example `browser_pw_browser_navigate`. A name that is not
   `^[a-zA-Z0-9_-]+$` or would exceed 64 characters is shortened and given a short hash suffix. Every mounted tool
   takes the backend's own inputs inside `arguments`. Tools listed in `read_only_tools` run directly and bypass the
@@ -132,9 +280,17 @@ tools directory, add this to `codexish.json`:
 - Starting a mount and calling a read-only tool need read and shell grants on `root_id`; other tools also need write.
 - The backend receives a small environment: system and user profile paths, `PATH`, `TEMP` and `DOTNET_ROOT`.
   Variables whose names look like credentials are never passed, and proxy variables are not passed either.
-- A mount that fails to start does not stop the server. `host_capabilities` reports each mount's `state`
-  (`connected`, `unavailable`, `invalid_config`, `exited`) with its error and the last lines of its stderr. Mounts
-  are read when the server starts.
+- Mounts connect in the background once the server listens, each on its own, so a backend that is slow or never
+  answers its handshake delays nothing else. A backend that fails to start or exits is restarted after 1 s, doubling
+  to at most 60 s between attempts, without giving up; five healthy minutes after a completed handshake and tool
+  listing reset the delay. `host_capabilities`
+  reports each mount's `state` (`starting`, `connected`, `retrying`, `invalid_config`, `stopped`), its attempts, last
+  error, next retry time and the last lines of its stderr. Only an entry that is invalid in the file itself
+  (`invalid_config`) is not retried.
+- The tool list a backend last reported is saved as `<state_dir>\browser-profiles\<id>.manifest.json`. While the
+  backend is down, and after a restart until it connects, those tools stay listed and a call answers
+  `BROWSER_UNAVAILABLE` with the mount's state and the time of its next retry. Mounts are read when the server
+  starts.
 - Mounted tools run unconfined as you and are not contained by the root or its grants. Tools such as
   `browser_file_upload`, `browser_evaluate` or `browser_run_code_unsafe` can read files or run code anywhere your
   account can; the grants only decide whether CODEXish forwards a call, and the root is the backend's working
@@ -143,24 +299,60 @@ tools directory, add this to `codexish.json`:
 ### Tray (slice 4, Windows)
 
 ```powershell
-dotnet run --project src/Codexish.Server -c Release -- --tray
-dotnet run --project src/Codexish.Server -c Release -- --tray --config D:\Codexish\codexish.json
+& $codexish --tray --public-url "https://<machine>.<tailnet>.ts.net" --port <port> --root "proj=C:\Projects\Example"
+& $codexish --tray --config D:\Codexish\codexish.json
 ```
 
-`--tray` runs the same server behind a notification-area icon. Without a configuration file it first shows a setup
-form (public https origin, one project root, a new CODEXish password and the OAuth callback), writes the file like
-`--init` and shows the client secret once. The server starts only from **Start server**. The menu also offers status
-with roots and processes, pause and resume, stopping session children, token revocation, the connection rejection
-log, and **Edit roots and grants**, which stops the server and saves the file.
+`--tray` runs the same server behind a notification-area icon. It first starts itself again in the background with
+a hidden console and exits as soon as that copy holds the tray (or has found one already running), so the console
+window of a shortcut, a double-click or a terminal closes at once and closing a terminal no longer ends CODEXish; if
+that relaunch fails, or the copy exits before it takes over, the tray runs in the original process. One tray runs
+per configuration file, however its path is spelled (a junction, symbolic link or short name leads to the same
+file): a second `--tray` for the same `codexish.json` says "CODEXish is already running; its icon is in the
+notification area" and exits.
+
+Without a configuration file the tray first shows a setup form: public https origin, local port (3000 unless
+`--port` says otherwise), one project root, a new CODEXish password, the OAuth callback and **Start CODEXish when I
+sign in to Windows**, which is checked. `--public-url`, `--port` and `--root` only pre-fill the form; the password is
+never taken from the command line. The form writes the file like `--init`, shows the client secret once (with any
+warnings), and then starts the server and a configured tunnel. When the file exists but cannot be loaded even from
+`codexish.json.bak`, or its `public_url` is http, the icon starts anyway, shows the reason in a balloon and in the
+status window, offers **Open configuration folder**, and tries again every minute; once the file loads, it starts
+the server and a configured tunnel.
+
+**Start with Windows**, a checkable menu item and the setup checkbox, writes `CODEXish.lnk` into your Startup folder.
+It runs this executable with `--tray --start` (plus `--config "<path>"` for a configuration outside the default
+location) from the executable's folder, with the console window minimized; unchecking it deletes the shortcut. When
+the tray starts and the shortcut names a file that no longer exists, for example after the install folder moved, the
+shortcut is rewritten to the running executable. `--start` starts the server once the tray is up, then the tunnel if
+`tunnel.command` is configured. A plain `--tray` waits for **Start server**.
+
+The server and the owned tunnel are supervised. A failed server start (a busy port, for example), a server that
+stops without being asked to, and an owned tunnel that exits without being asked to are retried after 1 s, doubling
+to at most 60 s between attempts, without ever giving up; five minutes of healthy running reset the delay. **Stop
+server and owned tunnel**, **Stop owned tunnel**, **Edit roots and grants** and **Exit** end supervision of what they
+stop until you start it again. Starts and stops run one after another, so an automatic start never overtakes a stop
+in progress. If stopping the owned tunnel fails, the server stops anyway and the tunnel failure is reported on its
+own. The icon's tooltip shows whether each part is running, retrying (with a short cause) or stopped, and every
+failure and restart is in the connection log with its cause.
+
+The menu also offers status with roots, processes and registered clients, pause and resume, stopping session
+children, revoking all tokens, **Remove registered clients**, the connection log, **Open configuration folder**, and
+**Edit roots and grants**, which stops the server and saves the file. The connection log window shows the latest 5,000 lines; every line, redacted the same way, is also
+appended to `<state_dir>\logs\tray-<yyyyMMdd>.log`, which the window names and retention removes after
+`output_days`.
 
 **Start configured tunnel** runs `tunnel.command` with `tunnel.args` as a child of the tray; `{port}` becomes the
-listening port. Nothing downloads or selects a tunnel, starting the server never starts one, and stopping the server
-or exiting the tray stops it:
+listening port. Nothing downloads or selects a tunnel. Starting the server alone never starts it, and it is only
+started while this server is listening, so it never publishes another program that took the port. The tunnel runs
+inside a kill-on-close job object, so it ends with the tray even when the tray is killed. Stopping the server or
+exiting the tray stops it:
 
 ```json
 "tunnel": { "command": "C:\\Tools\\cloudflared.exe", "args": ["tunnel", "--url", "http://127.0.0.1:{port}"] }
 ```
 
+A Tailscale Funnel set up as in [Tunnel](#tunnel) needs no `tunnel` entry: Tailscale publishes the port by itself.
 The tunnel process inherits the tray's environment, so a tunnel tool can read its own settings from environment
 variables. Its output appears in the connection log with the control token, client secret and password hash from
 `codexish.json` replaced by redaction markers. The tray exists only in the Windows build; elsewhere `--tray` prints a
@@ -177,8 +369,10 @@ dotnet run --project src/Codexish.Server -c Release -- --tray-tests
 The self-test uses real files, a real SQLite ledger, real child processes, a real booby-trapped Git repository
 and a real in-process HTTP listener. It opens no tunnel, sends no desktop input and performs no ChatGPT
 measurement. Windows-only checks print `SKIP` elsewhere. `--browser-tests` runs this executable as a stdio MCP
-fixture behind the real HTTP host; `--tray-tests` drives the tray controller over the local control endpoint without
-an icon or a tunnel. All three run in CI on Windows and Ubuntu.
+fixture behind the real HTTP host, including fixture modes that exit after a number of calls, never answer the
+handshake, or fail their first starts; `--tray-tests` drives the tray controller over the local control endpoint,
+including supervision (a busy port, a stopped host, short-lived test tunnels) and, on Windows, the autostart shortcut
+in a temporary Startup folder, without an icon or an external tunnel. All three run in CI on Windows and Ubuntu.
 
 Explicit local checks, never run in CI:
 
@@ -194,6 +388,15 @@ There is no sandbox: `shell_run`, builds, tests and any Git hook they invoke run
 `mode=replace` is not crash-atomic, `fs_apply_patch` has no rollback, redaction is a small published pattern set
 and not a guarantee, and no part of this has been measured against ChatGPT Pro. The complete list is the final
 section of [docs/v1-design.md](docs/v1-design.md).
+
+Known gaps that are recorded but not addressed yet: a child is placed in its Job Object just after it starts, so a
+grandchild spawned in that moment can escape it (starting suspended would close this); Git output and directory
+walks are read whole rather than streamed; continuation cursors for `fs_read`, artifacts and search, and binding
+each cursor to the identity of what it pages through, are incomplete; stored artifacts are not re-verified against
+their hash; backend schemas that use `$dynamicRef` are not rebased; the foreground confirmation window of desktop
+actions is unchanged; desktop actions on UAC prompts, the secure desktop and higher-integrity windows are refused;
+and OAuth client ID metadata documents (CIMD) are not implemented, so clients register through `/register` or use
+the static client.
 
 ## P0 probe
 

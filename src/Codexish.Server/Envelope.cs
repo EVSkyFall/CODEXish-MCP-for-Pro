@@ -35,6 +35,18 @@ public static class Limits
     };
 }
 
+// The one restart schedule for everything CODEXish supervises: 1 s, doubling to a 60 s ceiling, never giving up;
+// five minutes of healthy running start it over.
+public static class Backoff
+{
+    public static readonly TimeSpan HealthyRun = TimeSpan.FromMinutes(5);
+
+    public static TimeSpan Delay(int failures) =>
+        TimeSpan.FromSeconds(failures <= 1 ? 1 : failures >= 7 ? 60 : 1 << (failures - 1));
+
+    public static int FailuresAfterRun(int failures, TimeSpan healthy) => healthy >= HealthyRun ? 0 : failures;
+}
+
 public static class Reply
 {
     public const string SchemaVersion = "v1.0";

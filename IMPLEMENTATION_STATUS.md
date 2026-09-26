@@ -2,6 +2,173 @@
 
 Updated 2026-09-17. Mainline **A / PR #4** is unchanged. Desktop **PR #5 remains Draft**. No merge, force push, branch deletion, or whole-product completion is reported.
 
+## Dynamic Client Registration (pass 4) — local Windows results (2026-09-26)
+
+Branch `feat/v1-connect-hardening`, on top of 00c2b9c (Draft PR #7); the runs below used the uncommitted working tree on the authorized Windows 11 PC with portable SDK 10.0.401. Nothing here involved ChatGPT, a tunnel, a notification icon, the user's configuration or install, the real Startup folder or port 38451. Why: ChatGPT Plugins (Settings → Security and login → Developer mode; ChatGPT Plugins → +) documents only CIMD and DCR for client registration, and a server with only a pre-registered client can fail there.
+
+| Item | What it does |
+| --- | --- |
+| D1 metadata | `registration_endpoint: <public_url>/register`; `token_endpoint_auth_methods_supported: ["client_secret_basic", "client_secret_post", "none"]`; `client_id_metadata_document_supported` is not advertised. |
+| D2 `POST /register` | Takes a JSON body and answers `201`. `redirect_uris` is required: absolute https without a fragment, or http on `localhost`, `127.0.0.1` or `[::1]`; a bad or missing entry is `400 invalid_redirect_uri`, naming the entry. A body that is not a JSON object is `400 invalid_client_metadata`. `client_secret_basic` (the default) and `client_secret_post` get a generated secret stored as a SHA-256 hash; `none` makes a public client; any other method is replaced by `client_secret_basic` in the response. `grant_types` and `response_types` are always answered as `["authorization_code", "refresh_token"]` and `["code"]`, and unknown fields are ignored. `client_name` loses control and formatting characters (which include bidi overrides) and is cut to 200 characters without splitting a surrogate pair. The response carries `client_id` (`dcr_` + 32 hex), `client_id_issued_at`, `client_secret` and `client_secret_expires_at: 0` when a secret exists, the stored `redirect_uris`, `token_endpoint_auth_method`, `grant_types`, `response_types`, `client_name`, and `Cache-Control: no-store`. The endpoint needs no bearer token and has no Origin requirement; the Host allowlist still applies. Registrations and refusals appear in the connection log (`registered oauth client …`, `rejected oauth stage=register …`). |
+| D3 storage | New table `clients` (`client_id`, `secret_hash`, `redirect_uris` JSON, `auth_method`, `name`, `created_at`, `last_signed_in_at`), created with the schema. Only unused registrations are bounded: registrations that never signed in and hold no live token, keeping the newest `ClientRegistry.UnusedLimit` (1,000; tests lower it) with the oldest evicted first. Retention removes them after `output_days`. Neither step can select a client that has signed in or holds a live token, and `revoke-tokens` keeps clients. |
+| D4 `/authorize` | Accepts the static client and every registered client. A registered client's `redirect_uri` must equal one it registered, otherwise the local error page; a registered public client must send an S256 `code_challenge`. Errors before the password go to a listed or registered callback as redirects with `iss`; an unknown client or unregistered callback gets the local error page. For a registered client the sign-in page shows "<name> wants to connect to this PC." (or "An unnamed client") above the unchanged destination line. A successful sign-in sets `last_signed_in_at`. The static client's page and any-https policy are unchanged. |
+| D5 `/token` | A confidential registered client authenticates with its own secret (Basic or form). A public one sends its `client_id` and no secret, and its code must carry a PKCE challenge that the `code_verifier` verifies. The "no client_id, secret only" rule applies only to the static client, and conflicting Basic and form ids are refused. Codes, access tokens and refresh tokens carry the client that obtained them, and a code or refresh from another client is `invalid_grant`. Refresh behaves as in pass 1 for every client (kept, not rotated, no expiry by default). An unknown or removed client is `401 invalid_client`, and a token whose registered client no longer exists is refused on `/mcp` as well. |
+| D6 static client | `codexish-chatgpt` with the configured secret is unchanged; every pass-1 check passes as before. A static `client_id` that happens to look like `dcr_…` is excluded from the registered-client checks. |
+| D7 visibility | `/control/status` (and so the tray's status window) lists `registered_clients` with id, name, auth method, created, last sign-in and callback hosts, never a secret or its hash. `/control/remove-clients` and the new tray item **Remove registered clients** remove every registered client and revoke its tokens, with no confirmation beyond the click. |
+
+| Command | Result |
+| --- | --- |
+| Release build, server | 0 warnings, 0 errors |
+| Server project copy with its Windows conditions set to false (net10.0, no WPF/Windows Forms), offline restore | 0 warnings, 0 errors; a compile check on Windows, not a Linux run |
+| `--self-test`, two runs on the final source | SELF_TEST_PASSED 357 (327 before) in each; DESKTOP_CORE_PASSED 56; DESKTOP_REGRESSIONS 11 passed, 0 failed. The dangling-link check printed SKIP as before. |
+| `--browser-tests`, two runs | BROWSER_TESTS_PASSED 54 in each (unchanged) |
+| `--tray-tests`, two runs | TRAY_CONTROLLER_PASSED 51 (50 before) in each |
+
+The new checks run through the real in-process HTTP host, except where a unit is named:
+- Metadata: the registration endpoint and auth methods are advertised, and CIMD is absent.
+- Registration:
+  - A confidential client and a public client register; the public one has http callbacks on 127.0.0.1, localhost and [::1].
+  - Unknown fields are ignored, and the secret is stored hashed.
+  - An http callback on another host, a fragment, missing `redirect_uris` and a non-JSON body are refused.
+  - The redirect rules and name cleaning are also checked as units.
+  - An unsupported auth method is substituted and reported.
+  - A foreign Host is refused while a foreign Origin is not.
+- Authorize:
+  - The sign-in page names the registered client.
+  - An unregistered callback and an unknown id get the local error page with no redirect.
+  - A public client without PKCE gets an error redirect with `iss` and no code.
+  - A client without a name is shown as unnamed.
+- Token:
+  - Sign-in records `last_signed_in_at`.
+  - A confidential exchange without its secret is `invalid_client`, and with it succeeds with tokens bound to the client; Basic works, and the secret alone without `client_id` does not.
+  - A public exchange without the verifier fails, with the verifier it succeeds, and a code redeemed by another client fails.
+  - Refresh from the other registered client, or from the static client, fails.
+  - Four concurrent confidential refreshes and two repeated public ones succeed with the same refresh token.
+- Visibility and removal:
+  - The status listing shows the registered clients and contains no secret or hash.
+  - Removal revokes both clients' access and refresh tokens (`invalid_client` at `/token`) while a static token keeps working, and a removed client cannot sign in again without registering.
+- Clean-up:
+  - With `UnusedLimit` 3, a signed-in client and the three newest of five unused registrations remain.
+  - A retention sweep removes an old unused registration and keeps a signed-in one, a recent one and one that holds a live token.
+- The tray reaches `remove-clients` through the controller.
+
+Known gap: client ID metadata documents (CIMD) are not implemented. Not run and not claimed: registration and sign-in with the real ChatGPT Plugins flow, the new tray menu item in the UI, `--tray-smoke-test`, `--self-test-desktop`, `--self-test-desktop-http`, `--browser-live-test`, the P0 self-test, CI, a Linux run, and any use of Tailscale or cloudflared.
+
+## Review fixes (pass 3) — local Windows results (2026-09-26)
+
+Branch `feat/v1-connect-hardening`, on top of 16167ec; the runs below used the uncommitted working tree on the authorized Windows 11 PC with portable SDK 10.0.401. Nothing here involved ChatGPT, a tunnel, a notification icon, the user's configuration, the real Startup folder or port 38451. For current behavior this section supersedes the P3, P7, P8, P14, P17, P18 and P21 rows of the pass 2 table below.
+
+| Item | What it does |
+| --- | --- |
+| R1 retention names | A file is deleted only when its whole name is one CODEXish gives its files, and only directly in its own folder: `artifacts\art_<32 hex>.bin` (the database-driven removal also requires the id `art_<32 hex>`), `backups\<32 hex>.bak`, `logs\tray-<yyyyMMdd>.log`, `ledger.corrupt-<yyyyMMdd>T<HHmmssfff>Z.db[-wal\|-shm\|-journal]` in state_dir and `<config file name>.broken-<same stamp>[-N]` next to the configuration. No directory is deleted. |
+| R2 artifact rows | An artifact row is deleted only after its file was removed or was already absent; a file that cannot be removed keeps its row, is named in the sweep report and is retried at the next sweep. |
+| R3 held jobs | An exited process whose in-memory entry still holds a job handle (live descendants) keeps its row and its output; once the job is idle, a sweep closes it and removes both. |
+| R4 expired artifacts | `artifact_read` and `artifact_search` on a row whose file vanished answer `ARTIFACT_EXPIRED` with the artifact id; an artifact whose row is gone as well answers `NOT_FOUND`, naming retention as a possible cause. Both tool descriptions say so. |
+| C1 `.bak` restore | Recovery keeps the unreadable bytes first and reads the main file again: a readable version another writer saved meanwhile is loaded; a different unreadable version leaves the `.bak` loaded without overwriting; only a file that still holds exactly the failed bytes is replaced by the `.bak`. |
+| C2 broken copies | `.broken-<utc>` is created with `CreateNew`; a taken name gets `-2`, `-3` and so on. |
+| C3 access entries | `Validate` skips a malformed `allow_hosts` or `allow_origins` entry (JSON null included) with a warning per entry; `AccessPolicy` skips what it cannot use and never throws. |
+| C4 JSON null | Null for any string, list or section, at the top level and inside `shell`, `git`, `oauth` and `tunnel`, becomes the property's default before validation; null `tunnel.args` entries are dropped with a warning; root and mount entries already handled null. `shell.allowed: null` therefore means the default list, while an explicit `[]` still allows no shell. |
+| S1 events | `Store.Event` is best-effort everywhere (`ledger_rebuilt`, `migration_failed`, `server_start`, process, retention and all other events): a failed write goes to stderr only. |
+| S2 migrations | The schema script and each `ALTER TABLE` run through `WithRetry` within the command timeout. |
+| S3 quarantine | A `-journal` sidecar moves with the database. |
+| L1 process start | After `Process.Start`, a failed row insert, artifact creation or job bookkeeping still kills the tree and now also marks a row already written as `exited_unknown_code`; a failed diagnostic event cannot end a process. |
+| L2 cleanup | `CodexishRuntime.Dispose` runs every step, releases the store and the state-directory lock in nested `finally` blocks and then rethrows the first failure (a failed sweep loop stays swallowed as before). The tray's host and runtime release and a failed start's candidate disposal are nested the same way. A failing tunnel stop is logged, the server still stops, and `StopAsync` then throws "The server stopped, but stopping the owned tunnel failed: …". |
+| L3 child setup | In the tray tunnel and the browser backend, a failure after `Process.Start` (handle access, job assignment, reader setup) terminates the job or kills the tree and closes the job before the retry. The browser job is recorded before the handle is used, and the tunnel clears its references before releasing them. |
+| L4 lifecycle | Start, Stop, StartTunnel, StopTunnel and StartConfigured (which the P19 reload start uses) run one at a time under one lifecycle semaphore per controller. |
+| L5 relaunch | The launcher creates the manual-reset event `Local\CODEXish-tray-ready-<hash>`, starts the detached copy and waits, with no timeout, for that event or the copy's exit. The copy sets the event right after taking the mutex, or before showing the already-running message. A copy that exits first leaves the tray to the launcher, which logs the exit code to stderr. |
+| L6 instance names | The mutex and the event hash the configuration's final path (`GetFinalPathNameByHandle`). Before the file exists, the deepest existing parent is resolved and the rest appended, so the names do not change when first-run setup creates the file. `GetFullPath` is the fallback, compared case-insensitively on Windows. |
+| B1 mount ids | A mount id is reserved only after the whole entry validates. |
+| B2 healthy clock | The five-minute healthy clock starts after the handshake and tool listing. |
+
+| Command | Result |
+| --- | --- |
+| Release build, server | 0 warnings, 0 errors |
+| Server project copy with its Windows conditions set to false (net10.0, no WPF/Windows Forms), offline restore | 0 warnings, 0 errors; a compile check on Windows, not a Linux run |
+| `--self-test`, two runs on the final source (two more before the last small edit) | SELF_TEST_PASSED 327 (310 before) in each; DESKTOP_CORE_PASSED 56; DESKTOP_REGRESSIONS 11 passed, 0 failed. The dangling-link check printed SKIP as before. |
+| `--browser-tests`, two runs on the final source (two more before) | BROWSER_TESTS_PASSED 54 (53 before) in each |
+| `--tray-tests`, two runs on the final source (two more before) | TRAY_CONTROLLER_PASSED 50 (43 before) in each; the junction check ran |
+
+New checks:
+- Retention R1: user files `notes.txt`, `report.log`, `a.bak` and `x.bin`, backdated 400 days, in `artifacts`, `backups`, `logs`, state_dir and the configuration folder, plus look-alike names, a directory named like a tray log and a database row with the id `x`. The sweep leaves all of them and removes exactly the 7 expired CODEXish files. The existing retention fixture now uses real CODEXish names.
+- Retention R2: an old artifact row whose file is already gone is removed; an artifact held open with `FileShare.None` keeps its row and is reported, and the next sweep removes the file and then the row.
+- Retention R3: a live `PING.EXE` is assigned to a real kill-on-close job and set as an exited process's job. A real grandchild would inherit the output pipes and keep the process `running`, so this arranges the state directly. The row and output survive a sweep; after the descendant ends, the next sweep removes both.
+- Retention R4: `ARTIFACT_EXPIRED` from `artifact_read` (bytes and lines) and `artifact_search`, and `NOT_FOUND` naming retention.
+- Configuration C1: `Recover` with a newer readable file, and with a newer unreadable file.
+- Configuration C2: three `KeepBroken` calls with one stamp give the base name, `-2` and `-3`, all recognized by retention.
+- Configuration C3: warnings per malformed entry, `AccessPolicy` with malformed entries, and a host that builds with unvalidated entries.
+- Configuration C4: a file with every top-level property null (loaded only, never run, because its state_dir is the default), and a file with nulls inside sections, root and mount entries, which a runtime then serves.
+- Store S2: `BEGIN EXCLUSIVE` from a second connection held for 500 ms while a `Store` opens an old-schema database.
+- Tray L2: `FailNextTunnelStop`, a tray-test-only injection point.
+- Tray L5 and L6: the ready-event name shares the mutex hash; names are equal through a directory junction (`mklink /J` in the test folder) for an existing and a not-yet-existing file; `ChildTookOver` returns false for a stub that exits with code 3 before signaling and true for a signaled, still-running stub.
+- Browser B1: an invalid entry `dup` does not block a valid `DUP`.
+
+The first two runs of each suite predate one follow-up: `Runtime.Dispose` swallowing a failed sweep loop again, as it did before pass 3. Not run and not claimed: the real detached relaunch and the ready handshake with `--tray`, the mutex message box, the configuration-error balloon and the other tray UI (`--tray`, `--tray-smoke-test`), an actual Windows sign-in, `--self-test-desktop`, `--self-test-desktop-http`, `--browser-live-test`, the P0 self-test, CI, a Linux run, and any use of ChatGPT, Tailscale or cloudflared.
+
+## Availability hardening (pass 2) — local Windows results (2026-09-26)
+
+Branch `feat/v1-connect-hardening`, on top of 7f07d65; the runs below used the uncommitted working tree on the authorized Windows 11 PC with portable SDK 10.0.401. Nothing here involved ChatGPT, a tunnel, a notification icon, the user's configuration, the real Startup folder or port 38451.
+
+| Item | What it does |
+| --- | --- |
+| P1 startup tolerance | Bad, duplicate or empty root entries are skipped with a warning; a missing root directory stays configured (`exists=false`) and every call checks again; overlapping and nested roots are allowed; a state_dir inside a root, unsupported shell names, an invalid `access_token_hours`, a missing `state_dir` and invalid `redirect_uris` entries become warnings; zero roots leaves the desktop tools working. Warnings go to the startup log and `host_capabilities.warnings`. The files and shell FIFO keys are the canonical full path of the outermost containing root (case-insensitive on Windows), computed without disk access. |
+| P2 kept refusals | The single-instance state lock, `TransportRefusal` and `NoAuthRefusal` are unchanged; a port outside 0-65535 and an unusable `public_url` also still refuse. |
+| P3 configuration files | `Save` writes a flushed temporary file and swaps it in with `File.Replace` (or `File.Move`), keeping `codexish.json.bak`. `Load` keeps an unparseable file as `codexish.json.broken-<utc>`, loads and restores a readable `.bak`, and otherwise raises the real parse error. |
+| P4 drive roots | One containment helper (`PathRules.IsInside`) appends a separator only when the root lacks one; used by configuration warnings, `Workspace.Resolve` and the handle check. |
+| P5 secrets | `SecretMatches` never matches an empty configured secret. A malformed `password_hash` makes sign-in fail with `reason=malformed_password_hash detail=<cause>`; empty secrets and an unusable hash are also startup warnings. |
+| P6 shells | A command without `shell` runs in `shell.default` (or the first allowed shell when the default is not usable). `pwsh` resolves on every call from PATH, the newest `%ProgramFiles%\PowerShell\*\pwsh.exe`, then Windows PowerShell; `powershell` is a supported name and joins the default allowed list; results report `shell` and `interpreter`. |
+| P7 ledger rebuild | SQLITE_CORRUPT/NOTADB at open or schema time, or a failing `PRAGMA quick_check`, renames the database and its `-wal`/`-shm` to `ledger.corrupt-<utc>.*`, creates a fresh one, records an event and reports `ledger_rebuilt`. |
+| P8 ledger containment | Migrations ignore only duplicate-column errors and log others; BUSY, LOCKED and IOERR are retried with backoff within the 30 s command timeout; unreadable token, checkpoint, process and result rows are contained to that row. The ledger's acceptance and start records now surface a write failure as "nothing was started" instead of leaving the call waiting. |
+| P9, P10 processes | A failure after `Process.Start` terminates the child tree and its job, records `process_start_failed` and returns `EXECUTION_FAILED`. After the final state is recorded, the process handle is disposed and the job closed once it holds no process; job handles are used under a per-process lock so a closed handle number is never reused. |
+| P11, P12 Git | Every inherited `GIT_*` variable is dropped (only `GIT_TERMINAL_PROMPT=0` is set). Git resolves on every call from `git.path`, PATH, `%ProgramFiles%\Git\cmd`, then `%LOCALAPPDATA%\Programs\Git\cmd`; the `--no-lazy-fetch` probe repeats when the binary changes. |
+| P13 mounts in the background | Kestrel starts first; mounts connect afterwards from `ApplicationStarted`, each in its own loop with no handshake deadline. Mounted tools are served through list/call handlers, so the tool list changes without rebuilding the host. |
+| P14 mount supervision | A backend that fails to start or exits is restarted with the shared backoff (1 s doubling to 60 s, never giving up, reset after 5 healthy minutes). The last tool list is saved as `<state_dir>\browser-profiles\<id>.manifest.json` and listed while the backend is down; calls then answer `BROWSER_UNAVAILABLE` with state, attempts and `next_retry`. |
+| P15 profile flags | A dedicated Playwright mount whose own args carry profile, CDP, extension, storage-state or config flags starts with its args unchanged, without CODEXish's `--user-data-dir`, and with a warning. |
+| P16 tunnel job | The tray-owned tunnel runs in a kill-on-close job, closed when it exits by itself or is stopped. |
+| P17 retention | `retention.output_days` (30) and `backup_days` (90), 0 = forever; a sweep 60 s after start and every 6 h deletes the listed state classes in batches of 500 rows without VACUUM, protects the listed live state, and reports settings and the last sweep in `host_capabilities.retention`. |
+| P18 console-less tray | `--tray` relaunches the same executable with `--tray-detached`, `CreateNoWindow`, no redirection, and exits; a failed relaunch runs the tray in place. |
+| P19 configuration errors | A configuration that cannot be loaded (after `.bak` recovery) or is refused by `TransportRefusal` leaves the icon up with a balloon and the reason in the status window, retries every 60 s, then proceeds as `--start`; "Open configuration folder" is in the menu. |
+| P20 tray logs | The connection log keeps the latest 5,000 lines in memory and appends every redacted line to `<state_dir>\logs\tray-<yyyyMMdd>.log`; the window names the file. |
+| P21 single tray | A named mutex derived from the full configuration path; a second tray shows "CODEXish is already running; its icon is in the notification area" and exits 0. |
+
+| Command | Result |
+| --- | --- |
+| Release build, server | 0 warnings, 0 errors |
+| Server project copy with its Windows conditions set to false (net10.0, no WPF/Windows Forms), offline restore | 0 warnings, 0 errors; a compile check on Windows, not a Linux run |
+| `--self-test`, three runs | SELF_TEST_PASSED 310 (261 before) in each; DESKTOP_CORE_PASSED 56; DESKTOP_REGRESSIONS 11 passed, 0 failed. The dangling-link check printed SKIP because this session cannot create symbolic links; the new drive-root, powershell and Git-fallback checks ran. |
+| `--browser-tests`, five runs | BROWSER_TESTS_PASSED 53 (40 before) in each |
+| `--tray-tests`, five runs | TRAY_CONTROLLER_PASSED 43 (36 before) in each |
+
+Only the last run of each suite used the final source. The first run of each predates two small follow-ups (first: queue keys computed without disk access and retention deletes in batches; second: the per-process job-handle lock and the empty-secret warnings), and the runs in between predate the second. Not run and not claimed: the relaunch, the mutex message box, the configuration-error balloon and the other tray UI (`--tray`, `--tray-smoke-test`), an actual Windows sign-in, `--self-test-desktop`, `--self-test-desktop-http`, `--browser-live-test`, the P0 self-test, CI, a Linux run, and any use of ChatGPT, Tailscale or cloudflared.
+
+Known gaps, recorded and left for later: the Job Object race (a grandchild spawned between `Process.Start` and job assignment escapes; starting suspended would close it); Git output and directory traversal are not streamed; continuation cursors for `fs_read`, artifacts and search and cursor identity binding are incomplete; artifact hashes are not re-verified; `$dynamicRef` in backend schemas is not rebased; the foreground confirmation window is unchanged; UAC, secure-desktop and higher-integrity targets are refused.
+
+## Connection hardening — local Windows results (2026-09-26)
+
+Branch `feat/v1-connect-hardening`, based on `b6a19aa` (the PR #6 head); the runs below used the uncommitted working tree. They ran on the authorized Windows 11 PC with portable SDK 10.0.401. Nothing here involved ChatGPT, a tunnel, a notification icon, the user's configuration or the real Startup folder. For current behavior this section supersedes the tray row of the slice 3–4 table below.
+
+| Change | What it does |
+| --- | --- |
+| OAuth metadata | `authorization_response_iss_parameter_supported: true`; the protected-resource document is also served at `/.well-known/oauth-protected-resource/mcp`; no `openid-configuration`. |
+| Scope | Any requested scope, or none, is accepted; the grant and the token response are always `mcp`. The `invalid_scope` path is removed. |
+| Resource | `resource` never refuses at `/authorize` or `/token`; tokens are always issued for `<public_url>/mcp`; a value on another origin is logged as `oauth resource differs from public origin value=<json>`. |
+| Client authentication | A `client_id` that is present (form or Basic) must match; without one the secret alone authenticates the single client; a missing secret is refused as `missing_client_secret`. |
+| Redirect URIs | Configured entries still match exactly; any other absolute https URI without a fragment is accepted. For those, errors before the password stay on the local page, the acceptance is logged as `accepted oauth redirect_uri outside configured list host=<host>`, and the code redirect carries `iss`. The sign-in page names the destination host for every callback. `/token` still requires the same redirect_uri. |
+| Refresh tokens | Not rotated or consumed: a refresh validates the token and returns a new access token with the same refresh token. Family revocation on reuse, the "already consumed" refusal and consume-and-revoke are removed. `refresh_token_days` defaults to 0, meaning no expiry, which also covers rows stored under the rotating scheme; a positive value is honored and restarts from each refresh. `revoke-tokens` still revokes every token. |
+| Build | NU1901–NU1904 are no longer in the server project's `WarningsAsErrors`; the lead removed them from the P0 project the same way before committing 7f07d65. |
+| Tray | The setup form adds Local port and "Start CODEXish when I sign in to Windows" (checked); `--tray` takes `--start` and pre-fill values `--public-url`, `--port`, `--root`. `TrayAutostart.cs` writes `CODEXish.lnk` in the Startup folder through `IShellLinkW`/`IPersistFile`; a checkable "Start with Windows" item; a shortcut whose target file is gone or that cannot be read is rewritten at tray start. The server and the owned tunnel are supervised: 1 s doubling to 60 s, reset after 5 healthy minutes, never giving up; user stops end supervision; the tunnel starts only while the server listens; the tooltip shows running, retrying with a cause, or stopped. |
+| Runtime | A server start that fails after taking the state-directory lock now releases the lock and the database, so a later attempt in the same process can take them. |
+
+| Command | Result |
+| --- | --- |
+| Release build, server | 0 warnings, 0 errors |
+| Server project copy with its Windows conditions set to false (net10.0, no WPF/Windows Forms), offline restore | 0 warnings, 0 errors; a compile check on Windows, not a Linux run |
+| `--self-test` | SELF_TEST_PASSED 261 (237 before); DESKTOP_CORE_PASSED 56; DESKTOP_REGRESSIONS 11 passed, 0 failed. The dangling-link check printed SKIP because this session cannot create symbolic links. |
+| `--browser-tests` | BROWSER_TESTS_PASSED 40 |
+| `--tray-tests` | TRAY_CONTROLLER_PASSED 36 (13 before); the autostart checks ran against a temporary Startup folder |
+| `--tray-tests` built with the previous `Runtime.cs` | TRAY_CONTROLLER_FAILED after 28, at the check that a failed start releases the state-directory lock; its test directory could not be removed while the leaked handle was open and was deleted afterwards |
+
+Not run and not claimed: `--tray-smoke-test`, a plain `--tray` (setup form, menus, the Start with Windows item and the tooltip), an actual Windows sign-in with the shortcut, `--self-test-desktop`, `--self-test-desktop-http`, `--browser-live-test`, the P0 self-test, CI for this branch, a Linux run, and any use of ChatGPT, Tailscale or cloudflared.
+
 ## Slice 3–4 integration — local Windows results
 
 Branch `feat/v1-slice3-4-integration`, based on `bddeffe` (PR #5 head). Everything below ran on the authorized Windows 11 PC with portable SDK 10.0.401 against the source containing these changes. No CI run of this branch has been read, and nothing here involved ChatGPT, a tunnel or a personal browser profile.

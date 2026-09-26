@@ -28,22 +28,37 @@ documentation aliases.** A ChatGPT connector function name must match `^[a-zA-Z0
 
 **Decision: one JSON file, `%LOCALAPPDATA%\Codexish\codexish.json` by default, created by `--init` with random
 secrets and a PBKDF2-SHA256 password hash.** `--config <path>` overrides the location; nothing is read from
-environment variables or from any other credential store.
+environment variables or from any other credential store. A save writes a temporary file in the same directory and
+swaps it in with `File.Replace`, keeping the previous version as `codexish.json.bak`; a file that cannot be parsed
+is kept as `codexish.json.broken-<utc>` (created with `CreateNew`, `-2`, `-3` on a collision) and a readable `.bak` is
+loaded. The `.bak` replaces the main file only while that file still holds exactly the bytes that failed to parse;
+if another writer saved in between, its readable version is loaded instead, or the `.bak` is used without
+overwriting anything.
 
-**Decision: `--init` derives `allow_hosts` from the hostname in `--public-url`, always accepts the documented
-ChatGPT callback, and accepts repeatable `--redirect-uri` values for a connector whose callback differs.**
-When a redirect_uri is refused, the offered value is written to the rejection log so the user can add it.
+**Decision: nothing optional stops the server.** Only a port outside 0-65535, an unusable `public_url`, an http
+`public_url` with authentication (`TransportRefusal`), `--no-auth` with a public host (`NoAuthRefusal`) and the
+single-instance state lock refuse to start. Every other problem in the file is skipped or replaced by its default
+and reported in the startup log and `host_capabilities.warnings`. That includes a malformed `allow_hosts` or
+`allow_origins` entry, which `AccessPolicy` also skips instead of throwing, and a JSON `null` for any string, list or
+section, which means that property's default.
+
+**Decision: `--init` derives `allow_hosts` from the hostname in `--public-url`, lists the documented ChatGPT
+callback, and accepts repeatable `--redirect-uri` values.** Any https callback is accepted anyway (section 9), so
+the list matters only for a callback that is not https and for OAuth error redirects. When a redirect_uri is
+refused, the offered value is written to the rejection log so the user can add it.
 
 **Decision: a grant is per root and has three bits — read, write, shell — and a listed root defaults to all
 three.** There is no per-action approval UI and no model-writable approval tool: the local user edits the file.
 
-**Decision: two roots may not name the same directory or nest inside one another, and the server refuses to
-start otherwise.** FIFO resources are keyed by `root_id`, so two ids over one tree would give the same files
-two independent queues and let concurrent writes interleave.
+**Decision: roots may name the same directory or nest inside one another.** Each call resolves through the
+`root_id` it names, with that root's grants. The files and shell FIFO keys are the canonical full path of the
+outermost configured root that contains the named one (compared without case on Windows), so files reachable
+through two ids still share one queue. A root entry with a bad or duplicate id or no path is skipped with a
+warning; a root whose directory is missing stays configured, reports `exists=false`, and each call checks again.
 
-**Decision: the state directory must lie outside every root, and the server refuses to start otherwise.** The
-ledger, the artifact store and the `.bak` backups must not be reachable through `fs_*` or through a shell grant
-pointed at a root.
+**Decision: a state directory inside a root is a warning, not a refusal.** The ledger, the artifact store and the
+`.bak` backups are then reachable through that root's tools, which `host_capabilities.warnings` and
+`workspace_info.state_dir_note` say.
 
 **Decision: `host_capabilities` and `workspace_info` publish the roots, the grants, the execution boundary, the
 unimplemented features with a reason each, the protocol and schema versions, the latest checkpoint, and the
@@ -111,9 +126,16 @@ the process, and `process_write` is refused because its stdin belongs to nobody.
 `CURSOR_INVALID` rather than an offset into a different pair of streams.
 
 **Decision: `shell_run` and `process_start` are the same supervisor; structured `executable` plus `args` is
-preferred and a `command` string requires an explicit shell from `shell.allowed`.** `cmd` is invoked as
-`cmd.exe /s /c "<command>"` because cmd does not follow `CommandLineToArgvW` quoting; `pwsh` is invoked as
-`pwsh -NoProfile -NonInteractive -Command <command>` through the argument list.
+preferred, and a `command` string runs in the named shell or, without one, in `shell.default`.** The shell must
+be in `shell.allowed`, the user's own policy; supported names are `pwsh`, `powershell` and `cmd`, and unsupported
+names are ignored with a warning. `cmd` is invoked as `cmd.exe /s /c "<command>"` because cmd does not follow
+`CommandLineToArgvW` quoting; `pwsh` and `powershell` are invoked with `-NoProfile -NonInteractive -Command
+<command>` through the argument list. `pwsh` is resolved on every call from `PATH`, the newest
+`%ProgramFiles%\PowerShell\*\pwsh.exe`, then Windows PowerShell, and each result reports the `interpreter` used.
+
+**Decision: a failure after `Process.Start` terminates the child tree and its job before the error surfaces, and an
+exited process keeps only its metadata.** Its process and job handles are released once its final state is
+recorded (a job that still holds descendants is closed when they are gone).
 
 **Decision: `wait_ms` bounds the response only.** When it elapses the call returns `status: running` with a
 `process_id`, the child keeps running, and no timeout in this server ever kills anything.
@@ -139,19 +161,22 @@ re-attached as `running` with `reattached: true` and `output_since_restart: not_
 
 ## 6. Git
 
-**Decision: `git_status`, `git_diff` and `git_log` run the configured git binary with fixed argument sets and,
-on every call, `-c core.hooksPath=<empty directory in the state dir> -c core.fsmonitor=false -c core.pager=cat
--c diff.external= -c core.editor=true --no-optional-locks`, plus `--no-ext-diff --no-textconv` on diff and
-`GIT_TERMINAL_PROMPT=0` in the environment.** Reading a repository must not execute the repository's code.
+**Decision: `git_status`, `git_diff` and `git_log` run git with fixed argument sets and, on every call,
+`-c core.hooksPath=<empty directory in the state dir> -c core.fsmonitor=false -c core.pager=cat
+-c diff.external= -c core.editor=true --no-optional-locks`, plus `--no-ext-diff --no-textconv` on diff; every
+inherited `GIT_*` variable is dropped and only `GIT_TERMINAL_PROMPT=0` is set.** Reading a repository must not
+execute the repository's code. Git is resolved on every call: `git.path` when that file exists, then `PATH`, then
+`%ProgramFiles%\Git\cmd\git.exe`, then `%LOCALAPPDATA%\Programs\Git\cmd\git.exe`.
 
 **Decision: before each read, the repository's declared clean and process filters are listed by name with
 `git config --null --name-only --get-regexp '^filter\..*\.(clean|process|required)$'` and each one is
 disabled with `-c <name>=` (`=false` for `.required`).** A filter declared by `.gitattributes` runs during
 status and diff as well, so disabling hooks alone would not be enough. Only names are read, never values.
 
-**Decision: `--no-lazy-fetch` is probed once and used only where git understands it.** It stops a read of a
+**Decision: `--no-lazy-fetch` is probed and used only where git understands it.** It stops a read of a
 partial clone from starting a network fetch, which would run the remote and credential helpers; git 2.40
-rejects the option, so an unconditional flag would break every call on that version.
+rejects the option, so an unconditional flag would break every call on that version. The probe is repeated
+whenever the git binary found differs from the one probed.
 
 **Decision: `ref` and `path` arrive from the model, so a ref must match `^[A-Za-z0-9._/@^~{}-]+$`, must not
 start with `-` and must not be a filesystem traversal; `--end-of-options` precedes any ref and `--` precedes any
@@ -168,7 +193,8 @@ arguments; the same id with the same digest joins the live task or returns the s
 with a different digest is `IDEMPOTENCY_CONFLICT`.**
 
 **Decision: acceptance order is the order of the ledger insert under the gate lock, and each resource
-(`files:<root>`, `shell:<root>`, `git:<root>`, `process:<id>`) runs its accepted work in exactly that order.**
+(`files:<canonical root path>`, `shell:<canonical root path>`, `process:<id>`, `browser:<mount>`) runs its accepted
+work in exactly that order.**
 This closes the P0 contract gap that Codex finding M-2 identified; P0 promised mutual exclusion only.
 
 **Decision: a `shell:<root>` chain item completes when the child has started, not when it exits.** A dev server
@@ -195,6 +221,26 @@ cancellation request and reports `side_effects: unknown`.** Cancellation is not 
 **Decision: one SQLite file in the state directory holds `invocations`, `processes`, `artifacts`, `events`,
 `tokens` and `checkpoints`; artifact bytes live as files under `state_dir\artifacts`.**
 
+**Decision: a ledger that SQLite reports as damaged or not a database at startup, including `PRAGMA quick_check`,
+is renamed with its `-wal`, `-shm` and `-journal` files to `ledger.corrupt-<utc>.*` and replaced by a fresh one.**
+The rebuild is reported as `host_capabilities.ledger_rebuilt`; issued tokens are lost with it, so ChatGPT signs in
+again. A migration ignores only a duplicate-column error and logs any other; SQLITE_BUSY, SQLITE_LOCKED and
+SQLITE_IOERR are retried within the command timeout, the schema script and every migration included; a row that
+cannot be read is contained to that row. Diagnostic events are best-effort: one that cannot be written goes to
+stderr and never aborts startup, a call or a process.
+
+**Decision: CODEXish's own state is cleaned by age.** `retention.output_days` (30) covers artifacts, finished
+ledger rows, events, exited processes with their output, expired or revoked tokens, older checkpoints, client
+registrations that never signed in (and hold no live token) and tray logs; `retention.backup_days` (90) covers pre-edit backups, quarantined ledgers and unreadable configuration copies;
+0 keeps forever. A sweep runs about a minute after start and every 6 hours, deletes rows in small batches without
+VACUUM, and never touches running or reattachable processes, queued or running operations, the newest checkpoint,
+live tokens, browser profiles or anything in a root. Because `state_dir` may lie inside a root, a file is deleted
+only when its whole name is one CODEXish gives its files (`art_<32 hex>.bin`, `<32 hex>.bak`, `tray-<yyyyMMdd>.log`,
+`ledger.corrupt-<stamp>.db[-wal|-shm|-journal]`, `<config file>.broken-<stamp>[-N]`), only directly in its own
+folder, and no directory is ever deleted. An artifact row is deleted only after its file was removed or was already
+absent; an exited process whose job still holds live descendants keeps its row and output until they are gone; a
+read of an artifact whose file vanished answers `ARTIFACT_EXPIRED`.
+
 **Decision: an artifact cursor is bound to the artifact's generation, and a cursor from an earlier generation is
 `CURSOR_INVALID` rather than an offset into different bytes.**
 
@@ -211,25 +257,58 @@ preserved prefix readable, and reports `OUTPUT_INCOMPLETE` when a read asks for 
 `Origin: https://<host>` while Kestrel sees scheme http; without the automatic allowance the server's own login
 form would be rejected as cross-origin.
 
-**Decision: the only scope is `mcp`.** An empty scope becomes `mcp`, anything else is `invalid_scope` at
-`/authorize`, the granted scope is stored on the token row, and `/mcp` refuses a token that does not carry it.
+**Decision: the only scope is `mcp`, and any requested scope is accepted.** Whatever a client asks for, or
+nothing, the grant is `mcp`, the token response says `scope: "mcp"`, the scope is stored on the token row, and
+`/mcp` refuses a token that does not carry it. Refusing a scope only ever disconnected a client.
 
-**Decision: refresh rotation is one atomic consume-and-revoke.** Two concurrent exchanges of the same refresh
-token cannot both succeed; the loser is `invalid_grant`.
-
-**Decision: replaying a refresh token that was already rotated away revokes every token of that family.** The
-family is the authorization the tokens descend from, and the revocation is recorded in the events table.
+**Decision: refresh tokens are neither rotated nor expired by default, for every client.** A refresh validates the
+presented token (known, not revoked, not expired, audience matching, issued to the client that presents it), issues a
+new access token and returns the same refresh token. A confidential client's secret is required at `/token`, so a
+leaked refresh token alone is useless, while rotation's replay revocation permanently disconnected the connector whenever a refresh response was
+lost in the tunnel or two refreshes raced. `oauth.refresh_token_days` defaults to 0 (no expiry); a positive value is
+honored and counted from the token's last refresh. Refresh tokens stored under the earlier rotating scheme keep
+working, and `revoke-tokens` still revokes every token.
 
 **Decision: the authorization response carries `iss`** (RFC 9207), on both the success redirect and the error
-redirect.
+redirect, and the authorization-server metadata advertises `authorization_response_iss_parameter_supported`.
+Without that flag ChatGPT uses a per-connection callback instead of its stable one.
+
+**Decision: any absolute https redirect_uri without a fragment is accepted for the configured client, besides the
+exact entries of `oauth.redirect_uris`.** For a callback outside the list, errors before the password is accepted
+are shown on the local page and never redirected, so `/authorize` is not an unauthenticated open redirect; the sign-in
+page names the destination host for every callback; and the acceptance is logged with the host. `/token` still
+requires the redirect_uri of the authorization request.
 
 **Decision: authentication is a built-in single-user OAuth 2.1 authorization server on the same listener — no
 external IdP — with `S256` PKCE, opaque 32-byte tokens stored only as SHA-256 hashes with an audience and an
-expiry, a rotating refresh token, and both `client_secret_post` and `client_secret_basic`.**
+expiry, a refresh token that is kept rather than rotated, `client_secret_post` and `client_secret_basic`, and public
+clients (`none`) with PKCE.** For the static client a `client_id` that is present at `/token` must match, and without
+one its secret alone identifies it. No `openid-configuration` is served, because no id_token is issued.
+
+**Decision: clients may register themselves through Dynamic Client Registration (RFC 7591), and client ID metadata
+documents are not offered.** ChatGPT Plugins documents only CIMD and DCR for client registration, tries CIMD first
+when a server offers it, and needs `registration_endpoint` otherwise; advertising a half-done CIMD would make it skip
+DCR. `POST /register` is public (no bearer token, no Origin requirement; the Host allowlist applies) and answers
+`201` with a `dcr_<32 hex>` client ID. `redirect_uris` is required: absolute https without a fragment, or http on
+`localhost`, `127.0.0.1` or `[::1]` (RFC 8252); a bad entry is `400 invalid_redirect_uri` naming it.
+`client_secret_basic` (the default) and `client_secret_post` receive a secret stored only as a hash, `none` makes a
+public client, and any other method is replaced by `client_secret_basic` in the response. Grant and response types
+are always answered as `authorization_code`/`refresh_token` and `code`; unknown metadata is ignored; `client_name`
+loses control and formatting characters and is cut to 200 characters. At `/authorize` a registered client's
+`redirect_uri` must equal one it registered, a public client must send an S256 `code_challenge`, errors before the
+password go to that registered callback with `iss`, and the sign-in page shows the self-declared name above the
+destination host. At `/token` a confidential client authenticates with its own secret, a public one with its
+`client_id` and a PKCE verifier; codes, access tokens and refresh tokens belong to the client that obtained them, and
+an unknown or removed client is `invalid_client`. A client that has signed in is never removed automatically, and
+`revoke-tokens` keeps registrations. Registrations that never signed in are anonymous, internet-reachable state:
+only the newest 1,000 are kept (the oldest go first) and retention removes them after `output_days`; neither step
+can select a client that has signed in or holds a live token. `/control/remove-clients` and the tray's **Remove
+registered clients** remove every registered client and revoke its tokens. The static client is unchanged.
 
 **Decision: a request to `/mcp` without a valid bearer token is `401` with
 `WWW-Authenticate: Bearer resource_metadata="<public_url>/.well-known/oauth-protected-resource"`, and both
-metadata documents are served unauthenticated.**
+metadata documents are served unauthenticated.** The protected-resource document is also served at
+`/.well-known/oauth-protected-resource/mcp`, the RFC 9728 location for a resource with a path.
 
 **Decision: the `/authorize` GET form carries every incoming OAuth parameter into the POST as hidden fields plus
 a single-use CSRF nonce, and the POST revalidates all of them.** The issued code stays bound to the caller that
@@ -239,12 +318,13 @@ started the flow.
 client that never sent one may omit the verifier, and `pkce_used` is recorded on the token row and in the
 events table.**
 
-**Decision: an absent `resource` indicator defaults to `<public_url>/mcp`, and a present one must equal it.**
+**Decision: tokens are always issued for `<public_url>/mcp`, and a `resource` indicator never refuses a request at
+`/authorize` or `/token`.** A presented value whose origin differs from the public origin is logged.
 
 **Decision: `--no-auth` is accepted only when `allow_hosts` is empty.** The listener is loopback-only and the
 access policy always allows loopback hosts, so an empty allow list really does mean nothing but this machine.
 
-**Decision: `/control/pause`, `/resume`, `/kill-children`, `/revoke-tokens` and `/control/status` are accepted
+**Decision: `/control/pause`, `/resume`, `/kill-children`, `/revoke-tokens`, `/remove-clients` and `/control/status` are accepted
 only when the connection's remote address is loopback and the `Host` header is loopback and the request carries
 `X-Codexish-Control: <control_token>`.** The control API is not an MCP tool and is not reachable through the
 tunnel Host.

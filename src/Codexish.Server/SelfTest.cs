@@ -73,6 +73,7 @@ public static class SelfTest
                 await HttpTests.Run(runtime, config, password);
             }
             Restart(config);
+            await HardeningTests.Run(temp, password);
             Console.WriteLine($"SELF_TEST_PASSED: {passed}; no tunnel was opened, no desktop input was sent, " +
                 "and no ChatGPT connector measurement was performed.");
             return 0;
@@ -139,26 +140,26 @@ public static class SelfTest
             == "fix the failing test", "host_capabilities returns the latest checkpoint");
         Check(Error(tools.SessionCheckpoint("", "", [], [], [])) == "INVALID_ARGUMENT", "checkpoint requires an observable goal");
 
-        // Two ids over one directory would give the same files two independent FIFO queues.
+        // Overlapping roots are allowed; files reachable through two root ids share one FIFO queue.
         string root = runtime.Config.Roots[0].Path;
         var overlapping = new ServerConfig
         {
             StateDir = runtime.Config.StateDir + "-overlap",
             Roots = [new RootConfig { Id = "outer", Path = root }, new RootConfig { Id = "inner", Path = Path.Combine(root, "src") }]
         };
-        Check(Refused(overlapping.Validate), "a root nested inside another root is refused at startup");
+        overlapping.Validate();
+        var nested = new Workspace(overlapping);
+        Check(overlapping.Roots.Length == 2 && nested.QueueKey("outer") == nested.QueueKey("inner"),
+            "a root nested inside another root is accepted and shares the FIFO queue of the root that contains it");
         var duplicated = new ServerConfig
         {
             StateDir = runtime.Config.StateDir + "-overlap",
-            Roots = [new RootConfig { Id = "one", Path = root }, new RootConfig { Id = "two", Path = root }]
+            Roots = [new RootConfig { Id = "one", Path = root }, new RootConfig { Id = "two", Path = OperatingSystem.IsWindows() ? root.ToUpperInvariant() : root }]
         };
-        Check(Refused(duplicated.Validate), "two ids over the same directory are refused at startup");
-    }
-
-    private static bool Refused(Action action)
-    {
-        try { action(); return false; }
-        catch (ArgumentException) { return true; }
+        duplicated.Validate();
+        var twice = new Workspace(duplicated);
+        Check(duplicated.Roots.Length == 2 && twice.QueueKey("one") == twice.QueueKey("two") && twice.QueueKey("one") != nested.QueueKey("unknown"),
+            "two ids over the same directory are accepted and share one queue, compared the way the platform compares paths");
     }
 
     private static void Fences(CodexishRuntime runtime, CodexishTools tools, string root)
@@ -577,11 +578,19 @@ public static class SelfTest
 
     private static void Restart(ServerConfig config)
     {
+        string badToken = ServerConfig.NewSecret();
         using (var store = new Store(Path.Combine(config.StateDir, "codexish.db")))
         {
             store.InsertInvocation("restart-queued", "digest", "fs_write");
             store.InsertInvocation("restart-running", "digest", "fs_write");
             store.UpdateInvocationStatus("restart-running", "running");
+            // Rows whose values cannot be read back: each must stay contained to itself (P8).
+            string now = DateTimeOffset.UtcNow.ToString("o");
+            store.Execute("INSERT INTO processes(process_id,pid,start_time,state,exit_code,lifetime,root_id,updated_at) VALUES('proc_unreadable',99999999999,1,'running',NULL,'persistent','proj',$n)", ("$n", now));
+            store.Execute("INSERT INTO invocations(id,digest,tool,status,result,created_at,updated_at) VALUES('unreadable-result','d','fs_write','succeeded','{not json',$n,$n)", ("$n", now));
+            store.Execute("INSERT INTO tokens(hash,kind,client_id,audience,expires_at,revoked,pkce_used,family,scope) VALUES($h,'access','c',$a,'not a time',0,1,'','mcp')",
+                ("$h", Tokens.HashToken(badToken)), ("$a", config.Resource));
+            store.AddCheckpoint("{not json");
         }
         using var runtime = new CodexishRuntime(config);
         var tools = new CodexishTools(runtime);
@@ -592,7 +601,15 @@ public static class SelfTest
         var unknown = tools.OperationInspect("restart-running");
         Check(Error(unknown) == "EXECUTION_UNKNOWN" && Effects(unknown) == "unknown",
             "an operation running at restart becomes unknown, never an assumed success");
-        Check(Data(tools.HostCapabilities()).GetProperty("recovery").GetProperty("invocations_cancelled_on_restart").GetInt32() == 1,
+        var capabilities = tools.HostCapabilities();
+        Check(Data(capabilities).GetProperty("recovery").GetProperty("invocations_cancelled_on_restart").GetInt32() == 1,
             "restart recovery counts are reported in host_capabilities");
+        Check(Status(capabilities) == "succeeded" && Data(capabilities).GetProperty("checkpoint").GetProperty("unreadable").GetBoolean() &&
+              Data(capabilities).GetProperty("warnings").EnumerateArray().Any(w => w.GetString()!.Contains("could not be read and were skipped")),
+            "an unreadable process row and checkpoint neither stop startup nor host_capabilities, and are reported");
+        Check(Status(tools.WorkspaceInfo()) == "succeeded" && Reason(tools.OperationInspect("unreadable-result")) == "stored_result_unreadable",
+            "an unreadable stored result is reported as unreadable in that one response");
+        Check(runtime.Tokens.Validate(badToken, "access", config.Resource) is (null, "malformed_token"),
+            "a token row whose expiry cannot be read is an invalid token, not an authentication failure");
     }
 }
