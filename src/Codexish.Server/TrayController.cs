@@ -657,10 +657,16 @@ public static class TrayTests
                 "diagnostics do not contain control or client secrets");
 
             // A busy port: the first attempt fails, supervision keeps trying, and the server comes up once the port is free.
-            // The loopback port is chosen by the system; the one reserved for the user's live server is never used.
-            var blocker = new TcpListener(IPAddress.Loopback, 0);
-            blocker.Start();
-            while (((IPEndPoint)blocker.LocalEndpoint).Port == 38451) { blocker.Stop(); blocker = new TcpListener(IPAddress.Loopback, 0); blocker.Start(); }
+            // The port comes from 10000-29999, below the dynamic ranges of Windows (49152+) and Linux (32768+): a port
+            // the system hands out could become the source port of one of this test's own keep-alive connections the
+            // moment the blocker releases it, and the server could not bind it for minutes.
+            TcpListener? blocker = null;
+            while (blocker is null)
+            {
+                var candidate = new TcpListener(IPAddress.Loopback, Random.Shared.Next(10000, 30000));
+                try { candidate.Start(); blocker = candidate; }
+                catch (SocketException) { }
+            }
             int port = ((IPEndPoint)blocker.LocalEndpoint).Port;
             Directory.CreateDirectory(Path.Combine(directory, "busy-root"));
             var busyConfig = ServerConfig.Create("https://tray-busy.invalid", "test-only-password", [("busy", Path.Combine(directory, "busy-root"))], [], port, Path.Combine(directory, "busy-state"));

@@ -271,3 +271,15 @@ Run at the user's request with the Claude app in the foreground and no game runn
 Observed `focus_window` activation methods: first focus `attach_thread_input` (after `set_foreground` was not confirmed; the pre-fix code would have returned EXECUTION_UNKNOWN here), from minimized `restore` then `already_foreground`, second fixture `already_foreground`, from behind another process `set_foreground`. `alt_tap` was never needed; `activation_inputs_sent` stayed 0.
 
 Two test-harness bugs were fixed before these runs: the first focus now acts on a settled observation instead of the capture taken while the new window was still activating, and the HTTP acceptance reads `fs_read` text from `output.text`. An earlier attempt the same day was stopped because a game was in the foreground; live desktop tests must only run when no other application is in front and the user is idle.
+
+## v1.0.0 release (2026-10-23)
+
+- `main` holds v1 after PRs #1–#9; this PR adds the release workflow (`.github/workflows/release.yml`, on `v*` tags:
+  Windows build, the three suites, self-contained win-x64 zip plus SHA-256 on the GitHub release).
+- The server version comes from the assembly (`<Version>` in the project, overridden from the tag) and `/healthz`
+  reports it; the hard-coded `1.0.0-slice4` and `codexish_v1_slice4` are gone.
+- README rewritten for first-time users; the former detail moved unchanged to `docs/reference.md` and
+  `docs/p0-probe.md`, with the ChatGPT steps updated to the verified **Add → Create MCP App** flow.
+- Tray test 27 (busy port, supervised start) was flaky (about 1 in 5-10 runs): the blocker's system-assigned port
+  could be reused as the source port of the test's own keep-alive connections. It now uses a port from 10000-29999,
+  below the dynamic ranges; 10/10 local runs passed.
