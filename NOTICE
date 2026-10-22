@@ -1,0 +1,8 @@
+CODEXish
+Copyright 2026 EVSkyFall
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product bundles third-party components under their own licenses: the .NET runtime, ASP.NET Core and the
+Windows Desktop runtime (MIT), NuGet packages under MIT and Apache-2.0, SQLite (public domain) and Lucide icons
+(ISC, with Feather under MIT). See THIRD_PARTY_NOTICES.md and, in a release zip, the licenses/ folder.

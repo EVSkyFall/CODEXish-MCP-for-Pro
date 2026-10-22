@@ -190,3 +190,10 @@ dotnet run --project src/Codexish.Server -c Release -- --tray-tests
 - [Implementation status](IMPLEMENTATION_STATUS.md).
 - [P0 probe](docs/p0-probe.md): the original measurement fixture in `src/Codexish.P0`.
 - [Third-party notices](THIRD_PARTY_NOTICES.md): Lucide icons, ISC.
+
+## License
+
+CODEXish is licensed under the [Apache License 2.0](LICENSE). It is provided "as is", without warranties or
+conditions of any kind, and the authors are not liable for any damage arising from its use (sections 7 and 8 of the
+license). Bundled third-party components keep their own licenses; see [NOTICE](NOTICE) and
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

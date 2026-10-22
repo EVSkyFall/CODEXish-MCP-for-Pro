@@ -40,6 +40,9 @@ jobs:
           dotnet publish src/Codexish.Server/Codexish.Server.csproj -c Release -r win-x64 --self-contained true `
             -p:Version=$env:NUMERIC -p:InformationalVersion=$env:VERSION -o dist/CODEXish
           Copy-Item README.md, THIRD_PARTY_NOTICES.md dist/CODEXish/
+          foreach ($own in 'LICENSE', 'NOTICE') { if (Test-Path $own) { Copy-Item $own dist/CODEXish/ } }
+          # License texts and notices of the bundled .NET runtime and every NuGet package, found from this build.
+          ./scripts/collect-notices.ps1 -Assets src/Codexish.Server/obj/project.assets.json -Published dist/CODEXish -Out dist/CODEXish/licenses
           $zip = "CODEXish-$env:TAG-win-x64.zip"
           Compress-Archive -Path dist/CODEXish/* -DestinationPath $zip
           $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
