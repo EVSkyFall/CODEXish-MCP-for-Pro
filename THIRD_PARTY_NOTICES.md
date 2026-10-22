@@ -1,5 +1,13 @@
 # Third-party notices
 
+## Bundled runtime and libraries
+
+A release zip is a self-contained build: it carries the .NET runtime, ASP.NET Core and the Windows Desktop runtime
+(MIT, with Microsoft's own third-party notices), the NuGet packages CODEXish uses (MIT and Apache-2.0, including the
+Model Context Protocol C# SDK and SQLitePCLRaw), and SQLite (public domain). Their license texts and notices are in
+the zip's `licenses/` folder, listed in `licenses/INDEX.txt`. The release workflow gathers them from the build itself
+with [`scripts/collect-notices.ps1`](scripts/collect-notices.ps1), so the folder always matches what the zip contains.
+
 ## Lucide
 
 CODEXish uses icons from [Lucide](https://lucide.dev/), taken from the npm package `lucide-static` 1.61.0:
