@@ -264,6 +264,9 @@ public static class BrowserTests
                     {
                         var arguments = new Dictionary<string, JsonElement> { ["arguments"] = JsonSerializer.SerializeToElement(body) };
                         if (id is not null) arguments["invocation_id"] = JsonSerializer.SerializeToElement(id);
+                        // A ledger call answers with a handle once wait_ms passes. A slow runner can take longer than the
+                        // 1 s default before the result exists; the wait ends as soon as the result is there.
+                        if (id is not null) arguments["wait_ms"] = JsonSerializer.SerializeToElement(30000);
                         return await client.CallToolAsync(new CallToolRequestParams { Name = BrowserMounts.ToolName(mount, backend), Arguments = arguments });
                     }
                     string[] Texts(CallToolResult result) =>

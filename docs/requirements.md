@@ -28,7 +28,7 @@ MVP 완료는 P1만의 조회 성공이 아니라 **P2까지의 작업 흐름 �
 | PR-02 | 한 사용자 입력에서 관찰·수정·테스트 실패의 재계획을 이어갈 수 있는 도구와 후속 핸들을 제공한다. | P2 | [아키텍처](architecture.md) |
 | PR-03 | Chat 턴 수명, CODEXish session, operation/process 수명을 구분한다. 서버가 Chat 추론을 연장한다고 주장하지 않는다. | P0–P2 | [아키텍처](architecture.md) |
 | ARC-01 | Remote MCP Gateway와 outbound Windows Local Agent를 분리하고 PC 공개 포트를 필수로 요구하지 않는다. | P1 | [연결 구조](architecture.md) |
-| CAP-01 | READ_ONLY/FULL_CONTROL, workspace mode, 사용자 grant, 실제 실행 경계의 교집합을 집행한다. | P1–P2 | [보안](security.md) |
+| CAP-01 | READ_ONLY/FULL_CONTROL, workspace mode, 사용자 grant, 실제 실행 경계의 교집합을 집행한다. | P1–P2 | [보안](security-design-2026-09.md) |
 | CAP-02 | 실제 가용 기능과 미지원 이유를 노출한다. 임의 shell/JS/LSP 실행을 읽기 전용으로 위장하지 않는다. | P1–P3 | [도구 계약](tool-contracts.md) |
 | FS-01 | 범위·줄 번호·encoding·hash를 포함해 파일·목록·검색을 읽는다. 큰 결과는 재조회 가능하다. | P1 | [파일 도구](tool-contracts.md#3-filesystem) |
 | FS-02 | 기대 파일 상태를 검증해 patch/write하고 encoding·줄바꿈·사용자 변경을 보존한다. 부분 적용도 명시한다. | P2 | [파일 도구](tool-contracts.md#3-filesystem) |
@@ -41,10 +41,10 @@ MVP 완료는 P1만의 조회 성공이 아니라 **P2까지의 작업 흐름 �
 | BR-01 | 전용 browser profile과 opt-in attach, DOM/접근성·console/network·action을 분리 제공한다. | P1–P2 | [브라우저](tool-contracts.md#7-browser--cdp) |
 | LSP-01 | 문서 버전·위치 encoding이 명시된 진단·정의·참조·심볼·hover를 제공한다. | P3 | [LSP](tool-contracts.md#8-lsp) |
 | ART-01 | 큰 출력·이미지의 허용된 데이터를 보존하고 cursor/read/search로 접근하게 한다. 누락·redaction·만료를 표시한다. | P1 | [Artifact](tool-contracts.md#9-artifact와-큰-결과) |
-| APR-01 | 기존 허가를 재사용하고 새 권한만 신뢰할 수 있는 UI에서 확인한다. 승인은 정확한 인자·대상에 바인딩한다. | P1–P2 | [승인](security.md) |
-| SEC-01 | 사용자·기기·세션 인증과 접근 철회를 실행 경로에서 집행한다. | P1 | [보안](security.md) |
-| SEC-02 | 파일·shell·Git·LSP·CDP·GUI의 실제 권한 경계를 구분하고 우회를 시험한다. | 해당 기능 도입 시 | [실행 경계](security.md#실제-실행-경계) |
-| SEC-03 | 비밀정보와 신뢰할 수 없는 UI/파일/로그가 권한을 확대하지 못하게 한다. | P1–P3 | [보안](security.md) |
+| APR-01 | 기존 허가를 재사용하고 새 권한만 신뢰할 수 있는 UI에서 확인한다. 승인은 정확한 인자·대상에 바인딩한다. | P1–P2 | [승인](security-design-2026-09.md) |
+| SEC-01 | 사용자·기기·세션 인증과 접근 철회를 실행 경로에서 집행한다. | P1 | [보안](security-design-2026-09.md) |
+| SEC-02 | 파일·shell·Git·LSP·CDP·GUI의 실제 권한 경계를 구분하고 우회를 시험한다. | 해당 기능 도입 시 | [실행 경계](security-design-2026-09.md#실제-실행-경계) |
+| SEC-03 | 비밀정보와 신뢰할 수 없는 UI/파일/로그가 권한을 확대하지 못하게 한다. | P1–P3 | [보안](security-design-2026-09.md) |
 | RUN-01 | 같은 invocation 재전송은 합류·결과 재조회하고 효과가 불확실하면 자동 재실행하지 않는다. | P2 | [복구](architecture.md) |
 | RUN-02 | 바쁘다는 이유로 유효 요청을 거절하지 않고 자원 큐·합류를 사용한다. 실행 직전 권한·대상을 다시 검증한다. | P2 | [동시 작업](architecture.md) |
 | JRN-01 | append-only journal·checkpoint·artifact로 오류와 변경·프로세스·검증 결과를 재구성한다. | P1–P2 | [영속 상태](architecture.md) |

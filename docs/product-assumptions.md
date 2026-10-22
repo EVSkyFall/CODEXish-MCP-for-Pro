@@ -26,7 +26,7 @@
 | F-04 | 공식 문서 확인 | Responses API는 원격 MCP와 도구 결과를 지원한다. | [MCP and Connectors](https://developers.openai.com/api/docs/guides/tools-connectors-mcp). 이 API의 토큰 과금 설명을 Chat의 구독 할당량 근거로 사용하지 않는다. |
 | F-05 | 공식 문서 확인 | Secure MCP Tunnel 권한과 ChatGPT Developer mode 접근 권한은 구분된다. | [Tunnel 권한](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels#permissions-and-access). 이 프로젝트의 필수 의존성이나 Pro 계정의 이용 가능 기능으로 확정하지 않는다. |
 | D-01 | 설계 결정 | Remote MCP Gateway + outbound Windows Local Agent를 사용한다. | [아키텍처](architecture.md). 아직 구현되지 않았다. |
-| D-02 | 설계 결정 | 프로필을 구독 등급과 분리하고 실제 권한·지원 기능의 교집합만 노출한다. | [승인과 보안](security.md). MCP annotation만으로 권한을 집행하지 않는다. |
+| D-02 | 설계 결정 | 프로필을 구독 등급과 분리하고 실제 권한·지원 기능의 교집합만 노출한다. | [승인과 보안](security-design-2026-09.md). MCP annotation만으로 권한을 집행하지 않는다. |
 | V-01 | 실계정 확인 필요 | 6 Pro 선택 상태에서 연속 MCP 도구 사용과 이미지 관찰이 가능한가. | 문서상의 일반 MCP 지원만으로 이 모델의 실제 동작을 입증하지 못한다. |
 | V-02 | 실계정 확인 필요 | Chat이 긴 관찰·수정·테스트 루프를 어느 조건에서 끝내는가. | 서버가 추론 지속이나 자동 재호출을 강제할 수 있다고 가정하지 않는다. |
 | V-03 | 실환경 확인 필요 | 연결 제한, payload 크기, 관찰 지연, 승인 후 재개 동작. | 배포 환경에서 측정하고 버전·설정과 함께 기록한다. 수치를 미리 만들어 넣지 않는다. |

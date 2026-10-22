@@ -79,7 +79,7 @@ R/F는 `READ_ONLY`와 `FULL_CONTROL`, F는 `FULL_CONTROL`에서만 노출할 수
 | `fs.apply_patch` | unified diff, 대상별 expected hash | F. 변경 전후 hash·적용 결과·diff artifact |
 | `fs.mkdir`, `fs.move`, `fs.delete` | 정확한 대상, 기대 상태, 필요한 grant | F. 후속 기능. 재귀·덮어쓰기·제거 범위를 숨기지 않는다. |
 
-파일은 기본적으로 workspace 상대 경로로 지정한다. 절대 경로가 필요하면 등록된 root와의 관계를 명확하게 검증한다. `..`, 대소문자, UNC, 8.3 alias, symlink, junction, reparse point와 검사 이후 경로 교체까지 고려한다. [경로와 실제 실행 경계](security.md#실제-실행-경계)
+파일은 기본적으로 workspace 상대 경로로 지정한다. 절대 경로가 필요하면 등록된 root와의 관계를 명확하게 검증한다. `..`, 대소문자, UNC, 8.3 alias, symlink, junction, reparse point와 검사 이후 경로 교체까지 고려한다. [경로와 실제 실행 경계](security-design-2026-09.md#실제-실행-경계)
 
 텍스트 편집은 기존 encoding, BOM, 줄바꿈을 보존한다. 변환을 요청받았을 때만 변환한다. patch 적용 전후의 사용자 변경을 보호할 수 있는 조건부 교체 계약이 필요하며, hash를 한 번 읽고 무조건 덮어쓰는 구현은 충분하지 않다.
 
@@ -226,7 +226,7 @@ LSP 위치를 파일 줄 번호와 연결할 때 zero/one-based 및 UTF-16 등 �
 
 큰 텍스트는 전체 결과 위치와 다음 cursor를 주고, 모델용 이미지에는 실제 image content를 함께 제공한다. 클라이언트가 리소스 링크를 처리하지 못해도 read/search 도구로 다시 접근할 수 있어야 한다. 전체 데이터의 수집 실패는 `OUTPUT_INCOMPLETE`로, 보존 종료는 `ARTIFACT_EXPIRED`로 표시한다. 미리보기 축약 자체는 작업 실패가 아니다.
 
-보존 기간·저장량·해상도의 고정 수치는 이 설계에서 정하지 않는다. 사용자 설정과 실제 기반 서비스 제약을 표시하고, 자동 삭제나 숨은 truncation으로 진행 중인 작업의 근거를 잃지 않게 한다. [보안과 보존](security.md#비밀정보와-데이터-보존)
+보존 기간·저장량·해상도의 고정 수치는 이 설계에서 정하지 않는다. 사용자 설정과 실제 기반 서비스 제약을 표시하고, 자동 삭제나 숨은 truncation으로 진행 중인 작업의 근거를 잃지 않게 한다. [보안과 보존](security-design-2026-09.md#비밀정보와-데이터-보존)
 
 ## 10. Approval
 

@@ -1,5 +1,10 @@
 # 승인과 보안
 
+> **구현 전 설계 기록(2026-09-15).** 이 문서는 v1 이전에 검토한 Gateway/Agent 분리 구조를 전제로 해서 현재 제품과 다르다.
+> 실제 보안 정책과 취약점 제보 방법은 [SECURITY.md](../SECURITY.md)에 있다.
+> *Pre-implementation design record (2026-09-15); it describes a Gateway/Agent split that v1 did not build. The
+> current security policy is [SECURITY.md](../SECURITY.md).*
+
 이 문서는 [최상위 제품 가정](product-assumptions.md)에 따른 긴 작업 흐름을 유지하면서, 실제 사용자 권한을 각 도구의 실행 경로에서 지키기 위한 설계다. 사용자에게 이미 허가받은 작업은 매번 재확인하지 않는다. 아직 구현된 보호 기능이나 검증된 sandbox를 설명하는 문서가 아니다.
 
 ## 신뢰 경계
