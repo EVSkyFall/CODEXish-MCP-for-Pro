@@ -392,6 +392,8 @@ public static class TrayApplication
                 await owner.StopAsync();
                 candidate.Save(path);
                 editing.Roots = candidate.Roots;
+                // The running configuration is reused on the next start; recompute its warnings for the new roots.
+                editing.Validate();
                 if (candidate.Warnings.Count > 0) ShowText("CODEXish roots saved with warnings", string.Join(Environment.NewLine, candidate.Warnings));
                 form.Close();
             });
