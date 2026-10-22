@@ -31,6 +31,24 @@ public sealed record TrayOptions(bool Start = false, string? PublicUrl = null, s
             ? (value[..separator], value[(separator + 1)..])
             : ("project", value);
     }
+
+    // The first-run form's folder as roots: none when it is left empty, otherwise one root under RootEntry's id.
+    public static (string Id, string Path)[] SetupRoots(string id, string? folder) =>
+        string.IsNullOrWhiteSpace(folder) ? [] : [(id, folder.Trim())];
+
+    // The id offered for a folder chosen in a roots row that has none: the folder's name in the characters an id
+    // allows, made unique among the other rows.
+    public static string SuggestRootId(string folder, IEnumerable<string> taken)
+    {
+        string name = Path.GetFileName(Path.TrimEndingDirectorySeparator(folder.Trim()));
+        string id = new string(name.Select(c => char.IsAsciiLetterOrDigit(c) || c is '_' or '-' ? c : '-').ToArray()).Trim('-');
+        if (id.Length > 56) id = id[..56];
+        if (id.Length == 0) id = "root";
+        var used = new HashSet<string>(taken, StringComparer.OrdinalIgnoreCase);
+        string candidate = id;
+        for (int n = 2; used.Contains(candidate); n++) candidate = id + "-" + n.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        return candidate;
+    }
 }
 
 // The tray is a view/controller in the server process, not an additional identity or approval service. The server
@@ -566,6 +584,20 @@ public static class TrayTests
             Check(options.Start && options.PublicUrl == "https://pc.example" && options.Port == "3100" && options.RootEntry() == ("proj", @"C:\Projects\X") &&
                   !TrayOptions.Parse(["--tray"]).Start && TrayOptions.Parse(["--tray", "--root", @"D:\code"]).RootEntry() == ("project", @"D:\code"),
                 "--tray reads --start and the values that pre-fill the first-run form; a bare --root path becomes the root 'project'");
+            var noFolder = ServerConfig.Create("https://tray-test.invalid", "test-only-password", TrayOptions.SetupRoots("project", "  "), [], 0, Path.Combine(directory, "setup-state"));
+            Check(TrayOptions.SetupRoots("proj", @" C:\Projects\X ").SequenceEqual([("proj", @"C:\Projects\X")]) && noFolder.Roots.Length == 0 &&
+                  !noFolder.Warnings.Any(w => w.Contains("has no path", StringComparison.Ordinal)),
+                "first-run setup with an empty folder writes no root entry at all; a folder becomes one root under the --root id");
+            string separator = Path.DirectorySeparatorChar.ToString();
+            Check(TrayOptions.SuggestRootId(Path.Combine(directory, "My App") + separator, []) == "My-App" &&
+                  TrayOptions.SuggestRootId(Path.Combine(directory, "code"), ["code", "CODE-2"]) == "code-3" && TrayOptions.SuggestRootId(separator, []) == "root",
+                "a folder chosen in a roots row without an id offers its name as a unique id");
+            Check(TrayStatus.Look("server running") == TrayLook.Running && TrayStatus.Look("server running, tunnel stopped") == TrayLook.Running &&
+                  TrayStatus.Look("server stopped, tunnel stopped") == TrayLook.Stopped && TrayStatus.Look("server starting") == TrayLook.Stopped &&
+                  TrayStatus.Look("server retrying: IOException: busy") == TrayLook.Attention &&
+                  TrayStatus.Look("server running, tunnel retrying: exited with code 1") == TrayLook.Attention && TrayStatus.Look(null) == TrayLook.Attention &&
+                  TrayStatus.Line("server running, tunnel stopped") == "Server running, tunnel stopped" && TrayStatus.Line("server retrying: " + new string('x', 100)).Length == 64,
+                "the tray icon shows running, stopped, or attention while a part retries or the configuration is not loaded");
 
             var config = ServerConfig.Create("https://tray-test.invalid", "test-only-password", [("test", Path.Combine(directory, "root"))], [], 0, Path.Combine(directory, "state"));
             Check(config.OAuth.RefreshTokenDays == 0, "a new configuration keeps refresh tokens without expiry");

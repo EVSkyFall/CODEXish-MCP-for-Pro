@@ -1,0 +1,17 @@
+<!-- Tray icon, state "stopped": the CODEXish mark (codexish.svg) with its prompt moved up and left, and a status badge cut
+     out of the tile's bottom-right corner. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 24 24">
+  <defs>
+    <clipPath id="badge-cut">
+      <path clip-rule="evenodd" d="M0 0H24V24H0Z M19.5 13.5a6 6 0 1 0 0 12a6 6 0 1 0 0-12Z" />
+    </clipPath>
+  </defs>
+  <g clip-path="url(#badge-cut)">
+    <rect x="1.5" y="1.5" width="21" height="21" rx="4.5" fill="#005FB8" />
+    <g transform="translate(10.25 10.25) scale(1.2) translate(-11 -10)" fill="none" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="m7 11 2-2-2-2" />
+      <path d="M11 13h4" />
+    </g>
+  </g>
+  <circle cx="19.5" cy="19.5" r="4.5" fill="#9AA0A6" />
+</svg>

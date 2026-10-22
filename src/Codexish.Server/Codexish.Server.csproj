@@ -23,4 +23,11 @@
     <PackageReference Include="SQLitePCLRaw.lib.e_sqlite3" Version="2.1.12" />
     <PackageReference Include="System.Drawing.Common" Version="10.0.0" Condition="!$([MSBuild]::IsOSPlatform('Windows'))" />
   </ItemGroup>
+  <!-- Icons and glyphs rasterized from assets/ by assets/build-icons.ps1; the build only copies them in. -->
+  <PropertyGroup Condition="$([MSBuild]::IsOSPlatform('Windows'))">
+    <ApplicationIcon>..\..\assets\generated\codexish.ico</ApplicationIcon>
+  </PropertyGroup>
+  <ItemGroup Condition="$([MSBuild]::IsOSPlatform('Windows'))">
+    <EmbeddedResource Include="..\..\assets\generated\*.ico;..\..\assets\generated\glyphs-*.png;..\..\assets\generated\glyphs.txt" LogicalName="Codexish.Assets.%(Filename)%(Extension)" />
+  </ItemGroup>
 </Project>

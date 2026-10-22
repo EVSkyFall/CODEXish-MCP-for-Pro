@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/generated/codexish-256.png" alt="CODEXish icon" width="96" height="96"></p>
+
 # CODEXish MCP for Pro
 
 A single C#/.NET 10 Streamable HTTP application that gives a ChatGPT connector real tools on a Windows PC.
@@ -14,6 +16,18 @@ Two projects live here:
 
 Design decisions for v1 are in [docs/v1-design.md](docs/v1-design.md) and the slice order is in
 [docs/v1-plan.md](docs/v1-plan.md).
+
+## Screenshots
+
+The tray's windows and the sign-in page follow Windows' light or dark mode. The window images are
+`--design-preview` renders at 100% (see [Tests](#tests)); the sign-in page is the same command's HTML in a browser.
+
+| | Light | Dark |
+|---|---|---|
+| First-run setup | <img src="docs/images/setup-light.png" alt="First-run setup, light" width="300"> | <img src="docs/images/setup-dark.png" alt="First-run setup, dark" width="300"> |
+| Connection details | <img src="docs/images/connection-details-light.png" alt="Connection details, light" width="300"> | <img src="docs/images/connection-details-dark.png" alt="Connection details, dark" width="300"> |
+| Sign-in page | <img src="docs/images/sign-in-light.png" alt="Sign-in page, light" width="300"> | <img src="docs/images/sign-in-dark.png" alt="Sign-in page, dark" width="300"> |
+| Tray menu | <img src="docs/images/tray-menu-light.png" alt="Tray menu, light" width="220"> | <img src="docs/images/tray-menu-dark.png" alt="Tray menu, dark" width="220"> |
 
 ## v1 slice 1: coding core
 
@@ -311,11 +325,15 @@ per configuration file, however its path is spelled (a junction, symbolic link o
 file): a second `--tray` for the same `codexish.json` says "CODEXish is already running; its icon is in the
 notification area" and exits.
 
-Without a configuration file the tray first shows a setup form: public https origin, local port (3000 unless
-`--port` says otherwise), one project root, a new CODEXish password, the OAuth callback and **Start CODEXish when I
-sign in to Windows**, which is checked. `--public-url`, `--port` and `--root` only pre-fill the form; the password is
-never taken from the command line. The form writes the file like `--init`, shows the client secret once (with any
-warnings), and then starts the server and a configured tunnel. When the file exists but cannot be loaded even from
+Without a configuration file the tray first shows a setup form. Its connection section asks for the public https
+origin, the local port (3000 unless `--port` says otherwise), a new CODEXish password (with a show/hide button) and
+the OAuth callback; its sharing section for one project folder, with **Browse…**. **Start CODEXish when I sign in to
+Windows** is checked. `--public-url`, `--port` and `--root` only pre-fill the form; the password is never taken from
+the command line. A folder left empty writes no root at all; folders can be added later with **Edit roots and
+grants**. The form writes the file like `--init` and shows the connection details once: the MCP endpoint, the client
+ID and the masked client secret, each with **Copy**, and any warnings. ChatGPT registers itself (Create MCP App, then
+OAuth), so the client ID and secret are only for apps that ask for them. The tray then starts the server and a
+configured tunnel. When the file exists but cannot be loaded even from
 `codexish.json.bak`, or its `public_url` is http, the icon starts anyway, shows the reason in a balloon and in the
 status window, offers **Open configuration folder**, and tries again every minute; once the file loads, it starts
 the server and a configured tunnel.
@@ -326,6 +344,11 @@ location) from the executable's folder, with the console window minimized; unche
 the tray starts and the shortcut names a file that no longer exists, for example after the install folder moved, the
 shortcut is rewritten to the running executable. `--start` starts the server once the tray is up, then the tunnel if
 `tunnel.command` is configured. A plain `--tray` waits for **Start server**.
+
+The icon shows the state with a badge: green while the server runs, grey while it is stopped, and amber while the
+server or the owned tunnel is retrying or the configuration has not loaded. The first row of the menu repeats it, and
+double-clicking the icon opens the status. The menu, the windows and their icons follow Windows' light or dark app
+mode and the display scale of the screen they open on.
 
 The server and the owned tunnel are supervised. A failed server start (a busy port, for example), a server that
 stops without being asked to, and an owned tunnel that exits without being asked to are retried after 1 s, doubling
@@ -338,7 +361,8 @@ failure and restart is in the connection log with its cause.
 
 The menu also offers status with roots, processes and registered clients, pause and resume, stopping session
 children, revoking all tokens, **Remove registered clients**, the connection log, **Open configuration folder**, and
-**Edit roots and grants**, which stops the server and saves the file. The connection log window shows the latest 5,000 lines; every line, redacted the same way, is also
+**Edit roots and grants**: each root with its folder (**Browse…**) and Read, Write and Shell, **Add root** and a
+remove button per row; **Save and restart** saves the file and restarts whatever was running, server and owned tunnel, so ChatGPT stays connected. The connection log window shows the latest 5,000 lines; every line, redacted the same way, is also
 appended to `<state_dir>\logs\tray-<yyyyMMdd>.log`, which the window names and retention removes after
 `output_days`.
 
@@ -379,6 +403,13 @@ Explicit local checks, never run in CI:
 - `--browser-live-test <node.exe> <@playwright/mcp cli.js> <chrome.exe>`: a headless browser with a dedicated
   profile against a loopback page served by the test itself.
 - `--tray-smoke-test`: creates and removes a notification icon.
+- `--design-preview <dir>`: renders the setup, connection details, roots and text windows, the tray menu and the
+  tray icons to PNG at 100% and 150%, light and dark, and writes the sign-in and error pages as HTML. Every window is
+  created hidden and printed, so nothing appears on screen; it opens no server, port or configuration. Windows only
+  for the PNGs.
+- `assets/build-icons.ps1` regenerates `assets/generated` (the app and tray icons and the glyph sheets) from the SVG
+  sources in `assets/`; the build only embeds its output. Lucide's license is in
+  [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 - `--self-test-desktop` and `--self-test-desktop-http`: control a new self-owned window on the interactive desktop,
   the second through the authenticated HTTP host. Both take the foreground and send real input.
 
