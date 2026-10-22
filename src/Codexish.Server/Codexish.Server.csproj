@@ -3,6 +3,7 @@
     <TargetFramework>net10.0</TargetFramework>
     <TargetFramework Condition="$([MSBuild]::IsOSPlatform('Windows'))">net10.0-windows</TargetFramework>
     <UseWPF Condition="$([MSBuild]::IsOSPlatform('Windows'))">true</UseWPF>
+    <UseWindowsForms Condition="$([MSBuild]::IsOSPlatform('Windows'))">true</UseWindowsForms>
     <OutputType>Exe</OutputType>
     <DisableWinExeOutputInference>true</DisableWinExeOutputInference>
     <ImplicitUsings>enable</ImplicitUsings>
@@ -14,6 +15,9 @@
     <AssemblyName>Codexish.Server</AssemblyName>
   </PropertyGroup>
   <ItemGroup>
+    <!-- Windows Forms' implicit usings would make WPF and System.Drawing type names ambiguous; the tray aliases them. -->
+    <Using Remove="System.Windows.Forms" />
+    <Using Remove="System.Drawing" />
     <PackageReference Include="ModelContextProtocol.AspNetCore" Version="2.2.0" />
     <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.0" />
     <PackageReference Include="SQLitePCLRaw.lib.e_sqlite3" Version="2.1.12" />

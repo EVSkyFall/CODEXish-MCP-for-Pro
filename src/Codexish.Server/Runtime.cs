@@ -6,7 +6,7 @@ namespace Codexish.Server;
 public sealed class CodexishRuntime : IDisposable
 {
     public const string ProtocolVersion = "2025-11-25";
-    public const string ServerVersion = "1.0.0-slice2";
+    public const string ServerVersion = "1.0.0-slice4";
     private readonly Lazy<DesktopService> desktop = new(() => new DesktopService());
     public DesktopService Desktop => desktop.Value;
 
@@ -20,6 +20,7 @@ public sealed class CodexishRuntime : IDisposable
     public ProcessSupervisor Processes { get; }
     public GitService Git { get; }
     public Tokens Tokens { get; }
+    public BrowserMounts Browsers { get; }
     public bool AuthDisabled { get; }
     public string HooksDirectory { get; }
     public IReadOnlyList<object> RecoveredProcesses { get; }
@@ -50,6 +51,7 @@ public sealed class CodexishRuntime : IDisposable
         Processes = new ProcessSupervisor(Store, Artifacts, config);
         Git = new GitService(config, Workspace, Artifacts, Store, HooksDirectory);
         Tokens = new Tokens(Store, config);
+        Browsers = new BrowserMounts(this);
         RecoveredInvocations = Store.RecoverInvocations();
         RecoveredProcesses = Processes.Recover();
         Store.Event("server_start", null, new { version = ServerVersion, auth = authDisabled ? "disabled" : "oauth" });
@@ -71,7 +73,7 @@ public sealed class CodexishRuntime : IDisposable
     private static readonly (string Feature, string Reason)[] Unsupported =
     [
 
-        ("browser_*", "An external browser MCP is mounted in slice 3; this server does not drive a browser."),
+        ("browser automation of its own", "Browser tools come only from configured browser_mounts backends (see browser); this server adds no browser driver and no network sandbox."),
         ("lsp_*", "Not implemented; diagnostics come from the project's own build and test commands through shell_run."),
         ("git write tools (commit, checkout, push)", "Deliberate: Git writes run through shell_run under the root's shell grant, so one execution policy covers them."),
         ("approval tools", "There is no per-action approval UI. Grants live in codexish.json and are decided by the local user."),
@@ -93,7 +95,8 @@ public sealed class CodexishRuntime : IDisposable
             user_privilege_scope = "shell_run, process_start, builds, tests and any git hook run as the logged-in Windows user."
         },
         roots = Config.Roots.Select(r => new { id = r.Id, path = r.Path, grants = new { r.Read, r.Write, r.Shell } }),
-        tools = ToolNames,
+        tools = ToolNames.Concat(Browsers.Tools.Select(t => t.ProtocolTool.Name)).ToArray(),
+        browser = Browsers.Describe(),
         desktop = new { native_available = OperatingSystem.IsWindows(), coordinate_space = "virtual desktop physical pixels", uia_thread = "dedicated MTA", input_tick = "metadata only" },
         unsupported = Unsupported.Select(u => new { feature = u.Feature, reason = u.Reason }),
         limits = Limits.Describe(),
@@ -172,8 +175,11 @@ public sealed class CodexishRuntime : IDisposable
     {
         if (disposed) return;
         disposed = true;
+        Browsers.Stop();
         Ledger.Dispose();
         Processes.Dispose();
+        // The thread pool keeps a caller's UI synchronization context from deadlocking the asynchronous disposal.
+        Task.Run(() => Browsers.DisposeAsync().AsTask()).GetAwaiter().GetResult();
         if (desktop.IsValueCreated) desktop.Value.Dispose();
         Store.Event("server_stop", null, new { });
         Store.Dispose();

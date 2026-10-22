@@ -10,6 +10,9 @@ namespace Codexish.Server;
 internal static class GitTests
 {
     private static string markers = "";
+    private static string emptyGlobalConfig = "";
+    // Test-harness stall diagnostic only: product git calls have no timeout.
+    private static TimeSpan stallAfter = TimeSpan.FromSeconds(120);
 
     public static async Task Run(CodexishRuntime runtime, CodexishTools tools, string root)
     {
@@ -24,20 +27,34 @@ internal static class GitTests
         string traps = Path.Combine(temp, "traps");
         Directory.CreateDirectory(markers);
         Directory.CreateDirectory(traps);
+        emptyGlobalConfig = Path.Combine(temp, "empty-global.gitconfig");
+        File.WriteAllText(emptyGlobalConfig, "");
+        var probe = new ProcessStartInfo(git);
+        probe.Environment["GIT_CONFIG_COUNT"] = "1";
+        probe.Environment["GIT_PAGER"] = "inherited";
+        probe.Environment["GIT_OPTIONAL_LOCKS"] = "1";
+        PrepareEnvironment(probe, false);
+        Check(probe.Environment.Keys.Where(k => k.StartsWith("GIT_", StringComparison.OrdinalIgnoreCase)).Order(StringComparer.Ordinal)
+                .SequenceEqual(["GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_TERMINAL_PROMPT"]),
+            "the git fixture helper removes every inherited GIT_* variable and sets only its own");
+        string[] stall = FormatStall([(10, 1, "git.exe", "git fetch origin"), (11, 10, "sh", "sh -c sleep"), (20, 2, "git.exe", "git push https://user@elsewhere.invalid")], 10);
+        Check(stall.Length == 3 && stall[0].EndsWith("stalled_tree git fetch origin", StringComparison.Ordinal) && stall[1].EndsWith("stalled_tree sh -c sleep", StringComparison.Ordinal) &&
+            stall[2] == "pid=20 parent=2 other_git name=git.exe",
+            "stall diagnostics print command lines only for the stalled git process tree");
 
-        if (Raw(git, root, "init", "-b", "main") != 0)
+        if (Setup(git, root, "init", "-b", "main") != 0)
         {
             Skip("git checks: git init failed in this environment");
             return;
         }
-        Raw(git, root, "config", "user.email", "selftest@example.invalid");
-        Raw(git, root, "config", "user.name", "CODEXish self test");
+        Setup(git, root, "config", "user.email", "selftest@example.invalid");
+        Setup(git, root, "config", "user.name", "CODEXish self test");
         File.WriteAllText(Path.Combine(root, "tracked.txt"), "first\nsecond\n", new UTF8Encoding(false));
-        Raw(git, root, "add", "tracked.txt");
-        Raw(git, root, "commit", "-m", "initial commit");
+        Setup(git, root, "add", "tracked.txt");
+        Setup(git, root, "commit", "-m", "initial commit");
         File.WriteAllText(Path.Combine(root, "tracked.txt"), "first\nCHANGED\n", new UTF8Encoding(false));
         File.WriteAllText(Path.Combine(root, "staged.txt"), "staged content\n", new UTF8Encoding(false));
-        Raw(git, root, "add", "staged.txt");
+        Setup(git, root, "add", "staged.txt");
         File.WriteAllText(Path.Combine(root, "untracked.txt"), "untracked content\n", new UTF8Encoding(false));
 
         // Traps are installed only after the setup writes, so setup does not trip them.
@@ -48,21 +65,22 @@ internal static class GitTests
         foreach (string hook in new[] { "post-index-change", "pre-auto-gc", "post-checkout", "fsmonitor-watchman", "pre-commit" })
             Trap(Path.Combine(hooks, hook), "hook-" + hook);
         string Posix(string path) => path.Replace('\\', '/');
-        Raw(git, root, "config", "core.fsmonitor", Posix(Path.Combine(traps, "fsmonitor.sh")));
-        Raw(git, root, "config", "diff.external", Posix(Path.Combine(traps, "external.sh")));
-        Raw(git, root, "config", "diff.marker.textconv", Posix(Path.Combine(traps, "textconv.sh")));
-        Raw(git, root, "config", "core.pager", Posix(Path.Combine(traps, "pager.sh")));
-        Raw(git, root, "config", "core.editor", Posix(Path.Combine(traps, "editor.sh")));
+        Setup(git, root, "config", "core.fsmonitor", Posix(Path.Combine(traps, "fsmonitor.sh")));
+        Setup(git, root, "config", "diff.external", Posix(Path.Combine(traps, "external.sh")));
+        Setup(git, root, "config", "diff.marker.textconv", Posix(Path.Combine(traps, "textconv.sh")));
+        Setup(git, root, "config", "core.pager", Posix(Path.Combine(traps, "pager.sh")));
+        Setup(git, root, "config", "core.editor", Posix(Path.Combine(traps, "editor.sh")));
         // A clean filter also runs during status and diff, which is why the tools read the declared filter
         // names and disable them before the real query.
-        Raw(git, root, "config", "filter.marker.clean", Posix(Path.Combine(traps, "clean.sh")));
-        Raw(git, root, "config", "filter.marker.smudge", Posix(Path.Combine(traps, "smudge.sh")));
-        Raw(git, root, "config", "filter.marker.required", "true");
+        Setup(git, root, "config", "filter.marker.clean", Posix(Path.Combine(traps, "clean.sh")));
+        Setup(git, root, "config", "filter.marker.smudge", Posix(Path.Combine(traps, "smudge.sh")));
+        Setup(git, root, "config", "filter.marker.required", "true");
         File.WriteAllText(Path.Combine(root, ".gitattributes"), "*.txt diff=marker filter=marker\n", new UTF8Encoding(false));
 
-        // Control: the same repository without the fixed options must actually execute the trap.
-        Raw(git, root, "status", "--porcelain=v2");
-        Raw(git, root, "diff");
+        // Control: the same repository without the fixed options must actually execute the trap, so these runs
+        // keep the repository's trapped keys and optional locks.
+        Control(git, root, "status", "--porcelain=v2");
+        Control(git, root, "diff");
         var tripped = Directory.GetFiles(markers).Select(Path.GetFileName).OrderBy(n => n, StringComparer.Ordinal).ToArray();
         Check(tripped.Length > 0, $"the repository traps really execute when git runs unprotected ({string.Join(", ", tripped)})");
         Check(tripped.Contains("clean.marker"),
@@ -117,19 +135,128 @@ internal static class GitTests
                 UnixFileMode.GroupRead | UnixFileMode.GroupExecute | UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
     }
 
-    private static int Raw(string git, string cwd, params string[] arguments)
+    // Fixture construction must not depend on the machine: system/global config can enable an fsmonitor daemon,
+    // auto maintenance or line-ending conversion, and a detached helper that inherits the output pipes never lets
+    // them reach EOF.
+    private static int Setup(string git, string cwd, params string[] arguments) => Raw(git, cwd, true, arguments);
+
+    private static int Control(string git, string cwd, params string[] arguments) => Raw(git, cwd, false, arguments);
+
+    private static int Raw(string git, string cwd, bool hermetic, params string[] arguments)
     {
         var start = new ProcessStartInfo(git)
         {
-            WorkingDirectory = cwd, UseShellExecute = false, RedirectStandardOutput = true,
-            RedirectStandardError = true, CreateNoWindow = true
+            WorkingDirectory = cwd, UseShellExecute = false, RedirectStandardInput = true,
+            RedirectStandardOutput = true, RedirectStandardError = true, CreateNoWindow = true
         };
+        if (hermetic)
+            foreach (string option in new[] { "core.fsmonitor=false", "maintenance.auto=false", "gc.auto=0", "core.autocrlf=false" })
+            {
+                start.ArgumentList.Add("-c");
+                start.ArgumentList.Add(option);
+            }
         foreach (string argument in arguments) start.ArgumentList.Add(argument);
-        start.Environment["GIT_TERMINAL_PROMPT"] = "0";
+        PrepareEnvironment(start, hermetic);
         using var process = Process.Start(start)!;
-        process.StandardOutput.ReadToEnd();
-        process.StandardError.ReadToEnd();
-        process.WaitForExit();
+        process.StandardInput.Close();
+        var stdout = process.StandardOutput.ReadToEndAsync();
+        var stderr = process.StandardError.ReadToEndAsync();
+        if (!Task.WhenAll(stdout, stderr, process.WaitForExitAsync()).Wait(stallAfter))
+        {
+            string command = "git " + string.Join(' ', start.ArgumentList);
+            // Both are read before the diagnostics and the kill, which change them.
+            bool exited = process.HasExited, pipesOpen = !stdout.IsCompleted || !stderr.IsCompleted;
+            Console.WriteLine("STALL " + command);
+            foreach (string line in ProcessDiagnostics(process.Id)) Console.WriteLine("STALL " + line);
+            try { process.Kill(entireProcessTree: true); } catch (Exception) { /* it may already have exited while a helper holds the pipes */ }
+            throw new InvalidOperationException(
+                $"git fixture command did not finish within {stallAfter.TotalSeconds:0} s (git exited={exited}, output pipes still open={pipesOpen}): {command}. " +
+                "The STALL lines list the stalled process tree and every git process with its command line.");
+        }
         return process.ExitCode;
+    }
+
+    // Inherited GIT_* variables (GIT_CONFIG_COUNT/KEY/VALUE, GIT_DIR, pager or diff settings) would change what the
+    // fixture builds and what the control run proves, so only the variables set here reach git.
+    private static void PrepareEnvironment(ProcessStartInfo start, bool hermetic)
+    {
+        foreach (string name in start.Environment.Keys.Where(k => k.StartsWith("GIT_", StringComparison.OrdinalIgnoreCase)).ToArray())
+            start.Environment.Remove(name);
+        start.Environment["GIT_TERMINAL_PROMPT"] = "0";
+        start.Environment["GIT_CONFIG_NOSYSTEM"] = "1";
+        start.Environment["GIT_CONFIG_GLOBAL"] = emptyGlobalConfig;
+        if (hermetic) start.Environment["GIT_OPTIONAL_LOCKS"] = "0";
+    }
+
+    // Command lines are printed only for the stalled process tree; an unrelated git process's command line can carry
+    // credentials, so only its identity is printed.
+    private static string[] FormatStall(IReadOnlyList<(int Pid, int Parent, string Name, string CommandLine)> rows, int stalled)
+    {
+        var tree = new HashSet<int> { stalled };
+        for (bool grew = true; grew; )
+        {
+            grew = false;
+            foreach (var row in rows)
+                if (tree.Contains(row.Parent) && tree.Add(row.Pid)) grew = true;
+        }
+        return rows.Where(r => tree.Contains(r.Pid) || r.Name.StartsWith("git", StringComparison.OrdinalIgnoreCase))
+            .Select(r => tree.Contains(r.Pid)
+                ? $"pid={r.Pid} parent={r.Parent} stalled_tree {Redaction.Apply(r.CommandLine).Text}"
+                : $"pid={r.Pid} parent={r.Parent} other_git name={r.Name}")
+            .ToArray();
+    }
+
+    // Lists the stalled process's descendants with command lines and other git processes by name, for the stall report.
+    private static IEnumerable<string> ProcessDiagnostics(int stalled)
+    {
+        var rows = new List<(int Pid, int Parent, string Name, string CommandLine)>();
+        try
+        {
+            if (OperatingSystem.IsWindows())
+            {
+                // System.Diagnostics.Process does not expose command lines; CIM does without another package.
+                var start = new ProcessStartInfo("powershell.exe")
+                {
+                    UseShellExecute = false, RedirectStandardInput = true, RedirectStandardOutput = true,
+                    RedirectStandardError = true, CreateNoWindow = true
+                };
+                foreach (string argument in new[] { "-NoProfile", "-NonInteractive", "-Command",
+                    "Get-CimInstance Win32_Process | ForEach-Object { \"$($_.ProcessId)`t$($_.ParentProcessId)`t$($_.Name)`t$($_.CommandLine)\" }" })
+                    start.ArgumentList.Add(argument);
+                using var lister = Process.Start(start)!;
+                lister.StandardInput.Close();
+                var output = lister.StandardOutput.ReadToEndAsync();
+                var errors = lister.StandardError.ReadToEndAsync();
+                if (!Task.WhenAll(output, errors, lister.WaitForExitAsync()).Wait(TimeSpan.FromSeconds(60)))
+                {
+                    try { lister.Kill(entireProcessTree: true); } catch (Exception) { }
+                    return ["process listing did not finish"];
+                }
+                foreach (string line in output.Result.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                {
+                    string[] fields = line.Split('\t', 4);
+                    if (fields.Length == 4 && int.TryParse(fields[0], out int pid) && int.TryParse(fields[1], out int parent))
+                        rows.Add((pid, parent, fields[2], fields[3]));
+                }
+            }
+            else
+            {
+                foreach (string directory in Directory.EnumerateDirectories("/proc"))
+                {
+                    if (!int.TryParse(Path.GetFileName(directory), out int pid)) continue;
+                    try
+                    {
+                        string stat = File.ReadAllText(Path.Combine(directory, "stat"));
+                        string[] after = stat[(stat.LastIndexOf(')') + 2)..].Split(' ');
+                        string name = stat[(stat.IndexOf('(') + 1)..stat.LastIndexOf(')')];
+                        string commandLine = File.ReadAllText(Path.Combine(directory, "cmdline")).Replace('\0', ' ').Trim();
+                        rows.Add((pid, int.Parse(after[1]), name, commandLine));
+                    }
+                    catch (Exception) { /* the process ended while it was being listed */ }
+                }
+            }
+        }
+        catch (Exception e) { return [$"process listing failed: {e.GetType().Name}"]; }
+        return FormatStall(rows, stalled);
     }
 }

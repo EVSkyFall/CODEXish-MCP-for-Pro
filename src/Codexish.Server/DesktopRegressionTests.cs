@@ -25,7 +25,7 @@ public static class DesktopRegressionTests
             new("d", "TabItem", "Untitled", new(140, 320, 100, 30), false, false, true, false, true, null)]);
         public long HitTest(int x, int y) => Window.Handle;
         public int Send(DesktopInput[] inputs, DesktopRect desktop) { Sent++; return inputs.Length; }
-        public bool WindowAction(DesktopWindow window, string action)
+        public WindowActionResult WindowAction(DesktopWindow window, string action)
         {
             Window = action switch
             {
@@ -34,7 +34,8 @@ public static class DesktopRegressionTests
                 "restore_window" => Window with { Bounds = new(100, 100, 600, 400), Minimized = false },
                 _ => Window
             };
-            return true;
+            string method = action == "focus_window" ? "set_foreground" : "show_window_async";
+            return new(true, method, 0, [method]);
         }
     }
     private static JsonElement Data(CallToolResult result) => result.StructuredContent!.Value.GetProperty("data");
