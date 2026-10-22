@@ -1,8 +1,9 @@
-name: v1 slice 1 build and tool tests
+name: v1 build and tool tests
 on:
   push:
-    branches: ['feat/v1-**']
+    branches: [main]
   pull_request:
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:

@@ -1,8 +1,9 @@
 name: P0 build and protocol tests
 on:
   push:
-    branches: ['feat/p0-review-response-20260915']
+    branches: [main]
   pull_request:
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
