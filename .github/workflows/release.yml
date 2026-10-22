@@ -1,0 +1,61 @@
+name: release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to (re)build, for example v1.0.0
+        required: true
+permissions:
+  contents: write
+jobs:
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Version from the tag
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          # The assembly version must be numeric, so the tag has to start with v<major>.<minor>.<patch>.
+          if ($env:TAG -notmatch '^v(\d+\.\d+\.\d+)(.*)$') { throw "Tag '$env:TAG' does not start with v<major>.<minor>.<patch>." }
+          "TAG=$env:TAG" >> $env:GITHUB_ENV
+          "VERSION=$($Matches[1])$($Matches[2])" >> $env:GITHUB_ENV
+          "NUMERIC=$($Matches[1])" >> $env:GITHUB_ENV
+      - run: dotnet build src/Codexish.Server/Codexish.Server.csproj -c Release -p:Version=$env:NUMERIC -p:InformationalVersion=$env:VERSION
+      - run: dotnet run --project src/Codexish.Server/Codexish.Server.csproj --no-build -c Release -- --self-test
+      - run: dotnet run --project src/Codexish.Server/Codexish.Server.csproj --no-build -c Release -- --browser-tests
+      - run: dotnet run --project src/Codexish.Server/Codexish.Server.csproj --no-build -c Release -- --tray-tests
+      - name: Publish self-contained win-x64
+        run: |
+          dotnet publish src/Codexish.Server/Codexish.Server.csproj -c Release -r win-x64 --self-contained true `
+            -p:Version=$env:NUMERIC -p:InformationalVersion=$env:VERSION -o dist/CODEXish
+          Copy-Item README.md, THIRD_PARTY_NOTICES.md dist/CODEXish/
+          $zip = "CODEXish-$env:TAG-win-x64.zip"
+          Compress-Archive -Path dist/CODEXish/* -DestinationPath $zip
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -Path "$zip.sha256" -Value "$hash  $zip" -NoNewline
+          "ZIP=$zip" >> $env:GITHUB_ENV
+      - name: Attach to the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $notes = "docs/release-notes/$env:TAG.md"
+          gh release view $env:TAG *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:TAG $env:ZIP "$env:ZIP.sha256" --clobber
+          } elseif (Test-Path $notes) {
+            gh release create $env:TAG $env:ZIP "$env:ZIP.sha256" --verify-tag --title "CODEXish $env:TAG" --notes-file $notes
+          } else {
+            gh release create $env:TAG $env:ZIP "$env:ZIP.sha256" --verify-tag --title "CODEXish $env:TAG" --generate-notes
+          }
+          if ($LASTEXITCODE -ne 0) { throw "Publishing the release failed." }

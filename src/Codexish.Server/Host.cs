@@ -84,7 +84,8 @@ public static class CodexishHost
 
         app.MapGet("/healthz", () => new
         {
-            status = "codexish_v1_slice4",
+            status = "codexish",
+            version = CodexishRuntime.ServerVersion,
             authentication = runtime.AuthDisabled ? "disabled" : "oauth_bearer",
             binding = "loopback_only",
             paused = runtime.Ledger.Paused

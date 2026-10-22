@@ -1,3 +1,4 @@
+using System.Reflection;
 using System.Text.Json;
 using ModelContextProtocol.Protocol;
 
@@ -6,7 +7,10 @@ namespace Codexish.Server;
 public sealed class CodexishRuntime : IDisposable
 {
     public const string ProtocolVersion = "2025-11-25";
-    public const string ServerVersion = "1.0.0-slice4";
+    // From the assembly, so a release only sets the version at build time; "+<commit>" build metadata is dropped.
+    public static readonly string ServerVersion =
+        typeof(CodexishRuntime).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion.Split('+')[0]
+        ?? typeof(CodexishRuntime).Assembly.GetName().Version?.ToString(3) ?? "0.0.0";
     private readonly Lazy<DesktopService> desktop = new(() => new DesktopService());
     public DesktopService Desktop => desktop.Value;
 
