@@ -187,7 +187,9 @@ internal static class HardeningTests
         Check(fallback.Port == 3001 && File.ReadAllBytes(path).SequenceEqual(other) && keptNote.Contains("without overwriting", StringComparison.Ordinal),
             "when the file changed to something unreadable again, the backup is loaded without overwriting that newer file");
 
-        var at = DateTimeOffset.UtcNow;
+        // A fixed past instant: Recover above stamped its own copy with the current time, and a stamp is only
+        // millisecond-precise, so "now" could already be taken.
+        var at = new DateTimeOffset(2001, 2, 3, 4, 5, 6, 789, TimeSpan.Zero);
         string first = ServerConfig.KeepBroken(path, [1], at), second = ServerConfig.KeepBroken(path, [2], at), third = ServerConfig.KeepBroken(path, [3], at);
         var recognized = global::Codexish.Server.Retention.UnreadableConfiguration("codexish.json");
         Check(first == path + ".broken-" + ServerConfig.UtcStamp(at) && second == first + "-2" && third == first + "-3" &&
