@@ -1,6 +1,5 @@
 #if WINDOWS
 using Forms = System.Windows.Forms;
-using Drawing = System.Drawing;
 #endif
 using System.Diagnostics;
 using System.Security.Cryptography;
@@ -117,6 +116,25 @@ public static class TrayInstance
     }
 }
 
+public enum TrayLook { Running, Stopped, Attention }
+
+// What the tray icon and the menu's header show for TrayController.Status; null means the configuration is not loaded.
+public static class TrayStatus
+{
+    // Running once the server runs and nothing retries; attention while a part retries or nothing is loaded.
+    public static TrayLook Look(string? status) =>
+        status is null || status.Contains("retrying", StringComparison.Ordinal) ? TrayLook.Attention
+        : status.StartsWith("server running", StringComparison.Ordinal) ? TrayLook.Running
+        : TrayLook.Stopped;
+
+    // The header's status line, capitalized and shortened so a long retry cause cannot widen the whole menu.
+    public static string Line(string? status)
+    {
+        string text = string.IsNullOrEmpty(status) ? "Configuration error, retrying every minute" : char.ToUpperInvariant(status[0]) + status[1..];
+        return text.Length <= 64 ? text : text[..63] + "…";
+    }
+}
+
 // Windows Forms exists only in the Windows build; elsewhere the command-line server remains the whole product.
 public static class TrayApplication
 {
@@ -137,6 +155,9 @@ public static class TrayApplication
             {
                 Forms.Application.EnableVisualStyles();
                 Forms.Application.SetCompatibleTextRenderingDefault(false);
+                // Light or dark as Windows' app mode says; where that cannot be followed, the windows stay light.
+                try { Forms.Application.SetColorMode(Forms.SystemColorMode.System); }
+                catch (Exception error) { Console.Error.WriteLine("The tray keeps the light color mode: " + error.GetType().Name + ": " + error.Message); }
                 if (!smoke)
                 {
                     instance = TrayInstance.TryAcquire(path);
@@ -212,9 +233,57 @@ public static class TrayApplication
         }
     }
 
+    internal sealed record MenuActions(Func<Task> Status, Func<Task> Log, Func<Task> StartServer, Func<Task> StopServer,
+        Func<Task> StartTunnel, Func<Task> StopTunnel, Func<Task> Pause, Func<Task> Resume, Func<Task> StopChildren,
+        Func<Task> RevokeTokens, Func<Task> RemoveClients, Func<Task> EditRoots, Func<Task> OpenFolder, Func<Task> StartWithWindows,
+        Func<Task> Exit);
+
+    // The tray menu in display order, grouped by what the items act on; --design-preview builds the same menu.
+    internal static (TrayMenu Menu, Forms.ToolStripMenuItem StartWithWindows) BuildMenu(MenuActions actions, Func<Func<Task>, Task> run)
+    {
+        var menu = new TrayMenu(new Ui(96, Palette.Current));
+        Forms.ToolStripMenuItem Add(string text, string glyph, Func<Task> action, bool emphasized = false)
+        {
+            var item = menu.Add(text, glyph, emphasized);
+            item.Click += async (_, _) => await run(action);
+            return item;
+        }
+        // Bold, as Windows marks the item a double-click on the icon opens.
+        Add("Status / roots / processes", "activity", actions.Status, emphasized: true);
+        Add("Connection log", "scroll-text", actions.Log);
+        menu.Separator();
+        Add("Start server", "play", actions.StartServer);
+        Add("Stop server and owned tunnel", "square", actions.StopServer);
+        Add("Start configured tunnel", "cloud", actions.StartTunnel);
+        Add("Stop owned tunnel", "cloud-off", actions.StopTunnel);
+        menu.Separator();
+        Add("Pause changes", "circle-pause", actions.Pause);
+        Add("Resume changes", "circle-play", actions.Resume);
+        Add("Stop session children", "octagon-x", actions.StopChildren);
+        menu.Separator();
+        Add("Revoke all tokens", "key-round", actions.RevokeTokens);
+        Add("Remove registered clients", "user-x", actions.RemoveClients);
+        menu.Separator();
+        Add("Edit roots and grants", "folder-cog", actions.EditRoots);
+        Add("Open configuration folder", "folder-open", actions.OpenFolder);
+        var startWithWindows = Add("Start with Windows", "toggle-left", actions.StartWithWindows);
+        menu.Separator();
+        Add("Exit", "power", actions.Exit);
+        return (menu, startWithWindows);
+    }
+
+    // Checked exactly when the shortcut exists; the switch icon shows the same state.
+    internal static void ShowAutostart(Forms.ToolStripMenuItem item, bool enabled)
+    {
+        item.Checked = enabled;
+        item.Tag = new MenuGlyph(enabled ? "toggle-right" : "toggle-left", false);
+    }
+
     private sealed class Context : Forms.ApplicationContext
     {
         private readonly Forms.NotifyIcon icon;
+        private readonly TrayMenu menu;
+        private TrayLook shown;
         private readonly Forms.Form dispatcher = new() { ShowInTaskbar = false };
         private readonly Forms.Timer timer = new() { Interval = 500 };
         private readonly Forms.Timer reload = new() { Interval = (int)ReloadInterval.TotalMilliseconds };
@@ -234,50 +303,52 @@ public static class TrayApplication
             string? autostartProblem = null;
             try { autostart = smoke ? null : TrayAutostart.ForThisProcess(path); }
             catch (Exception error) { autostartProblem = "Autostart is unavailable: " + error.GetType().Name + ": " + error.Message; }
-            var menu = new Forms.ContextMenuStrip();
-            void Add(string title, Func<Task> action) => menu.Items.Add(title, null, async (_, _) => await Guard(action));
-            Add("Start server", async () => await Controller().StartAsync());
-            Add("Stop server and owned tunnel", async () => await Controller().StopAsync());
-            Add("Start configured tunnel", async () => await Controller().StartTunnelAsync());
-            Add("Stop owned tunnel", async () => await Controller().StopTunnelAsync());
-            menu.Items.Add(new Forms.ToolStripSeparator());
-            Add("Status / roots / processes", ShowStatus);
-            Add("Pause changes", async () => { await Controller().ControlAsync("pause"); });
-            Add("Resume changes", async () => { await Controller().ControlAsync("resume"); });
-            Add("Stop session children", async () => { await Controller().ControlAsync("kill-children"); });
-            Add("Revoke all tokens", async () => { await Controller().ControlAsync("revoke-tokens"); });
-            Add("Remove registered clients", async () => { await Controller().ControlAsync("remove-clients"); });
-            Add("Edit roots and grants", EditRoots);
-            Add("Connection log", () =>
+            (menu, var startWithWindows) = BuildMenu(new MenuActions(
+                Status: ShowStatus,
+                Log: () =>
+                {
+                    ShowText("CODEXish connection log", controller is null
+                        ? NotLoaded()
+                        : $"Complete log: {controller.LogFile}{Environment.NewLine}The most recent {TrayController.MemoryLines} lines:{Environment.NewLine}{Environment.NewLine}" +
+                          string.Join(Environment.NewLine, controller.Diagnostics), controller is null ? Tone.Warning : null);
+                    return Task.CompletedTask;
+                },
+                StartServer: async () => await Controller().StartAsync(),
+                StopServer: async () => await Controller().StopAsync(),
+                StartTunnel: async () => await Controller().StartTunnelAsync(),
+                StopTunnel: async () => await Controller().StopTunnelAsync(),
+                Pause: async () => { await Controller().ControlAsync("pause"); },
+                Resume: async () => { await Controller().ControlAsync("resume"); },
+                StopChildren: async () => { await Controller().ControlAsync("kill-children"); },
+                RevokeTokens: async () => { await Controller().ControlAsync("revoke-tokens"); },
+                RemoveClients: async () => { await Controller().ControlAsync("remove-clients"); },
+                EditRoots: EditRoots,
+                OpenFolder: () =>
+                {
+                    string folder = Path.GetDirectoryName(Path.GetFullPath(path)) ?? ".";
+                    Directory.CreateDirectory(folder);
+                    Process.Start(new ProcessStartInfo(folder) { UseShellExecute = true })?.Dispose();
+                    return Task.CompletedTask;
+                },
+                StartWithWindows: () =>
+                {
+                    if (autostart is null) throw new InvalidOperationException(autostartProblem ?? "Autostart is unavailable.");
+                    if (autostart.Enabled) autostart.Disable();
+                    else autostart.Enable();
+                    controller?.Note((autostart.Enabled ? "Autostart shortcut written: " : "Autostart shortcut removed: ") + autostart.ShortcutPath);
+                    return Task.CompletedTask;
+                },
+                Exit: Exit), Guard);
+            // The autostart state is read again, and the menu sized for the screen it opens on, every time it opens.
+            menu.Strip.Opening += (_, _) =>
             {
-                ShowText("CODEXish connection log", controller is null
-                    ? NotLoaded()
-                    : $"Complete log: {controller.LogFile}{Environment.NewLine}The most recent {TrayController.MemoryLines} lines:{Environment.NewLine}{Environment.NewLine}" +
-                      string.Join(Environment.NewLine, controller.Diagnostics));
-                return Task.CompletedTask;
-            });
-            Add("Open configuration folder", () =>
-            {
-                string folder = Path.GetDirectoryName(Path.GetFullPath(path)) ?? ".";
-                Directory.CreateDirectory(folder);
-                Process.Start(new ProcessStartInfo(folder) { UseShellExecute = true })?.Dispose();
-                return Task.CompletedTask;
-            });
-            menu.Items.Add(new Forms.ToolStripSeparator());
-            // Checked exactly when the shortcut exists; read again every time the menu opens.
-            var startWithWindows = new Forms.ToolStripMenuItem("Start with Windows");
-            startWithWindows.Click += async (_, _) => await Guard(() =>
-            {
-                if (autostart is null) throw new InvalidOperationException(autostartProblem ?? "Autostart is unavailable.");
-                if (autostart.Enabled) autostart.Disable();
-                else autostart.Enable();
-                controller?.Note((autostart.Enabled ? "Autostart shortcut written: " : "Autostart shortcut removed: ") + autostart.ShortcutPath);
-                return Task.CompletedTask;
-            });
-            menu.Items.Add(startWithWindows);
-            menu.Opening += (_, _) => startWithWindows.Checked = autostart?.Enabled == true;
-            Add("Exit", Exit);
-            icon = new Forms.NotifyIcon { Icon = Drawing.SystemIcons.Application, Text = "CODEXish — stopped", ContextMenuStrip = menu, Visible = true };
+                ShowAutostart(startWithWindows, autostart?.Enabled == true);
+                string? status = controller?.Status;
+                menu.Apply(new Ui(DesignNative.DpiAt(Forms.Cursor.Position, menu.Strip.DeviceDpi), Palette.Current),
+                    TrayStatus.Line(status), TrayStatus.Look(status));
+            };
+            shown = !smoke && config is null ? TrayLook.Attention : TrayLook.Stopped;
+            icon = new Forms.NotifyIcon { Icon = TrayIcons.For(shown, Forms.SystemInformation.SmallIconSize.Width), Text = "CODEXish — stopped", ContextMenuStrip = menu.Strip, Visible = true };
             icon.DoubleClick += async (_, _) => await Guard(ShowStatus);
             if (!smoke && autostart is not null)
             {
@@ -299,13 +370,23 @@ public static class TrayApplication
                 if (smoke)
                 {
                     timer.Stop();
-                    if (!icon.Visible || menu.Items.Count < 10 || dispatcher.Handle == 0) ExitCode = 1;
+                    if (!icon.Visible || menu.Strip.Items.Count < 10 || dispatcher.Handle == 0) ExitCode = 1;
                     Console.WriteLine(ExitCode == 0
                         ? "TRAY_UI_SMOKE_PASSED: notification icon, menu and STA dispatcher created and cleaned; no server, tunnel or user configuration opened."
                         : "TRAY_UI_SMOKE_FAILED");
                     await Exit();
                 }
-                else icon.Text = Tooltip(controller?.Status ?? "configuration error, retrying every minute");
+                else
+                {
+                    string? status = controller?.Status;
+                    icon.Text = Tooltip(status ?? "configuration error, retrying every minute");
+                    var look = TrayStatus.Look(status);
+                    if (look != shown)
+                    {
+                        shown = look;
+                        icon.Icon = TrayIcons.For(look, Forms.SystemInformation.SmallIconSize.Width);
+                    }
+                }
             };
             timer.Start();
         }
@@ -354,8 +435,8 @@ public static class TrayApplication
 
         private async Task ShowStatus()
         {
-            if (controller is null) ShowText("CODEXish status", NotLoaded());
-            else ShowText("CODEXish status", await controller.ControlAsync("status"));
+            if (controller is null) ShowText("CODEXish status", NotLoaded(), Tone.Warning);
+            else ShowText("CODEXish status", Indented(await controller.ControlAsync("status")));
         }
 
         // A notification icon's tooltip holds at most 127 characters.
@@ -368,7 +449,7 @@ public static class TrayApplication
         private async Task Guard(Func<Task> action)
         {
             try { await action(); }
-            catch (Exception error) { ShowText("CODEXish operation failed", error.GetType().Name + ": " + Redaction.Apply(error.Message).Text); }
+            catch (Exception error) { ShowText("CODEXish operation failed", error.GetType().Name + ": " + Redaction.Apply(error.Message).Text, Tone.Error); }
         }
 
         private Task EditRoots()
@@ -376,29 +457,25 @@ public static class TrayApplication
             if (config is null || controller is null) throw new InvalidOperationException(NotLoaded());
             var editing = config;
             var owner = controller;
-            using var form = new Forms.Form { Text = "CODEXish roots — stop before applying", Width = 800, Height = 400, StartPosition = Forms.FormStartPosition.CenterScreen };
-            var grid = new Forms.DataGridView
+            using var form = DesignForm.Open("CODEXish roots and grants");
+            var view = TrayWindows.Roots(form, editing.Roots);
+            view.Save = roots => Guard(async () =>
             {
-                Dock = Forms.DockStyle.Fill, AutoGenerateColumns = true,
-                DataSource = new System.ComponentModel.BindingList<RootConfig>(editing.Roots.Select(r => new RootConfig { Id = r.Id, Path = r.Path, Read = r.Read, Write = r.Write, Shell = r.Shell }).ToList())
-            };
-            var apply = new Forms.Button { Text = "Save roots and stop server", Dock = Forms.DockStyle.Bottom, Height = 40 };
-            apply.Click += async (_, _) => await Guard(async () =>
-            {
-                grid.EndEdit();
                 var candidate = JsonSerializer.Deserialize<ServerConfig>(JsonSerializer.Serialize(editing))!;
-                candidate.Roots = ((System.ComponentModel.BindingList<RootConfig>)grid.DataSource).ToArray();
+                candidate.Roots = roots;
                 candidate.Validate();
+                bool serverWasRunning = owner.Running, tunnelWasRunning = owner.TunnelRunning;
                 await owner.StopAsync();
                 candidate.Save(path);
                 editing.Roots = candidate.Roots;
                 // The running configuration is reused on the next start; recompute its warnings for the new roots.
                 editing.Validate();
-                if (candidate.Warnings.Count > 0) ShowText("CODEXish roots saved with warnings", string.Join(Environment.NewLine, candidate.Warnings));
+                // Saving must not leave ChatGPT disconnected: bring back exactly what was running.
+                if (serverWasRunning) await owner.StartAsync();
+                if (tunnelWasRunning) await owner.StartTunnelAsync();
+                if (candidate.Warnings.Count > 0) ShowText("CODEXish roots saved with warnings", string.Join(Environment.NewLine, candidate.Warnings), Tone.Warning);
                 form.Close();
             });
-            form.Controls.Add(grid);
-            form.Controls.Add(apply);
             form.ShowDialog();
             return Task.CompletedTask;
         }
@@ -415,49 +492,54 @@ public static class TrayApplication
 
         protected override void Dispose(bool disposing)
         {
-            if (disposing) { timer.Dispose(); reload.Dispose(); icon.Dispose(); dispatcher.Dispose(); }
+            if (disposing) { timer.Dispose(); reload.Dispose(); icon.Dispose(); menu.Strip.Dispose(); dispatcher.Dispose(); }
             base.Dispose(disposing);
         }
     }
 
-    private static void ShowText(string title, string text)
+    private static void ShowText(string title, string text, Tone? tone = null)
     {
-        var form = new Forms.Form { Text = title, Width = 850, Height = 540, StartPosition = Forms.FormStartPosition.CenterScreen };
-        form.Controls.Add(new Forms.TextBox { Multiline = true, ReadOnly = true, Dock = Forms.DockStyle.Fill, ScrollBars = Forms.ScrollBars.Both, Text = text });
+        var form = DesignForm.Open(title);
+        TrayWindows.Viewer(form, text, tone);
         form.Show();
+    }
+
+    private static readonly JsonSerializerOptions IndentedJson = new()
+    {
+        WriteIndented = true, Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+    };
+
+    // The control endpoint answers in compact JSON; the status window shows it indented.
+    private static string Indented(string json)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(json);
+            return JsonSerializer.Serialize(document.RootElement, IndentedJson).ReplaceLineEndings(Environment.NewLine);
+        }
+        catch (JsonException) { return json; }
     }
 
     private static ServerConfig? Setup(string path, TrayOptions options)
     {
         ServerConfig? created = null;
         var (rootId, rootPath) = options.RootEntry();
-        using var form = new Forms.Form { Text = "CODEXish first-run setup", Width = 700, Height = 500, StartPosition = Forms.FormStartPosition.CenterScreen };
-        var panel = new Forms.TableLayoutPanel { Dock = Forms.DockStyle.Fill, ColumnCount = 2, RowCount = 8, Padding = new Forms.Padding(16) };
-        var url = new Forms.TextBox { Width = 440, PlaceholderText = "https://your-tunnel-host", Text = options.PublicUrl ?? "" };
-        var port = new Forms.TextBox { Width = 120, Text = options.Port ?? "3000" };
-        var root = new Forms.TextBox { Width = 440, PlaceholderText = "Existing project directory", Text = rootPath };
-        var password = new Forms.TextBox { Width = 440, UseSystemPasswordChar = true };
-        var callback = new Forms.TextBox { Width = 440, Text = ServerConfig.DefaultRedirectUri };
-        var signIn = new Forms.CheckBox { Text = "Start CODEXish when I sign in to Windows", Checked = true, AutoSize = true };
-        foreach (var (label, control) in new (string, Forms.Control)[] { ("Public HTTPS origin", url), ("Local port", port), ("Project root (read / write / shell)", root), ("New CODEXish password", password), ("OAuth callback", callback) })
+        using var form = DesignForm.Open("CODEXish first-run setup");
+        var view = TrayWindows.Setup(form, new SetupValues(options.PublicUrl ?? "", options.Port ?? "3000", rootPath, ServerConfig.DefaultRedirectUri, path));
+        view.Create.Click += (_, _) =>
         {
-            panel.Controls.Add(new Forms.Label { Text = label, AutoSize = true });
-            panel.Controls.Add(control);
-        }
-        panel.Controls.Add(new Forms.Label { AutoSize = true });
-        panel.Controls.Add(signIn);
-        var save = new Forms.Button { Text = "Create local configuration", AutoSize = true };
-        save.Click += (_, _) =>
-        {
+            FieldBox? field = null;
             try
             {
-                if (password.Text.Length == 0) throw new ArgumentException("Enter a new server password.");
-                if (!int.TryParse(port.Text.Trim(), out int localPort)) throw new ArgumentException("Enter the local port as a number, for example 3000.");
-                string[] callbacks = string.IsNullOrWhiteSpace(callback.Text) ? [] : [callback.Text.Trim()];
-                created = ServerConfig.Create(url.Text, password.Text, [(rootId, root.Text)], callbacks, localPort, null);
+                if (view.Password.Input.Text.Length == 0) { field = view.Password; throw new ArgumentException("Enter a new server password."); }
+                if (!int.TryParse(view.Port.Input.Text.Trim(), out int localPort)) { field = view.Port; throw new ArgumentException("Enter the local port as a number, for example 3000."); }
+                string[] callbacks = string.IsNullOrWhiteSpace(view.Callback.Input.Text) ? [] : [view.Callback.Input.Text.Trim()];
+                // An empty folder writes no root entry; folders can be added later with Edit roots and grants.
+                created = ServerConfig.Create(view.Url.Input.Text.Trim(), view.Password.Input.Text, TrayOptions.SetupRoots(rootId, view.Folder.Input.Text),
+                    callbacks, localPort, null);
                 created.Save(path);
                 string signInResult = "Start at sign-in: off. Turn it on with Start with Windows in the tray menu.";
-                if (signIn.Checked)
+                if (view.SignIn.Checked)
                 {
                     try
                     {
@@ -467,18 +549,20 @@ public static class TrayApplication
                     }
                     catch (Exception error) { signInResult = "Start at sign-in could not be set up (" + error.Message + "). Use Start with Windows in the tray menu."; }
                 }
-                string warnings = created.Warnings.Count == 0 ? "" :
-                    Environment.NewLine + "Warnings:" + Environment.NewLine + string.Join(Environment.NewLine, created.Warnings);
-                ShowText("CODEXish connection details — keep private", "MCP endpoint: " + created.PublicUrl + "/mcp" + Environment.NewLine +
-                    "Client ID: " + created.OAuth.ClientId + Environment.NewLine + "Client secret: " + created.OAuth.ClientSecret + Environment.NewLine +
-                    "Configuration: " + path + Environment.NewLine + "Local port: " + created.Port + Environment.NewLine + signInResult + Environment.NewLine +
-                    "Use your new CODEXish password on its login page. This is not your OpenAI password." + warnings);
+                var details = DesignForm.Open("CODEXish connection details — keep private");
+                TrayWindows.Connection(details, new ConnectionDetails(created.PublicUrl + "/mcp", created.OAuth.ClientId, created.OAuth.ClientSecret,
+                    path, created.Port, signInResult, created.Roots.Length > 0, created.Warnings));
+                details.Show();
                 form.Close();
             }
-            catch (Exception error) { created = null; Forms.MessageBox.Show(form, error.Message, "Configuration not saved"); }
+            catch (Exception error)
+            {
+                created = null;
+                field ??= error.Message.Contains("public_url", StringComparison.Ordinal) ? view.Url
+                    : error.Message.Contains("port", StringComparison.OrdinalIgnoreCase) ? view.Port : null;
+                view.ShowError(error.Message, field);
+            }
         };
-        panel.Controls.Add(save);
-        form.Controls.Add(panel);
         form.ShowDialog();
         return created;
     }

@@ -1,5 +1,15 @@
 using Codexish.Server;
 
+if (args.Contains("--design-preview"))
+{
+    int at = Array.IndexOf(args, "--design-preview");
+    if (at + 1 >= args.Length)
+    {
+        Console.Error.WriteLine("Usage: --design-preview <directory>");
+        return 2;
+    }
+    return DesignPreview.Run(args[at + 1]);
+}
 if (args.Contains("--tray-smoke-test")) return await TrayApplication.Run("", smoke: true);
 if (args.Contains("--tray-tests")) return await TrayTests.Run();
 if (args.Contains("--browser-fixture")) return await BrowserTests.Fixture(args);

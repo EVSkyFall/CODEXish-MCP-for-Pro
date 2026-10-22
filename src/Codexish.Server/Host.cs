@@ -353,26 +353,69 @@ public static class CodexishHost
 
     private static string Encode(string? value) => WebUtility.HtmlEncode(value ?? "");
 
+    // The pages are self-contained: system fonts, inline styles and the CODEXish mark as inline SVG, light and dark from
+    // prefers-color-scheme, and nothing fetched from anywhere. Material 3 roles carry Windows 11's palette, as in the tray.
+    private const string PageStyle = """
+        :root{color-scheme:light dark;--bg:#f3f3f3;--surface:#fbfbfb;--stroke:#e3e3e3;--on:#1a1a1a;--on-variant:#5d5d5d;
+        --field:#fff;--field-stroke:#d4d4d4;--underline:#868686;--primary:#005fb8;--on-primary:#fff;--container:#e5eff9;
+        --on-container:#0a3a66;--error:#c42b1c;--error-container:#fde7e9;--shadow:0 8px 24px rgb(0 0 0/.08),0 1px 2px rgb(0 0 0/.06)}
+        @media (prefers-color-scheme:dark){:root{--bg:#202020;--surface:#2b2b2b;--stroke:#383838;--on:#fff;--on-variant:#c8c8c8;
+        --field:#333;--field-stroke:#424242;--underline:#9a9a9a;--primary:#60cdff;--on-primary:#000;--container:#1b3850;
+        --on-container:#cde7ff;--error:#ff99a4;--error-container:#442726;--shadow:0 8px 24px rgb(0 0 0/.4)}}
+        *{box-sizing:border-box}
+        html{-webkit-text-size-adjust:100%;text-size-adjust:100%}
+        body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px 16px;background:var(--bg);color:var(--on);
+        font:14px/20px "Segoe UI Variable Text","Segoe UI",system-ui,-apple-system,BlinkMacSystemFont,Roboto,"Helvetica Neue",Arial,sans-serif}
+        main{width:100%;max-width:400px;padding:32px 24px 24px;border:1px solid var(--stroke);border-radius:12px;background:var(--surface);box-shadow:var(--shadow)}
+        .brand{display:flex;align-items:center;gap:16px;margin:0 0 24px}
+        .brand svg{flex:none;width:40px;height:40px}
+        h1{margin:0;font:600 24px/32px "Segoe UI Variable Display","Segoe UI",system-ui,-apple-system,BlinkMacSystemFont,Roboto,"Helvetica Neue",Arial,sans-serif}
+        p{margin:0}
+        .lead{margin-top:2px;color:var(--on-variant)}
+        .who{margin:0 0 12px;overflow-wrap:anywhere}
+        .dest{margin:0 0 24px;padding:12px 16px;border-radius:8px;background:var(--container);color:var(--on-container);font-size:12px;line-height:16px}
+        .dest strong{display:block;margin-top:4px;font-size:16px;line-height:24px;font-weight:600;overflow-wrap:anywhere}
+        label{display:block;margin:0 0 6px;font-weight:600}
+        input[type=password]{display:block;width:100%;height:40px;margin:0;padding:0 12px;border:1px solid var(--field-stroke);
+        border-bottom-color:var(--underline);border-radius:4px;background:var(--field);color:var(--on);font:inherit;font-size:16px}
+        input[type=password]:hover{border-color:var(--underline)}
+        input[type=password]:focus{outline:2px solid transparent;border-color:var(--field-stroke);border-bottom-color:var(--primary);box-shadow:inset 0 -1px 0 var(--primary)}
+        .hint{margin-top:6px;color:var(--on-variant);font-size:12px;line-height:16px}
+        button{display:block;width:100%;height:40px;margin:24px 0 0;padding:0 24px;border:0;border-radius:20px;background:var(--primary);
+        color:var(--on-primary);font:inherit;font-weight:600;cursor:pointer}
+        button:hover{background:color-mix(in srgb,var(--primary) 90%,var(--on-primary))}
+        button:active{background:color-mix(in srgb,var(--primary) 84%,var(--on-primary))}
+        button:focus-visible{outline:2px solid var(--on);outline-offset:2px}
+        .err,.refused{display:flex;gap:12px;align-items:flex-start;border-radius:8px}
+        .err{margin:0 0 16px;padding:12px 16px;background:var(--error-container)}
+        .err svg,.refused svg{flex:none;width:20px;height:20px;margin-top:0;color:var(--error)}
+        .refused svg{width:24px;height:24px;margin-top:4px}
+        .refused h1{font-size:20px;line-height:32px}
+        .refused p{margin-top:4px;overflow-wrap:anywhere}
+        @media (max-width:440px){main{padding:24px 16px 16px}}
+        """;
+
+    // The CODEXish mark: Lucide's square-terminal (ISC) with its square filled, as in assets/icon/codexish.svg.
+    private const string Logo = """<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="1.5" y="1.5" width="21" height="21" rx="4.5" fill="#005FB8"/><path d="m7 11 2-2-2-2M11 13h4" transform="translate(12 12) scale(1.3) translate(-11 -10)" fill="none" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>""";
+
+    // Lucide's circle-alert (ISC).
+    private const string AlertIcon = """<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="12" x2="12" y1="8" y2="12"/><line x1="12" x2="12.01" y1="16" y2="16"/></svg>""";
+
     // Delta 3: every incoming parameter is carried into the POST as a hidden field and revalidated there,
     // so the issued code stays bound to the caller that started the flow.
     private static string LoginForm(AuthorizeRequest request, string nonce, string? message) => $$"""
         <!doctype html><html lang="en"><head><meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="color-scheme" content="light dark">
         <title>CODEXish sign in</title>
-        <style>body{font:16px system-ui;margin:0;display:grid;place-items:center;min-height:100vh;background:#f6f6f7;color:#18181b}
-        form{background:#fff;padding:24px;border-radius:12px;box-shadow:0 1px 4px rgba(0,0,0,.12);width:min(360px,92vw)}
-        h1{font-size:18px;margin:0 0 4px}p{margin:0 0 16px;color:#52525b;font-size:13px}
-        input[type=password]{width:100%;padding:10px;border:1px solid #d4d4d8;border-radius:8px;font-size:15px;box-sizing:border-box}
-        button{margin-top:12px;width:100%;padding:10px;border:0;border-radius:8px;background:#18181b;color:#fff;font-size:15px}
-        .dest{margin:0 0 16px;padding:10px 12px;border:1px solid #d4d4d8;border-radius:8px;background:#fafafa;font-size:13px;color:#3f3f46}
-        .dest strong{display:block;margin-top:2px;font-size:18px;color:#18181b;overflow-wrap:anywhere}
-        .who{margin:0 0 8px;color:#18181b;font-size:14px;overflow-wrap:anywhere}
-        .err{color:#b91c1c;font-size:13px;margin-bottom:12px}</style></head><body>
+        <style>{{PageStyle}}</style></head><body><main>
         <form method="post" action="/authorize">
-        <h1>CODEXish</h1><p>Sign in to connect this Windows PC.</p>
+        <div class="brand">{{Logo}}<div><h1>CODEXish</h1><p class="lead">Sign in to connect this Windows PC.</p></div></div>
         {{Requester(request)}}<div class="dest">After sign-in you will return to <strong>{{Encode(Destination(request.RedirectUri))}}</strong></div>
         {{Message(message)}}
-        <input type="password" name="password" autocomplete="current-password" autofocus required>
+        <label for="password">CODEXish password</label>
+        <input id="password" type="password" name="password" autocomplete="current-password" autofocus required aria-describedby="password-hint">
+        <p class="hint" id="password-hint">The password set up for CODEXish on this PC, not your OpenAI password.</p>
         <input type="hidden" name="response_type" value="code">
         <input type="hidden" name="client_id" value="{{Encode(request.ClientId)}}">
         <input type="hidden" name="redirect_uri" value="{{Encode(request.RedirectUri)}}">
@@ -382,22 +425,41 @@ public static class CodexishHost
         <input type="hidden" name="scope" value="{{Encode(request.Scope)}}">
         <input type="hidden" name="resource" value="{{Encode(request.Resource)}}">
         <input type="hidden" name="nonce" value="{{Encode(nonce)}}">
-        <button type="submit">Sign in</button></form></body></html>
+        <button type="submit">Sign in</button></form></main></body></html>
         """;
 
     private static string Message(string? message) =>
-        message is null ? "" : $"<div class=\"err\">{Encode(message)}</div>";
+        message is null ? "" : $"<div class=\"err\" role=\"alert\">{AlertIcon}<p>{Encode(message)}</p></div>";
 
     // The name a registered client gave itself. Anyone can register any name, so the destination host below it stays
     // the thing to check.
     private static string Requester(AuthorizeRequest request) => !request.Registered ? "" :
         $"<p class=\"who\"><strong>{Encode(request.ClientName ?? "An unnamed client")}</strong> wants to connect to this PC.</p>";
 
-    private static string ErrorPage(string message) => $"""
-        <!doctype html><html lang="en"><head><meta charset="utf-8"><title>CODEXish</title></head>
-        <body style="font:16px system-ui;padding:24px"><h1 style="font-size:18px">Authorization refused</h1>
-        <p>{Encode(message)}</p></body></html>
+    private static string ErrorPage(string message) => $$"""
+        <!doctype html><html lang="en"><head><meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="color-scheme" content="light dark">
+        <title>CODEXish</title>
+        <style>{{PageStyle}}</style></head><body><main>
+        <div class="brand">{{Logo}}<p class="lead">CODEXish</p></div>
+        <div class="refused" role="alert">{{AlertIcon}}<div><h1>Authorization refused</h1>
+        <p>{{Encode(message)}}</p></div></div></main></body></html>
         """;
+
+    // --design-preview: the sign-in page as a registered client sees it, the same page after a wrong password, and the
+    // local error page, from sample values.
+    internal static IReadOnlyList<(string Name, string Html)> PreviewPages()
+    {
+        var request = new AuthorizeRequest("sample-client", ServerConfig.DefaultRedirectUri, true, "sample-state", "sample-challenge", "S256",
+            "mcp", null, true, "ChatGPT");
+        return
+        [
+            ("sign-in.html", LoginForm(request, "sample-nonce", null)),
+            ("sign-in-wrong-password.html", LoginForm(request, "sample-nonce", "Incorrect password.")),
+            ("error.html", ErrorPage("Unknown client_id. Check the connector configuration, or connect it again so it can register.")),
+        ];
+    }
 
     private static void MapToken(WebApplication app, CodexishRuntime runtime, Action<string> log)
     {
