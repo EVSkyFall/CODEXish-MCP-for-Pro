@@ -60,7 +60,7 @@ Secure MCP Tunnel은 대체 연결 경로의 후보이며 현재 구조의 필�
 | 사용자 grant | device, roots, 앱/브라우저 범위, 외부 목적지, 허용 행위 | 사용자에게 실제로 허가받은 대상과 효과 |
 | 실행 환경 | OS 계정·격리 방식·어댑터 가용성 | 실제로 집행하거나 수행할 수 있는 범위 |
 
-유효 권한은 이 네 층과 클라이언트에서 허용된 도구의 **교집합**이다. `FULL_CONTROL + observe_only`도 읽기만 허용한다. `workspace_write`는 허가된 workspace의 편집·빌드·테스트를 위한 모드이며 데스크톱 전체 조작 권한을 뜻하지 않는다. [셸의 실제 격리 경계](security.md#실제-실행-경계)
+유효 권한은 이 네 층과 클라이언트에서 허용된 도구의 **교집합**이다. `FULL_CONTROL + observe_only`도 읽기만 허용한다. `workspace_write`는 허가된 workspace의 편집·빌드·테스트를 위한 모드이며 데스크톱 전체 조작 권한을 뜻하지 않는다. [셸의 실제 격리 경계](security-design-2026-09.md#실제-실행-경계)
 
 workspace는 root 목록, 경로 종류, 저장소·worktree 식별자, 경로 정책을 가진다. 세션은 owner, device, workspace, profile, mode, grant revision을 참조한다. 세션 생성은 승인된 설정을 바인딩할 뿐 권한을 발급하지 않는다. `session_id`나 `device_id`를 알고 있다는 사실도 권한이 아니다.
 
@@ -161,7 +161,7 @@ Git의 공통 메타데이터를 건드리는 작업은 저장소 단위 큐로 
 
 파일 변경은 old/new hash와 적용 patch, shell은 command/cwd/exit code, Git은 전후 HEAD·상태, GUI는 관찰 ID·대상·행동을 연결한다. Journal은 append-only 이벤트와 파생 상태로 구성하고 오류·부분 성공을 덮어 지우지 않는다. 원자적 파일 저장과 journal 기록 사이 crash는 복구 대조의 대상이다.
 
-전체 stdout·stderr·검색 결과는 허용된 데이터 범위 안에서 artifact에 보존한다. 응답은 요약·증분·cursor·미리보기이며 생략된 데이터의 위치와 완전성을 표시한다. 저장 실패나 누락을 성공적인 요약으로 숨기지 않는다. 비밀정보는 [보안 정책](security.md)에 따라 모델용 결과와 원본 보존 범위를 구분한다.
+전체 stdout·stderr·검색 결과는 허용된 데이터 범위 안에서 artifact에 보존한다. 응답은 요약·증분·cursor·미리보기이며 생략된 데이터의 위치와 완전성을 표시한다. 저장 실패나 누락을 성공적인 요약으로 숨기지 않는다. 비밀정보는 [보안 정책](security-design-2026-09.md)에 따라 모델용 결과와 원본 보존 범위를 구분한다.
 
 Checkpoint는 모델의 숨겨진 사고과정이 아니라 관찰 가능한 작업 상태와 근거를 저장한다. 새 세션에서 checkpoint를 가져오더라도 이전 권한이 자동 확장되지는 않는다.
 

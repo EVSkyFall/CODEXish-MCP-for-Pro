@@ -184,6 +184,7 @@ dotnet run --project src/Codexish.Server -c Release -- --tray-tests
 
 ## Documentation
 
+- [Security policy](SECURITY.md): the security model, what is in and out of scope, and how to report a vulnerability.
 - [Reference](docs/reference.md): configuration, OAuth, the control API, shells and Git, the ledger and retention,
   browser mounts, the tray, tests, and limits.
 - [Design](docs/v1-design.md) and [plan](docs/v1-plan.md).

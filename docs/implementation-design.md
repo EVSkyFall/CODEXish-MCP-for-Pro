@@ -3,7 +3,7 @@
 기준일: 2026-09-15. 기준 commit: `43d5f8793e4397894009f7860609a67d92084d48`.
 상태: **PROPOSED / 사용자 설계 검토 대기**. 이 문서의 선택은 승인 전 제안이다. 실행 코드, 독립 리뷰 승인, Windows 시험 결과를 뜻하지 않는다.
 
-상위 계약은 [README](../README.md), [요구사항](requirements.md), [아키텍처](architecture.md), [도구 계약](tool-contracts.md), [보안](security.md), [제품 가정](product-assumptions.md)이다. 기존 파일을 대체하지 않고 구현 결정을 보충한다. 변경이 필요한 의미는 [검토표](design-review.md)에 표시한다.
+상위 계약은 [README](../README.md), [요구사항](requirements.md), [아키텍처](architecture.md), [도구 계약](tool-contracts.md), [보안](security-design-2026-09.md), [제품 가정](product-assumptions.md)이다. 기존 파일을 대체하지 않고 구현 결정을 보충한다. 변경이 필요한 의미는 [검토표](design-review.md)에 표시한다.
 
 ## 1. 유지할 목표와 제외할 것
 
