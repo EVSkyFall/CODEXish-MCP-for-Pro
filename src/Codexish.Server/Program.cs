@@ -2,7 +2,7 @@ using Codexish.Server;
 
 if (args.Contains("--tray-smoke-test")) return await TrayApplication.Run("", smoke: true);
 if (args.Contains("--tray-tests")) return await TrayTests.Run();
-if (args.Contains("--browser-fixture")) return await BrowserTests.Fixture(CommandLine.Values(args, "--browser-fixture")[0], args.Contains("--ignore-stdin-eof"));
+if (args.Contains("--browser-fixture")) return await BrowserTests.Fixture(args);
 if (args.Contains("--browser-tests")) return await BrowserTests.Run();
 if (args.Contains("--browser-live-test"))
 {
@@ -30,7 +30,7 @@ if (args.Contains("--self-test"))
 
 string? Option(string name) => CommandLine.Values(args, name).FirstOrDefault();
 string configPath = Option("--config") ?? ServerConfig.DefaultPath;
-if (args.Contains("--tray")) return await TrayApplication.Run(configPath);
+if (args.Contains("--tray")) return await TrayApplication.Run(configPath, TrayOptions.Parse(args), arguments: args);
 
 if (args.Contains("--init"))
 {
@@ -58,7 +58,7 @@ if (args.Contains("--init"))
           Client ID           {created.OAuth.ClientId}
           Client secret       {created.OAuth.ClientSecret}
           Scope               mcp
-          Redirect URI(s)     {string.Join(", ", created.OAuth.RedirectUris)}
+          Redirect URIs       any https callback; listed: {string.Join(", ", created.OAuth.RedirectUris)}
 
         Local control token (loopback only, never send it through the tunnel)
           {created.ControlToken}
@@ -67,9 +67,11 @@ if (args.Contains("--init"))
         State dir: {created.StateDir}
         Allowed Host header(s): {string.Join(", ", created.AllowHosts.Concat(["127.0.0.1", "localhost"]))}
 
-        If the connector's callback differs, the server logs the offered redirect_uri on rejection;
-        rerun --init with --redirect-uri <that value> to accept it.
+        Any https callback without a fragment is accepted, and the sign-in page names the host it returns to.
+        Only a callback that is not https has to be listed: the server logs a refused one with its offered
+        redirect_uri, and --init --redirect-uri <that value> lists it.
         """);
+    foreach (string warning in created.Warnings) Console.WriteLine("WARNING: " + warning);
     return 0;
 }
 
@@ -79,20 +81,20 @@ if (noAuth && ServerConfig.NoAuthRefusal(config) is { } refusal) throw new Argum
 if (ServerConfig.TransportRefusal(config, noAuth) is { } insecure) throw new ArgumentException(insecure);
 
 using var runtime = new CodexishRuntime(config, noAuth);
-// A mount that cannot start is reported in host_capabilities; the coding and desktop tools start regardless.
-await runtime.Browsers.InitializeAsync();
+// Browser mounts connect in the background once the listener is up, so none of them can delay or stop the server.
 var app = CodexishHost.Build(runtime, config.Port, instructions: !args.Contains("--no-instructions"));
 Console.WriteLine($"""
     CODEXish v1 (coding core, desktop, browser mounts)
       MCP           http://127.0.0.1:{config.Port}/mcp  (published as {config.PublicUrl}/mcp)
-      Roots         {string.Join(", ", config.Roots.Select(r => $"{r.Id}:{(r.Read ? "r" : "")}{(r.Write ? "w" : "")}{(r.Shell ? "x" : "")}"))}
-      Browser       {runtime.Browsers.Summary()}
+      Roots         {string.Join(", ", config.Roots.Select(r => $"{r.Id}:{(r.Read ? "r" : "")}{(r.Write ? "w" : "")}{(r.Shell ? "x" : "")}{(Directory.Exists(r.Path) ? "" : " (missing)")}"))}
+      Browser       {runtime.Browsers.Summary()}; mounts connect after start, see host_capabilities
       State         {config.StateDir}
       Auth          {(noAuth ? "DISABLED (loopback development only)" : "OAuth bearer required on /mcp")}
       Control       POST http://127.0.0.1:{config.Port}/control/pause with header X-Codexish-Control
     The listener is loopback only; expose it with a tunnel. Host and Origin checks are not authentication.
     Commands run as this Windows user: there is no sandbox. Ctrl+C stops the server.
     """);
+foreach (string warning in runtime.Warnings) Console.WriteLine("WARNING: " + warning);
 await app.RunAsync();
 return 0;
 

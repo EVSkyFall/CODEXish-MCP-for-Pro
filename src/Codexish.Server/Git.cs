@@ -50,18 +50,21 @@ public sealed partial class GitService(ServerConfig config, Workspace workspace,
 
     // --no-lazy-fetch keeps a read of a partial clone from starting a network fetch, which would run the
     // remote helper and any credential helper. It does not exist in older git (2.40 rejects it), so support is
-    // probed once and the flag is only used where it is understood.
-    private int lazyFetch = -1;
+    // probed and the flag is only used where it is understood. The probe is repeated whenever the git binary found
+    // differs from the one probed, so an upgrade or a downgrade never leaves a stale answer behind.
+    private (string Binary, DateTime Written, bool Supported)? lazyFetch;
 
     private async Task<bool> SupportsNoLazyFetch(RootConfig root, CancellationToken token)
     {
-        if (lazyFetch >= 0) return lazyFetch == 1;
+        string binary = Resolved;
+        DateTime written = File.Exists(binary) ? File.GetLastWriteTimeUtc(binary) : default;
+        if (lazyFetch is { } known && known.Binary == binary && known.Written == written) return known.Supported;
         var probe = BaseArguments();
         probe.AddRange(["--no-lazy-fetch", "--version"]);
         var (exitCode, _, _) = await Run(root, probe, token);
-        lazyFetch = exitCode == 0 ? 1 : 0;
-        store.Event("git_capability", root.Id, new { no_lazy_fetch = lazyFetch == 1 });
-        return lazyFetch == 1;
+        lazyFetch = (binary, written, exitCode == 0);
+        store.Event("git_capability", root.Id, new { git = binary, no_lazy_fetch = exitCode == 0 });
+        return exitCode == 0;
     }
 
     // A clean or process filter declared by .gitattributes also runs during status and diff, so the filters the
@@ -92,7 +95,8 @@ public sealed partial class GitService(ServerConfig config, Workspace workspace,
         try
         {
             Directory.CreateDirectory(hooksDirectory);
-            var start = new ProcessStartInfo(config.Git.Path)
+            string git = Resolved;
+            var start = new ProcessStartInfo(git)
             {
                 WorkingDirectory = root.Path,
                 UseShellExecute = false,
@@ -103,13 +107,13 @@ public sealed partial class GitService(ServerConfig config, Workspace workspace,
                 StandardErrorEncoding = new UTF8Encoding(false)
             };
             foreach (string argument in arguments) start.ArgumentList.Add(argument);
-            start.Environment["GIT_TERMINAL_PROMPT"] = "0";
+            PrepareEnvironment(start);
             using var process = new Process { StartInfo = start };
             try { process.Start(); }
             catch (System.ComponentModel.Win32Exception e)
             {
                 throw new CodexishFault("UNSUPPORTED_CAPABILITY",
-                    $"git could not be started from '{config.Git.Path}': {e.Message}. Set git.path in codexish.json.");
+                    $"git could not be started from '{git}': {e.Message}. Install Git, or set git.path in codexish.json.");
             }
             Task<string> stdout = process.StandardOutput.ReadToEndAsync(token);
             Task<string> stderr = process.StandardError.ReadToEndAsync(token);
@@ -281,11 +285,44 @@ public sealed partial class GitService(ServerConfig config, Workspace workspace,
     }
 
     public const string Execution =
-        "The configured git binary ran with core.hooksPath pointing at an empty directory and with " +
+        "Git (git.path when that file exists, otherwise the first found on PATH or in the Git for Windows install locations) " +
+        "ran without inherited GIT_* variables, with core.hooksPath pointing at an empty directory and with " +
         "core.fsmonitor, core.pager, diff.external, core.editor, log.showSignature, maintenance.auto, gc.auto, " +
         "--no-optional-locks, --no-ext-diff and --no-textconv fixed (plus --no-lazy-fetch where git supports it), and every clean or process " +
         "filter the repository declares was read by name and disabled, so this read did not execute " +
         "repository-supplied code. Git writes are not tools; run them through shell_run.";
 
-    public bool Available => File.Exists(config.Git.Path) || !Path.IsPathRooted(config.Git.Path);
+    // Inherited GIT_* variables (GIT_DIR, GIT_CONFIG_COUNT/KEY/VALUE, pager or diff settings) would redirect or reconfigure
+    // what these fixed reads do, so every one is dropped and only the explicit safe values are set.
+    internal static void PrepareEnvironment(ProcessStartInfo start)
+    {
+        foreach (string name in start.Environment.Keys.Where(k => k.StartsWith("GIT_", StringComparison.OrdinalIgnoreCase)).ToArray())
+            start.Environment.Remove(name);
+        start.Environment["GIT_TERMINAL_PROMPT"] = "0";
+    }
+
+    // Looked up on every call, so a Git that is moved, upgraded or installed later keeps working without editing the file.
+    public string Resolved => Locate(config.Git.Path) ?? (string.IsNullOrWhiteSpace(config.Git.Path) ? "git" : config.Git.Path);
+
+    public bool Available => Locate(config.Git.Path) is not null;
+
+    public static string? Locate(string? configured) => Locate(configured, Environment.GetEnvironmentVariable("PATH"),
+        Environment.GetEnvironmentVariable("ProgramFiles"), Environment.GetEnvironmentVariable("LOCALAPPDATA"));
+
+    // The configured git.path when that file exists, then git on PATH, then the Git for Windows machine and per-user
+    // install locations.
+    public static string? Locate(string? configured, string? pathVariable, string? programFiles, string? localAppData)
+    {
+        if (!string.IsNullOrWhiteSpace(configured))
+            try { if (File.Exists(configured)) return Path.GetFullPath(configured); }
+            catch (ArgumentException) { /* a malformed git.path is passed over like a missing one */ }
+        if (ProcessSupervisor.OnPath("git", pathVariable) is { } onPath) return onPath;
+        foreach (string? parent in new[] { programFiles, localAppData is null ? null : Path.Combine(localAppData, "Programs") })
+        {
+            if (string.IsNullOrEmpty(parent)) continue;
+            string candidate = Path.Combine(parent, "Git", "cmd", OperatingSystem.IsWindows() ? "git.exe" : "git");
+            if (File.Exists(candidate)) return candidate;
+        }
+        return null;
+    }
 }

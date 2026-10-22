@@ -18,6 +18,34 @@ public sealed class ManagedProcess
     public required string Display { get; init; }
     public required DateTimeOffset StartedUtc { get; init; }
     public nint JobHandle { get; set; }
+    // Guards JobHandle: a handle closed on one thread must never be used on another, where Windows may already have
+    // given its number to a new job.
+    public readonly object JobSync = new();
+
+    // Terminates the job while it is certainly still this process's job.
+    public bool TerminateJob()
+    {
+        lock (JobSync) return Native.TerminateJob(JobHandle);
+    }
+
+    public void CloseJobIfIdle()
+    {
+        lock (JobSync)
+        {
+            if (JobHandle == 0 || Native.ActiveProcesses(JobHandle) != 0) return;
+            Native.CloseJob(JobHandle);
+            JobHandle = 0;
+        }
+    }
+
+    public void CloseJob()
+    {
+        lock (JobSync)
+        {
+            Native.CloseJob(JobHandle);
+            JobHandle = 0;
+        }
+    }
     public Task? Collection { get; set; }
     public volatile string State = "running";
     public int? ExitCode { get; set; }
@@ -26,6 +54,11 @@ public sealed class ManagedProcess
     // cannot be read, but it can still be inspected and stopped.
     public bool Reattached { get; init; }
     public string Supervision { get; set; } = "job_object";
+    // For a command string: the shell name and the interpreter executable that actually ran it.
+    public string? Shell { get; init; }
+    public string? Interpreter { get; init; }
+    // Set once the final state is persisted and the process and job handles are released.
+    public volatile bool Released;
 }
 
 // D7. One supervisor for shell_run and process_start. wait_ms only bounds the response; nothing here kills a
@@ -54,6 +87,7 @@ public sealed class ProcessSupervisor(Store store, Artifacts artifacts, ServerCo
             CreateNoWindow = true
         };
         string display;
+        string? chosenShell = null, interpreter = null;
         if (!string.IsNullOrEmpty(executable))
         {
             if (!string.IsNullOrEmpty(command))
@@ -64,29 +98,31 @@ public sealed class ProcessSupervisor(Store store, Artifacts artifacts, ServerCo
         }
         else if (!string.IsNullOrEmpty(command))
         {
-            if (string.IsNullOrEmpty(shell))
-                throw new CodexishFault("INVALID_ARGUMENT",
-                    $"A command string requires an explicit shell. Allowed: {string.Join(", ", config.Shell.Allowed)}.");
-            if (!config.Shell.Allowed.Contains(shell, StringComparer.Ordinal))
+            string[] allowed = config.Shell.Usable;
+            // Without a shell the configured default runs the command; the allowed list stays the user's own policy.
+            chosenShell = string.IsNullOrWhiteSpace(shell) ? config.Shell.EffectiveDefault : ShellConfig.Canonical(shell);
+            if (chosenShell is null || !allowed.Contains(chosenShell))
                 throw new CodexishFault("PERMISSION_DENIED",
-                    $"shell '{shell}' is not in shell.allowed ({string.Join(", ", config.Shell.Allowed)}).");
-            if (shell == "pwsh")
+                    string.IsNullOrWhiteSpace(shell)
+                        ? "No shell is allowed in shell.allowed, so a command string cannot run; use executable plus args."
+                        : $"shell '{shell}' is not in shell.allowed ({string.Join(", ", allowed)}).");
+            interpreter = ResolveShell(chosenShell);
+            start.FileName = interpreter;
+            if (chosenShell == "cmd")
             {
-                start.FileName = "pwsh";
+                // cmd.exe does not follow CommandLineToArgvW quoting; /s /c "..." passes the rest verbatim.
+                start.Arguments = "/s /c \"" + command + "\"";
+            }
+            else
+            {
                 start.ArgumentList.Add("-NoProfile");
                 start.ArgumentList.Add("-NonInteractive");
                 start.ArgumentList.Add("-Command");
                 start.ArgumentList.Add(command);
             }
-            else
-            {
-                // cmd.exe does not follow CommandLineToArgvW quoting; /s /c "..." passes the rest verbatim.
-                start.FileName = "cmd.exe";
-                start.Arguments = "/s /c \"" + command + "\"";
-            }
-            display = shell + ": " + command;
+            display = chosenShell + ": " + command;
         }
-        else throw new CodexishFault("INVALID_ARGUMENT", "Supply executable+args, or command with an explicit shell.");
+        else throw new CodexishFault("INVALID_ARGUMENT", "Supply executable+args, or a command string.");
 
         var process = new Process { StartInfo = start };
         try
@@ -101,44 +137,129 @@ public sealed class ProcessSupervisor(Store store, Artifacts artifacts, ServerCo
         // The job is assigned immediately after Start. A grandchild spawned inside this very short window
         // could escape supervision; that race is not closed here (CREATE_SUSPENDED would be needed).
         nint job = 0;
-        string supervision = lifetime == "session" ? "process_tree_fallback" : "not_supervised_persistent";
-        if (lifetime == "session" && !DisableJobObjects)
+        ManagedProcess? managed = null;
+        bool persisted = false;
+        try
         {
-            job = Native.CreateKillOnCloseJob();
-            if (job != 0 && !Native.AssignProcess(job, process.Handle)) { Native.CloseJob(job); job = 0; }
-            if (job != 0) supervision = "job_object";
-        }
-        // A job that could not be created is reported, never a reason to refuse the user's command: the child
-        // keeps running and its tree is ended with Process.Kill(entireProcessTree) instead.
-        if (lifetime == "session" && job == 0)
-            store.Event("job_object_unavailable", null, new { supervision, platform = Environment.OSVersion.Platform.ToString() });
-        long startTime;
-        try { startTime = process.StartTime.ToUniversalTime().Ticks; }
-        catch (Exception) { startTime = DateTime.UtcNow.Ticks; }
+            string supervision = lifetime == "session" ? "process_tree_fallback" : "not_supervised_persistent";
+            if (lifetime == "session" && !DisableJobObjects)
+            {
+                job = Native.CreateKillOnCloseJob();
+                if (job != 0 && !Native.AssignProcess(job, process.Handle)) { Native.CloseJob(job); job = 0; }
+                if (job != 0) supervision = "job_object";
+            }
+            // A job that could not be created is reported, never a reason to refuse the user's command: the child
+            // keeps running and its tree is ended with Process.Kill(entireProcessTree) instead.
+            if (lifetime == "session" && job == 0)
+                store.Event("job_object_unavailable", null, new { supervision, platform = Environment.OSVersion.Platform.ToString() });
+            long startTime;
+            try { startTime = process.StartTime.ToUniversalTime().Ticks; }
+            catch (Exception) { startTime = DateTime.UtcNow.Ticks; }
 
-        var stdout = artifacts.Create("text/plain", "stdout", cwd.Root.Id);
-        var stderr = artifacts.Create("text/plain", "stderr", cwd.Root.Id);
-        var managed = new ManagedProcess
+            var stdout = artifacts.Create("text/plain", "stdout", cwd.Root.Id);
+            var stderr = artifacts.Create("text/plain", "stderr", cwd.Root.Id);
+            managed = new ManagedProcess
+            {
+                ProcessId = "proc_" + Guid.NewGuid().ToString("N"),
+                Process = process,
+                Pid = process.Id,
+                StartTime = startTime,
+                Lifetime = lifetime,
+                RootId = cwd.Root.Id,
+                StdoutArtifact = stdout.Id,
+                StderrArtifact = stderr.Id,
+                Display = display,
+                StartedUtc = DateTimeOffset.UtcNow,
+                JobHandle = job,
+                Supervision = supervision,
+                Shell = chosenShell,
+                Interpreter = interpreter
+            };
+            processes[managed.ProcessId] = managed;
+            Persist(managed);
+            persisted = true;
+            // Diagnostic events never throw (Store.Event), so from here nothing can end the child.
+            store.Event("process_start", managed.ProcessId, new { pid = managed.Pid, lifetime = managed.Lifetime, root = cwd.Root.Id, display, interpreter });
+            managed.Collection = Collect(managed);
+            return managed;
+        }
+        catch (Exception error)
         {
-            ProcessId = "proc_" + Guid.NewGuid().ToString("N"),
-            Process = process,
-            Pid = process.Id,
-            StartTime = startTime,
-            Lifetime = lifetime,
-            RootId = cwd.Root.Id,
-            StdoutArtifact = stdout.Id,
-            StderrArtifact = stderr.Id,
-            Display = display,
-            StartedUtc = DateTimeOffset.UtcNow,
-            JobHandle = job,
-            Supervision = supervision
-        };
-        processes[managed.ProcessId] = managed;
-        Persist(managed);
-        store.Event("process_start", managed.ProcessId, new { pid = managed.Pid, lifetime = managed.Lifetime, root = cwd.Root.Id, display });
-        managed.Collection = Collect(managed);
-        return managed;
+            // The essential records (the process row, its artifacts, the job) could not be made: nothing may keep running
+            // that no handle describes, so the child and its tree end before the error surfaces.
+            int pid = 0;
+            try { pid = process.Id; } catch (InvalidOperationException) { }
+            if (!Native.TerminateJob(job))
+                try { process.Kill(entireProcessTree: true); } catch (Exception) { /* it already exited */ }
+            Native.CloseJob(job);
+            if (managed is not null)
+            {
+                processes.TryRemove(managed.ProcessId, out _);
+                // A row already written must not stay "running" for a child that no longer exists.
+                if (persisted)
+                    try { store.UpsertProcess(new ProcessRow(managed.ProcessId, managed.Pid, managed.StartTime, "exited_unknown_code", null,
+                        managed.Lifetime, managed.RootId, managed.StdoutArtifact, managed.StderrArtifact)); }
+                    catch (Exception) { /* a restart turns a stale running row into exited_unknown_code as well */ }
+            }
+            process.Dispose();
+            store.Event("process_start_failed", null, new { pid, error = error.GetType().Name, message = error.Message, cleanup = "terminated" });
+            throw new CodexishFault("EXECUTION_FAILED",
+                $"The child started but could not be recorded ({error.GetType().Name}: {error.Message}); it was terminated with its descendants.",
+                "unknown", details: new { pid, cleanup = "terminated" });
+        }
     }
+
+    // pwsh: PATH, then the newest %ProgramFiles%\PowerShell\*\pwsh.exe, then Windows PowerShell. Looked up on every call,
+    // so an interpreter installed, moved or upgraded later is found without a restart.
+    public static string ResolveShell(string shell) => ResolveShell(shell, Environment.GetEnvironmentVariable("PATH"),
+        Environment.GetEnvironmentVariable("ProgramFiles"), OperatingSystem.IsWindows() ? Environment.SystemDirectory : null);
+
+    public static string ResolveShell(string shell, string? pathVariable, string? programFiles, string? systemDirectory) => shell switch
+    {
+        "cmd" => Existing(systemDirectory is null ? null : Path.Combine(systemDirectory, "cmd.exe")) ?? "cmd.exe",
+        "powershell" => WindowsPowerShell(systemDirectory) ?? OnPath("powershell", pathVariable) ?? "powershell.exe",
+        _ => OnPath("pwsh", pathVariable) ?? NewestPwsh(programFiles) ?? WindowsPowerShell(systemDirectory) ?? "pwsh"
+    };
+
+    private static string? Existing(string? path) => path is not null && File.Exists(path) ? path : null;
+
+    internal static string? OnPath(string name, string? pathVariable)
+    {
+        string file = OperatingSystem.IsWindows() ? name + ".exe" : name;
+        foreach (string directory in (pathVariable ?? "").Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            try
+            {
+                if (Path.IsPathRooted(directory) && Existing(Path.Combine(directory.Trim('"'), file)) is { } found) return found;
+            }
+            catch (ArgumentException) { /* a malformed PATH entry is skipped */ }
+        }
+        return null;
+    }
+
+    private static string? NewestPwsh(string? programFiles)
+    {
+        if (string.IsNullOrEmpty(programFiles)) return null;
+        string parent = Path.Combine(programFiles, "PowerShell");
+        if (!Directory.Exists(parent)) return null;
+        static Version Named(string directory)
+        {
+            string digits = new(Path.GetFileName(directory).TakeWhile(c => char.IsAsciiDigit(c) || c == '.').ToArray());
+            return Version.TryParse(digits.Contains('.') ? digits : digits + ".0", out var version) ? version : new Version(0, 0);
+        }
+        try
+        {
+            return Directory.EnumerateDirectories(parent)
+                .Select(d => (Directory: d, Executable: Path.Combine(d, OperatingSystem.IsWindows() ? "pwsh.exe" : "pwsh")))
+                .Where(c => File.Exists(c.Executable))
+                .OrderByDescending(c => Named(c.Directory)).ThenByDescending(c => File.GetLastWriteTimeUtc(c.Executable))
+                .Select(c => c.Executable).FirstOrDefault();
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException) { return null; }
+    }
+
+    private static string? WindowsPowerShell(string? systemDirectory) =>
+        systemDirectory is null ? null : Existing(Path.Combine(systemDirectory, "WindowsPowerShell", "v1.0", "powershell.exe"));
 
     private void Persist(ManagedProcess managed) => store.UpsertProcess(new ProcessRow(managed.ProcessId, managed.Pid,
         managed.StartTime, managed.State, managed.ExitCode, managed.Lifetime, managed.RootId,
@@ -155,8 +276,45 @@ public sealed class ProcessSupervisor(Store store, Artifacts artifacts, ServerCo
         FinishIfCollecting(managed.StderrArtifact);
         try { managed.ExitCode = managed.Process.ExitCode; managed.State = "exited"; }
         catch (Exception) { managed.State = "exited_unknown_code"; }
-        Persist(managed);
-        store.Event("process_exit", managed.ProcessId, new { state = managed.State, exit_code = managed.ExitCode });
+        try
+        {
+            Persist(managed);
+            store.Event("process_exit", managed.ProcessId, new { state = managed.State, exit_code = managed.ExitCode });
+        }
+        catch (Exception) { /* the in-memory state stays authoritative for process_poll */ }
+        finally { Release(managed); }
+    }
+
+    // After the final state is recorded only the metadata stays: the process handle is closed, and so is the job once
+    // no descendant is left in it. A job that still holds descendants keeps them supervised until they are gone.
+    private static void Release(ManagedProcess managed)
+    {
+        try { managed.Process.Dispose(); } catch (Exception) { }
+        managed.CloseJobIfIdle();
+        managed.Released = true;
+    }
+
+    // Jobs whose last descendant has exited since the process itself did.
+    public int ReleaseIdleJobs()
+    {
+        int closed = 0;
+        foreach (var managed in processes.Values.Where(p => p.Released && p.JobHandle != 0))
+        {
+            managed.CloseJobIfIdle();
+            if (managed.JobHandle == 0) closed++;
+        }
+        return closed;
+    }
+
+    // An exited process whose job still holds live descendants: retention keeps its row and output until they are gone.
+    public bool HoldsJob(string processId) => processes.TryGetValue(processId, out var managed) && managed.JobHandle != 0;
+
+    // Retention removed these rows; the in-memory entries of exited processes go with them.
+    public void Forget(IEnumerable<string> processIds)
+    {
+        foreach (string id in processIds)
+            if (processes.TryGetValue(id, out var managed) && managed.State != "running" && managed.JobHandle == 0)
+                processes.TryRemove(id, out _);
     }
 
     // A collected stream is finalized only if nothing marked it incomplete first.
@@ -260,6 +418,8 @@ public sealed class ProcessSupervisor(Store store, Artifacts artifacts, ServerCo
             supervision = managed.Supervision,
             reattached = managed.Reattached,
             output_since_restart = managed.Reattached ? "not_captured" : null,
+            shell = managed.Shell,
+            interpreter = managed.Interpreter,
             stdout = outText,
             stderr = errText,
             stdout_bytes = outBytes.Length,
@@ -334,7 +494,7 @@ public sealed class ProcessSupervisor(Store store, Artifacts artifacts, ServerCo
         }
         // The job object is the Windows mechanism; elsewhere, and for persistent children that never get a
         // job, the runtime's own process-tree termination is used and the result says which one ran.
-        bool viaJob = Native.TerminateJob(managed.JobHandle);
+        bool viaJob = managed.TerminateJob();
         if (!viaJob)
         {
             try { managed.Process.Kill(entireProcessTree: true); }
@@ -364,6 +524,8 @@ public sealed class ProcessSupervisor(Store store, Artifacts artifacts, ServerCo
         root_id = managed.RootId,
         started_utc = managed.StartedUtc,
         command = managed.Display,
+        shell = managed.Shell,
+        interpreter = managed.Interpreter,
         stdout_artifact = managed.StdoutArtifact,
         stderr_artifact = managed.StderrArtifact
     };
@@ -423,7 +585,8 @@ public sealed class ProcessSupervisor(Store store, Artifacts artifacts, ServerCo
         if (!managed.Reattached || managed.State != "running") return;
         if (Alive(managed.Pid, managed.StartTime)) return;
         managed.State = "exited_unknown_code";
-        Persist(managed);
+        try { Persist(managed); }
+        finally { Release(managed); }
     }
 
     private static bool Alive(int pid, long startTime)
@@ -443,7 +606,7 @@ public sealed class ProcessSupervisor(Store store, Artifacts artifacts, ServerCo
         int killed = 0;
         foreach (var managed in processes.Values.Where(p => p.Lifetime == "session" && p.State == "running"))
         {
-            if (!Native.TerminateJob(managed.JobHandle))
+            if (!managed.TerminateJob())
                 try { managed.Process.Kill(entireProcessTree: true); } catch (Exception) { continue; }
             killed++;
         }
@@ -461,7 +624,7 @@ public sealed class ProcessSupervisor(Store store, Artifacts artifacts, ServerCo
             // Persistent children never get a job and keep running by design.
             if (managed.Lifetime == "session")
             {
-                if (managed.JobHandle != 0) Native.CloseJob(managed.JobHandle);
+                if (managed.JobHandle != 0) managed.CloseJob();
                 else if (managed.State == "running")
                     try { managed.Process.Kill(entireProcessTree: true); } catch (Exception) { }
             }

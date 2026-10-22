@@ -112,6 +112,32 @@ internal static class Native
     public static bool AssignProcess(nint job, nint process) =>
         OperatingSystem.IsWindows() && job != 0 && AssignProcessToJobObject(job, process);
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JobBasicAccounting
+    {
+        public long TotalUserTime, TotalKernelTime, ThisPeriodTotalUserTime, ThisPeriodTotalKernelTime;
+        public uint TotalPageFaultCount, TotalProcesses, ActiveProcesses, TotalTerminatedProcesses;
+    }
+
+    private const int JobObjectBasicAccountingInformation = 1;
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool QueryInformationJobObject(nint job, int infoClass, out JobBasicAccounting info, uint length, nint returned);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool IsProcessInJob(nint process, nint job, out bool result);
+
+    // How many processes are still alive in a job, or null when that cannot be read.
+    public static int? ActiveProcesses(nint job)
+    {
+        if (!OperatingSystem.IsWindows() || job == 0) return null;
+        return QueryInformationJobObject(job, JobObjectBasicAccountingInformation, out var info, (uint)Marshal.SizeOf<JobBasicAccounting>(), 0)
+            ? (int)info.ActiveProcesses : null;
+    }
+
+    public static bool InJob(nint process, nint job) =>
+        OperatingSystem.IsWindows() && job != 0 && IsProcessInJob(process, job, out bool result) && result;
+
     public static bool TerminateJob(nint job) => OperatingSystem.IsWindows() && job != 0 && TerminateJobObject(job, 1);
 
     public static void CloseJob(nint job) { if (OperatingSystem.IsWindows() && job != 0) CloseHandle(job); }

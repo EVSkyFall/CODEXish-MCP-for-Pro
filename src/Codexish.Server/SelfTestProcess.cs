@@ -40,8 +40,22 @@ internal static class ProcessTests
 
         Check(Error(await tools.ShellRun("proj", "sh3", command: "echo x", shell: "bash", wait_ms: 1000)) == "PERMISSION_DENIED",
             "a shell outside shell.allowed is refused");
-        Check(Error(await tools.ShellRun("proj", "sh4", command: "echo x", wait_ms: 1000)) == "INVALID_ARGUMENT",
-            "a command string without an explicit shell is refused");
+        var defaulted = await tools.ShellRun("proj", "sh4", command: "Write-Output 'defaulted'", wait_ms: 60000);
+        if (Error(defaulted) == "NOT_FOUND") Skip("default shell check: no PowerShell interpreter is installed");
+        else
+            Check(Status(defaulted) == "succeeded" && Data(defaulted).GetProperty("stdout_preview").GetString()!.Contains("defaulted") &&
+                  Data(defaulted).GetProperty("shell").GetString() == runtime.Config.Shell.EffectiveDefault &&
+                  Data(defaulted).GetProperty("interpreter").GetString() is { Length: > 0 },
+                "a command without a shell runs in shell.default and the result names the interpreter that ran it");
+        string powershell = Path.Combine(Environment.SystemDirectory, "WindowsPowerShell", "v1.0", "powershell.exe");
+        if (OperatingSystem.IsWindows() && File.Exists(powershell))
+        {
+            var classic = await tools.ShellRun("proj", "sh4b", command: "Write-Output ('ps' + $PSVersionTable.PSVersion.Major)", shell: "powershell", wait_ms: 60000);
+            Check(Status(classic) == "succeeded" && Data(classic).GetProperty("stdout_preview").GetString()!.Contains("ps5") &&
+                  Data(classic).GetProperty("interpreter").GetString()!.Equals(powershell, StringComparison.OrdinalIgnoreCase),
+                "shell=powershell runs Windows PowerShell 5.1 and reports it");
+        }
+        else Skip("shell=powershell check: Windows PowerShell is not installed");
         var structured = await tools.ShellRun("proj", "sh5", executable: Shells.Executable(shell),
             args: Shells.DirectArguments(shell, "structured"), wait_ms: 30000);
         Check(Data(structured).GetProperty("stdout_preview").GetString()!.Contains("structured"),

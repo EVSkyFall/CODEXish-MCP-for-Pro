@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -16,8 +17,23 @@ public sealed class RootConfig
 
 public sealed class ShellConfig
 {
+    public static readonly string[] Supported = ["pwsh", "powershell", "cmd"];
+
     [JsonPropertyName("default")] public string Default { get; set; } = "pwsh";
-    [JsonPropertyName("allowed")] public string[] Allowed { get; set; } = ["pwsh", "cmd"];
+    [JsonPropertyName("allowed")] public string[] Allowed { get; set; } = ["pwsh", "powershell", "cmd"];
+
+    // The user's own list, minus names this build does not support. Names are matched without case.
+    [JsonIgnore]
+    public string[] Usable => (Allowed ?? [])
+        .Select(n => Supported.FirstOrDefault(s => s.Equals(n?.Trim(), StringComparison.OrdinalIgnoreCase)))
+        .OfType<string>().Distinct(StringComparer.Ordinal).ToArray();
+
+    // shell.default when it is usable; otherwise the first usable allowed shell, so the allowed list stays the policy.
+    [JsonIgnore]
+    public string? EffectiveDefault => Canonical(Default) is { } name && Usable.Contains(name) ? name : Usable.FirstOrDefault();
+
+    public static string? Canonical(string? name) =>
+        Supported.FirstOrDefault(s => s.Equals(name?.Trim(), StringComparison.OrdinalIgnoreCase));
 }
 
 public sealed class GitConfig
@@ -32,7 +48,15 @@ public sealed class OAuthConfig
     [JsonPropertyName("redirect_uris")] public string[] RedirectUris { get; set; } = [];
     [JsonPropertyName("password_hash")] public string PasswordHash { get; set; } = "";
     [JsonPropertyName("access_token_hours")] public int AccessTokenHours { get; set; } = 12;
-    [JsonPropertyName("refresh_token_days")] public int RefreshTokenDays { get; set; } = 30;
+    // 0 means refresh tokens never expire; a positive value counts days since the token's last refresh.
+    [JsonPropertyName("refresh_token_days")] public int RefreshTokenDays { get; set; }
+}
+
+// Age-based cleanup of CODEXish's own state; 0 (or less) keeps that class of state forever.
+public sealed class RetentionConfig
+{
+    [JsonPropertyName("output_days")] public int OutputDays { get; set; } = 30;
+    [JsonPropertyName("backup_days")] public int BackupDays { get; set; } = 90;
 }
 
 public sealed class ServerConfig
@@ -49,6 +73,13 @@ public sealed class ServerConfig
     [JsonPropertyName("control_token")] public string ControlToken { get; set; } = "";
     [JsonPropertyName("browser_mounts")] public BrowserMountConfig[] BrowserMounts { get; set; } = [];
     [JsonPropertyName("tunnel")] public TunnelConfig Tunnel { get; set; } = new();
+    [JsonPropertyName("retention")] public RetentionConfig Retention { get; set; } = new();
+
+    // Problems that no longer stop the server: they go to the startup log and host_capabilities.warnings.
+    [JsonIgnore] public List<string> Warnings { get; private set; } = [];
+
+    // The file this configuration was loaded from or last saved to, when there is one.
+    [JsonIgnore] public string? SourcePath { get; set; }
 
     public const string DefaultRedirectUri = "https://chatgpt.com/connector_platform_oauth_redirect";
     private static readonly JsonSerializerOptions Format = new() { WriteIndented = true };
@@ -57,65 +88,190 @@ public sealed class ServerConfig
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Codexish");
     public static string DefaultPath => System.IO.Path.Combine(DefaultDirectory, "codexish.json");
 
+    public static string UtcStamp(DateTimeOffset time) => time.UtcDateTime.ToString("yyyyMMdd'T'HHmmssfff'Z'", CultureInfo.InvariantCulture);
+
+    // A file that cannot be parsed is kept as <file>.broken-<utc>. When <file>.bak parses, it is loaded and restored
+    // as the main file; otherwise the real parse error is raised.
     public static ServerConfig Load(string path)
     {
         if (!File.Exists(path))
             throw new ArgumentException($"No configuration at {path}. Run --init --password <pw> --public-url <url> [--root id=path] first.");
-        var config = JsonSerializer.Deserialize<ServerConfig>(File.ReadAllText(path))
-            ?? throw new ArgumentException($"Configuration at {path} is not a JSON object.");
+        byte[] bytes = File.ReadAllBytes(path);
+        ServerConfig config;
+        string? recovery = null;
+        try { config = Parse(bytes, path); }
+        catch (Exception error) when (error is JsonException or InvalidDataException)
+        {
+            (config, recovery) = Recover(path, bytes, error);
+        }
+        config.SourcePath = System.IO.Path.GetFullPath(path);
         config.Validate();
+        if (recovery is not null)
+        {
+            config.Warnings.Add(recovery);
+            Console.Error.WriteLine("WARNING: " + recovery);
+        }
         return config;
     }
 
-    public void Save(string path)
+    private static ServerConfig Parse(byte[] bytes, string path) =>
+        JsonSerializer.Deserialize<ServerConfig>(bytes)
+            ?? throw new InvalidDataException($"The configuration at {path} is not a JSON object.");
+
+    // The unreadable bytes are kept first. The backup replaces the main file only while that file still holds exactly
+    // those bytes: if another writer saved in between, its newer file is loaded instead, or, when that one is
+    // unreadable as well, the backup is used without overwriting anything.
+    internal static (ServerConfig Config, string Note) Recover(string path, byte[] unreadable, Exception error)
     {
-        string? directory = System.IO.Path.GetDirectoryName(System.IO.Path.GetFullPath(path));
-        if (directory is not null) Directory.CreateDirectory(directory);
-        File.WriteAllText(path, JsonSerializer.Serialize(this, Format), new UTF8Encoding(false));
+        string broken;
+        try { broken = KeepBroken(path, unreadable, DateTimeOffset.UtcNow); }
+        catch (Exception keep) when (keep is IOException or UnauthorizedAccessException) { broken = "(not kept: " + keep.Message + ")"; }
+        byte[]? current = null;
+        try { current = File.ReadAllBytes(path); }
+        catch (Exception gone) when (gone is IOException or UnauthorizedAccessException) { current = null; }
+        bool unchanged = current is not null && current.AsSpan().SequenceEqual(unreadable);
+        if (!unchanged && current is not null)
+            try
+            {
+                return (Parse(current, path), $"The configuration at {path} could not be read ({error.Message}) and was kept as {broken}; " +
+                    "another writer had saved a new version meanwhile, which was loaded instead.");
+            }
+            catch (Exception newer) when (newer is JsonException or InvalidDataException) { /* the newer file is unreadable too */ }
+        string backup = path + ".bak";
+        byte[]? saved = null;
+        ServerConfig? recovered = null;
+        try
+        {
+            if (File.Exists(backup))
+            {
+                saved = File.ReadAllBytes(backup);
+                recovered = Parse(saved, backup);
+            }
+        }
+        catch (Exception unreadableBackup) when (unreadableBackup is JsonException or InvalidDataException or IOException) { recovered = null; }
+        if (recovered is null || saved is null)
+            throw new InvalidDataException($"The configuration at {path} could not be read: {error.Message} " +
+                $"The unreadable file was kept as {broken}, and there is no readable {System.IO.Path.GetFileName(backup)}.", error);
+        if (!unchanged)
+            return (recovered, $"The configuration at {path} could not be read ({error.Message}) and was kept as {broken}; " +
+                $"it changed again while being recovered, so {System.IO.Path.GetFileName(backup)} was loaded without overwriting it.");
+        WriteAtomically(path, saved, null);
+        return (recovered, $"The configuration at {path} could not be read ({error.Message}); it was kept as {broken}, and the previous " +
+            $"version {System.IO.Path.GetFileName(backup)} was loaded and restored as the main file.");
     }
 
+    // <file>.broken-<utc>, never overwriting an earlier copy: a name that is taken gets -2, -3 and so on.
+    internal static string KeepBroken(string path, byte[] bytes, DateTimeOffset at)
+    {
+        string stem = path + ".broken-" + UtcStamp(at);
+        for (int attempt = 1; ; attempt++)
+        {
+            string candidate = attempt == 1 ? stem : stem + "-" + attempt.ToString(CultureInfo.InvariantCulture);
+            try
+            {
+                using var stream = new FileStream(candidate, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+                stream.Write(bytes);
+                stream.Flush(true);
+                return candidate;
+            }
+            catch (IOException) when (File.Exists(candidate) || Directory.Exists(candidate)) { }
+        }
+    }
+
+    // The previous version is kept as <file>.bak, and the file itself is always either the old or the new version.
+    public void Save(string path)
+    {
+        string full = System.IO.Path.GetFullPath(path);
+        string? directory = System.IO.Path.GetDirectoryName(full);
+        if (directory is not null) Directory.CreateDirectory(directory);
+        WriteAtomically(full, new UTF8Encoding(false).GetBytes(JsonSerializer.Serialize(this, Format)), full + ".bak");
+        SourcePath = full;
+    }
+
+    // A temporary file in the same directory is written and flushed, then swapped in with File.Replace, or moved into
+    // place when there is nothing to replace.
+    internal static void WriteAtomically(string path, byte[] bytes, string? backup)
+    {
+        string temp = path + ".tmp-" + Guid.NewGuid().ToString("N");
+        try
+        {
+            using (var stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            {
+                stream.Write(bytes);
+                stream.Flush(true);
+            }
+            if (File.Exists(path)) File.Replace(temp, path, backup, ignoreMetadataErrors: true);
+            else File.Move(temp, path);
+        }
+        finally
+        {
+            try { if (File.Exists(temp)) File.Delete(temp); }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException) { /* a leftover temporary file is harmless */ }
+        }
+    }
+
+    // Only a port outside 0-65535 and an unusable public_url still refuse to start. Everything else that is wrong is
+    // skipped or replaced by its default, and recorded as a warning.
     public void Validate()
     {
+        List<string> warnings = [];
         if (Port is < 0 or > 65535) throw new ArgumentException("port must be between 0 and 65535.");
-        if (OAuth.AccessTokenHours <= 0 || OAuth.RefreshTokenDays <= 0)
-            throw new ArgumentException("access_token_hours and refresh_token_days must be positive.");
-        if (string.IsNullOrWhiteSpace(StateDir)) throw new ArgumentException("state_dir is required.");
-        // JSON null for these optional sections means none configured; each browser mount entry is validated on its
-        // own when the mounts start, so one malformed entry cannot stop the server.
-        BrowserMounts ??= [];
-        Tunnel ??= new();
-        Tunnel.Command ??= "";
-        Tunnel.Args ??= [];
-        StateDir = System.IO.Path.TrimEndingDirectorySeparator(System.IO.Path.GetFullPath(StateDir));
-        if (Roots.Length == 0) throw new ArgumentException("Configure at least one root with --root id=path.");
-        var ids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var root in Roots)
+        NormalizeNulls(warnings);
+        // An entry the access policy cannot use is dropped here, so AccessPolicy never sees it.
+        string[] hosts = AllowHosts.Where(AccessPolicy.IsExactHost).Select(h => h!).ToArray();
+        foreach (string? rejected in AllowHosts.Where(h => !AccessPolicy.IsExactHost(h)))
+            warnings.Add($"allow_hosts entry '{rejected ?? "null"}' is not an exact hostname without scheme, port or wildcard and is ignored.");
+        AllowHosts = hosts;
+        string[] origins = AllowOrigins.Where(o => AccessPolicy.NormalizeOrigin(o) is not null).Select(o => o!).ToArray();
+        foreach (string? rejected in AllowOrigins.Where(o => AccessPolicy.NormalizeOrigin(o) is null))
+            warnings.Add($"allow_origins entry '{rejected ?? "null"}' is not an exact http(s) origin and is ignored.");
+        AllowOrigins = origins;
+        if (OAuth.AccessTokenHours <= 0)
         {
-            if (!IsRootId(root.Id)) throw new ArgumentException($"Root id '{root.Id}' must match ^[A-Za-z0-9_-]{{1,64}}$.");
-            if (!ids.Add(root.Id)) throw new ArgumentException($"Duplicate root id '{root.Id}'.");
-            if (string.IsNullOrWhiteSpace(root.Path)) throw new ArgumentException($"Root '{root.Id}' has no path.");
-            root.Path = System.IO.Path.TrimEndingDirectorySeparator(System.IO.Path.GetFullPath(root.Path));
-            if (!Directory.Exists(root.Path)) throw new ArgumentException($"Root '{root.Id}' path does not exist: {root.Path}");
-            // The ledger, backups and artifacts must not be reachable through file tools or a shell grant.
-            if (Contains(root.Path, StateDir) || Contains(StateDir, root.Path) ||
-                StateDir.Equals(root.Path, StringComparison.OrdinalIgnoreCase))
-                throw new ArgumentException($"state_dir must lie outside every root; '{root.Id}' overlaps {StateDir}.");
+            warnings.Add($"oauth.access_token_hours is {OAuth.AccessTokenHours}; access tokens last the default 12 hours instead.");
+            OAuth.AccessTokenHours = 12;
         }
-        // Two ids on one directory would give the same files two independent FIFO queues, so overlapping
-        // roots are refused rather than silently serialized apart.
-        for (int outer = 0; outer < Roots.Length; outer++)
-            for (int inner = outer + 1; inner < Roots.Length; inner++)
+        if (string.IsNullOrWhiteSpace(StateDir))
+        {
+            warnings.Add($"state_dir is not set; {DefaultDirectory} is used.");
+            StateDir = DefaultDirectory;
+        }
+        StateDir = System.IO.Path.TrimEndingDirectorySeparator(System.IO.Path.GetFullPath(StateDir));
+
+        List<RootConfig> usable = [];
+        var ids = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var root in Roots ?? [])
+        {
+            if (root is null) { warnings.Add("A null entry in roots is ignored."); continue; }
+            root.Id ??= "";
+            if (!IsRootId(root.Id)) { warnings.Add($"Root id '{root.Id}' does not match ^[A-Za-z0-9_-]{{1,64}}$; that entry is ignored."); continue; }
+            if (!ids.Add(root.Id)) { warnings.Add($"Root id '{root.Id}' appears more than once; only its first entry is used."); continue; }
+            if (string.IsNullOrWhiteSpace(root.Path)) { warnings.Add($"Root '{root.Id}' has no path; that entry is ignored."); continue; }
+            try { root.Path = System.IO.Path.TrimEndingDirectorySeparator(System.IO.Path.GetFullPath(root.Path)); }
+            catch (Exception error) when (error is ArgumentException or NotSupportedException or PathTooLongException)
             {
-                string a = Roots[outer].Path, b = Roots[inner].Path;
-                if (a.Equals(b, StringComparison.OrdinalIgnoreCase) || Contains(a, b) || Contains(b, a))
-                    throw new ArgumentException(
-                        $"Roots '{Roots[outer].Id}' and '{Roots[inner].Id}' are the same directory or nested; give one root per directory tree.");
+                warnings.Add($"Root '{root.Id}' path '{root.Path}' is not a usable path ({error.Message}); that entry is ignored.");
+                continue;
             }
-        if (Shell.Allowed.Length == 0) throw new ArgumentException("shell.allowed must list at least one interpreter.");
-        foreach (string name in Shell.Allowed)
-            if (name is not ("pwsh" or "cmd")) throw new ArgumentException($"shell.allowed supports pwsh and cmd only; found '{name}'.");
-        if (!Shell.Allowed.Contains(Shell.Default, StringComparer.Ordinal))
-            throw new ArgumentException("shell.default must appear in shell.allowed.");
+            if (!Directory.Exists(root.Path))
+                warnings.Add($"Root '{root.Id}' path does not exist: {root.Path}. Calls on it fail until the directory exists.");
+            if (PathRules.IsInside(root.Path, StateDir) || PathRules.IsInside(StateDir, root.Path))
+                warnings.Add($"state_dir {StateDir} overlaps root '{root.Id}' ({root.Path}), so the ledger, backups and artifacts " +
+                    "are reachable through that root's file and shell tools. Move state_dir outside every root.");
+            usable.Add(root);
+        }
+        Roots = usable.ToArray();
+        if (Roots.Length == 0)
+            warnings.Add("No usable root is configured. File, shell and Git tools need one; the desktop tools keep working.");
+
+        string[] unsupported = Shell.Allowed.Where(n => ShellConfig.Canonical(n) is null).Select(n => n ?? "null").ToArray();
+        if (unsupported.Length > 0)
+            warnings.Add($"shell.allowed names {string.Join(", ", unsupported)} are not supported and are ignored; supported: {string.Join(", ", ShellConfig.Supported)}.");
+        if (Shell.Usable.Length == 0)
+            warnings.Add("shell.allowed lists no supported interpreter, so command strings are refused; executable plus args still run.");
+        else if (Shell.EffectiveDefault != ShellConfig.Canonical(Shell.Default))
+            warnings.Add($"shell.default '{Shell.Default}' is not an allowed, supported interpreter; commands without a shell use {Shell.EffectiveDefault}.");
+
         if (PublicUrl.Length > 0)
         {
             if (!Uri.TryCreate(PublicUrl, UriKind.Absolute, out var url) || url.Scheme is not ("http" or "https"))
@@ -126,9 +282,54 @@ public sealed class ServerConfig
             if (!AllowOrigins.Contains(PublicUrl, StringComparer.OrdinalIgnoreCase))
                 AllowOrigins = [.. AllowOrigins, PublicUrl];
         }
+        List<string> redirects = [];
         foreach (string redirect in OAuth.RedirectUris)
-            if (!Uri.TryCreate(redirect, UriKind.Absolute, out var uri) || uri.Scheme is not ("http" or "https") || uri.Fragment.Length != 0)
-                throw new ArgumentException($"oauth.redirect_uris entry '{redirect}' must be an absolute http(s) URI without a fragment.");
+            if (redirect is not null && Uri.TryCreate(redirect, UriKind.Absolute, out var uri) && uri.Scheme is "http" or "https" && uri.Fragment.Length == 0)
+                redirects.Add(redirect);
+            else warnings.Add($"oauth.redirect_uris entry '{redirect}' is not an absolute http(s) URI without a fragment and is ignored.");
+        OAuth.RedirectUris = redirects.ToArray();
+        // An empty secret matches nothing, so these would silently lock everyone out.
+        if (string.IsNullOrEmpty(OAuth.ClientSecret))
+            warnings.Add("oauth.client_secret is empty, so no token request can authenticate; create a new configuration with --init or the tray setup.");
+        if (string.IsNullOrEmpty(ControlToken))
+            warnings.Add("control_token is empty, so the local control API and the tray's status and control items refuse every request.");
+        if (PasswordHashProblem(OAuth.PasswordHash) is { } problem)
+            warnings.Add($"oauth.password_hash is not usable ({problem}), so no password can sign in; create a new configuration with --init or the tray setup.");
+        Warnings = warnings;
+    }
+
+    // JSON null for any string, list or section means that property's default, so nothing later meets a null.
+    // Each browser mount entry is validated on its own when the mounts start, so one malformed entry cannot stop the
+    // server.
+    private void NormalizeNulls(List<string> warnings)
+    {
+        var defaults = new ServerConfig();
+        PublicUrl ??= defaults.PublicUrl;
+        StateDir ??= defaults.StateDir;
+        ControlToken ??= defaults.ControlToken;
+        AllowHosts ??= [];
+        AllowOrigins ??= [];
+        Roots ??= [];
+        BrowserMounts ??= [];
+        Retention ??= new();
+        Shell ??= new();
+        Shell.Default ??= new ShellConfig().Default;
+        Shell.Allowed ??= new ShellConfig().Allowed;
+        Git ??= new();
+        Git.Path ??= "";
+        OAuth ??= new();
+        OAuth.ClientId ??= new OAuthConfig().ClientId;
+        OAuth.ClientSecret ??= "";
+        OAuth.PasswordHash ??= "";
+        OAuth.RedirectUris ??= [];
+        Tunnel ??= new();
+        Tunnel.Command ??= "";
+        Tunnel.Args ??= [];
+        if (Tunnel.Args.Any(a => a is null))
+        {
+            warnings.Add("tunnel.args contains null entries; they are ignored.");
+            Tunnel.Args = Tunnel.Args.Where(a => a is not null).ToArray();
+        }
     }
 
     // D12: --no-auth is only for a pure loopback configuration. ProbeAccessPolicy always allows loopback hosts,
@@ -152,9 +353,6 @@ public sealed class ServerConfig
     private static bool IsRootId(string id) =>
         id.Length is > 0 and <= 64 && id.All(c => char.IsAsciiLetterOrDigit(c) || c is '_' or '-');
 
-    private static bool Contains(string outer, string inner) =>
-        inner.StartsWith(outer + System.IO.Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
-
     // pbkdf2-sha256$<iterations>$<salt base64>$<hash base64>. Secrets are generated, never read from the environment.
     public const int PasswordIterations = 600000;
 
@@ -165,15 +363,34 @@ public sealed class ServerConfig
         return $"pbkdf2-sha256${PasswordIterations}${Convert.ToBase64String(salt)}${Convert.ToBase64String(hash)}";
     }
 
+    // Why a stored hash cannot verify any password, or null when it is well formed.
+    public static string? PasswordHashProblem(string? stored)
+    {
+        if (string.IsNullOrEmpty(stored)) return "empty";
+        string[] parts = stored.Split('$');
+        if (parts.Length != 4) return "wrong_field_count";
+        if (parts[0] != "pbkdf2-sha256") return "unknown_algorithm";
+        if (!int.TryParse(parts[1], NumberStyles.None, CultureInfo.InvariantCulture, out int iterations) || iterations <= 0) return "bad_iteration_count";
+        try
+        {
+            if (Convert.FromBase64String(parts[2]).Length == 0 || Convert.FromBase64String(parts[3]).Length == 0) return "empty_salt_or_hash";
+        }
+        catch (FormatException) { return "bad_base64"; }
+        return null;
+    }
+
     public static bool VerifyPassword(string password, string stored)
     {
-        string[] parts = stored.Split('$');
-        if (parts.Length != 4 || parts[0] != "pbkdf2-sha256" || !int.TryParse(parts[1], out int iterations) || iterations <= 0) return false;
-        byte[] salt, expected;
-        try { salt = Convert.FromBase64String(parts[2]); expected = Convert.FromBase64String(parts[3]); }
-        catch (FormatException) { return false; }
-        byte[] actual = Rfc2898DeriveBytes.Pbkdf2(Encoding.UTF8.GetBytes(password), salt, iterations, HashAlgorithmName.SHA256, expected.Length);
-        return CryptographicOperations.FixedTimeEquals(actual, expected);
+        if (PasswordHashProblem(stored) is not null) return false;
+        try
+        {
+            string[] parts = stored.Split('$');
+            int iterations = int.Parse(parts[1], NumberStyles.None, CultureInfo.InvariantCulture);
+            byte[] salt = Convert.FromBase64String(parts[2]), expected = Convert.FromBase64String(parts[3]);
+            byte[] actual = Rfc2898DeriveBytes.Pbkdf2(Encoding.UTF8.GetBytes(password), salt, iterations, HashAlgorithmName.SHA256, expected.Length);
+            return CryptographicOperations.FixedTimeEquals(actual, expected);
+        }
+        catch (Exception error) when (error is ArgumentException or CryptographicException or FormatException or OverflowException) { return false; }
     }
 
     public static string NewSecret(int bytes = 32) => Base64Url(RandomNumberGenerator.GetBytes(bytes));
@@ -181,17 +398,9 @@ public sealed class ServerConfig
     public static string Base64Url(byte[] value) =>
         Convert.ToBase64String(value).TrimEnd('=').Replace('+', '-').Replace('/', '_');
 
-    public static string FindGit()
-    {
-        List<string> candidates = [];
-        if (Environment.GetEnvironmentVariable("ProgramFiles") is { Length: > 0 } programFiles)
-            candidates.Add(System.IO.Path.Combine(programFiles, "Git", "cmd", "git.exe"));
-        candidates.Add(@"C:\Program Files\Git\cmd\git.exe");
-        candidates.Add("/usr/bin/git");
-        foreach (string candidate in candidates)
-            if (File.Exists(candidate)) return candidate;
-        return OperatingSystem.IsWindows() ? "git.exe" : "git";
-    }
+    // The git that --init writes into the file. The server looks git up again on every call, so this is only a first
+    // preference.
+    public static string FindGit() => GitService.Locate("") ?? (OperatingSystem.IsWindows() ? "git.exe" : "git");
 
     // --init builds a complete configuration with fresh random secrets; it never reads an existing credential store.
     public static ServerConfig Create(string publicUrl, string password, IEnumerable<(string Id, string Path)> roots,
@@ -208,8 +417,8 @@ public sealed class ServerConfig
         };
         config.OAuth.ClientSecret = NewSecret();
         config.OAuth.PasswordHash = HashPassword(password);
-        // The documented ChatGPT callback is always accepted; --redirect-uri adds the connector's own value,
-        // which the server logs whenever it rejects one.
+        // Any https callback is accepted at /authorize; the listed ones additionally receive OAuth error redirects.
+        // --redirect-uri is needed only for a callback that is not https, which the server logs when it refuses one.
         List<string> redirects = [DefaultRedirectUri, .. redirectUris];
         config.OAuth.RedirectUris = redirects.Distinct(StringComparer.Ordinal).ToArray();
         // The tunnel hostname comes from public_url so the Host allowlist matches the issued OAuth metadata.

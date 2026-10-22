@@ -22,23 +22,36 @@ public static class BrowserTests
     private static string GitHubToken => "ghp_" + new string('b', 36);
     private static string ApiKey => "sk-" + new string('c', 24);
 
-    public sealed class FixtureState(string directory)
+    public sealed class FixtureState(string directory, int exitAfterCalls)
     {
         public string Directory { get; } = directory;
         public int Count;
+        private int calls;
+
+        // --exit-after-calls: the process ends shortly after answering its Nth snapshot or edit.
+        public void Called()
+        {
+            if (exitAfterCalls > 0 && Interlocked.Increment(ref calls) == exitAfterCalls)
+                _ = Task.Run(async () => { await Task.Delay(300); Environment.Exit(3); });
+        }
     }
 
     [McpServerToolType]
     public sealed class FixtureTools(FixtureState state)
     {
         [McpServerTool(Name = "snapshot", ReadOnly = true), Description("Read the test count.")]
-        public CallToolResult Snapshot() => new() { Content = [new TextContentBlock { Text = "count=" + state.Count }] };
+        public CallToolResult Snapshot()
+        {
+            state.Called();
+            return new() { Content = [new TextContentBlock { Text = "count=" + state.Count }] };
+        }
 
         [McpServerTool(Name = "edit", ReadOnly = false), Description("Apply one test edit.")]
         public CallToolResult Edit(string text)
         {
             state.Count++;
             File.WriteAllText(Path.Combine(state.Directory, "effect.txt"), text);
+            state.Called();
             return new() { Content = [new TextContentBlock { Text = "count=" + state.Count }], StructuredContent = JsonSerializer.SerializeToElement(new { count = state.Count }) };
         }
 
@@ -73,17 +86,45 @@ public static class BrowserTests
         };
     }
 
-    // With ignoreEndOfInput the fixture keeps running after its input closes, so shutdown has to terminate it.
-    public static async Task<int> Fixture(string directory, bool ignoreEndOfInput = false)
+    // Fixture modes: --ignore-stdin-eof keeps running after its input closes, so shutdown has to terminate it;
+    // --exit-after-calls N exits after N calls; --hang-initialize reads its input and never answers the handshake;
+    // --fail-starts K --start-counter <file> exits at once on each of its first K starts.
+    public static async Task<int> Fixture(string[] args)
     {
+        string directory = CommandLine.Values(args, "--browser-fixture")[0];
+        int Number(string name) => CommandLine.Values(args, name).Select(int.Parse).FirstOrDefault();
+        if (Number("--fail-starts") is > 0 and int failStarts && CommandLine.Values(args, "--start-counter").FirstOrDefault() is { } counter)
+        {
+            int starts = File.Exists(counter) ? int.Parse(File.ReadAllText(counter)) : 0;
+            File.WriteAllText(counter, (starts + 1).ToString());
+            if (starts < failStarts) return 4;
+        }
+        if (args.Contains("--hang-initialize"))
+        {
+            using var input = Console.OpenStandardInput();
+            await input.CopyToAsync(Stream.Null);
+            return 0;
+        }
         var builder = Microsoft.Extensions.Hosting.Host.CreateApplicationBuilder();
         builder.Logging.ClearProviders();
-        builder.Services.AddSingleton(new FixtureState(directory));
+        builder.Services.AddSingleton(new FixtureState(directory, Number("--exit-after-calls")));
         builder.Services.AddMcpServer().WithStdioServerTransport().WithTools<FixtureTools>();
         using var host = builder.Build();
         await host.RunAsync();
-        if (ignoreEndOfInput) await Task.Delay(Timeout.Infinite);
+        if (args.Contains("--ignore-stdin-eof")) await Task.Delay(Timeout.Infinite);
         return 0;
+    }
+
+    // Test harness wait: polls a condition until it holds or the harness gives up and reports the check as failed.
+    private static async Task<bool> Until(Func<bool> condition, int seconds)
+    {
+        var watch = Stopwatch.StartNew();
+        while (!condition())
+        {
+            if (watch.Elapsed > TimeSpan.FromSeconds(seconds)) return false;
+            await Task.Delay(50);
+        }
+        return true;
     }
 
     private static bool Alive(int pid)
@@ -126,13 +167,19 @@ public static class BrowserTests
                 "profile_mode=existing passes only the configured arguments, with {profile_dir} expanded");
             var custom = new BrowserMountConfig { Id = "cdp", RootId = "test", Kind = "custom", Command = "backend", Args = ["--port", "0"] };
             Check(BrowserMounts.LaunchArguments(custom, profile).SequenceEqual(["--port", "0"]), "a custom backend keeps exactly its configured arguments");
-            Check(BrowserMounts.Invalid(new() { Id = "pw", RootId = "test", Command = "node", Args = ["--user-data-dir", "profile"] }, BrowserMounts.NewIdSet()) is not null &&
-                BrowserMounts.Invalid(existing, BrowserMounts.NewIdSet()) is null,
-                "a profile flag in a dedicated Playwright mount's own arguments is a configuration error; profile_mode=existing accepts it");
+            var ownState = new BrowserMountConfig { Id = "pw", RootId = "test", Command = "node", Args = ["cli.js", "--cdp-endpoint=http://127.0.0.1:9"] };
+            Check(BrowserMounts.Invalid(ownState, BrowserMounts.NewIdSet()) is null && BrowserMounts.ProfileWarning(ownState) is { Length: > 0 } &&
+                BrowserMounts.LaunchArguments(ownState, profile).SequenceEqual(ownState.Args) &&
+                BrowserMounts.Invalid(existing, BrowserMounts.NewIdSet()) is null && BrowserMounts.ProfileWarning(existing) is null,
+                "a dedicated Playwright mount whose own args select browser state is valid, keeps its args unchanged and carries a warning");
             var ids = BrowserMounts.NewIdSet();
             Check(BrowserMounts.Invalid(new() { Id = "pw", RootId = "test", Command = "node" }, ids) is null &&
                 BrowserMounts.Invalid(new() { Id = "PW", RootId = "test", Command = "node" }, ids) is { } duplicate && duplicate.Contains("already used", StringComparison.Ordinal),
                 "mount ids that differ only in case are duplicates, because they would share one dedicated profile directory");
+            var reserved = BrowserMounts.NewIdSet();
+            Check(BrowserMounts.Invalid(new() { Id = "dup", RootId = "test", Command = "" }, reserved) is { } missing && missing.Contains("command", StringComparison.Ordinal) &&
+                BrowserMounts.Invalid(new() { Id = "DUP", RootId = "test", Command = "node" }, reserved) is null && reserved.Contains("dup"),
+                "an invalid mount entry does not reserve its id, so a later valid entry may use it");
 
             var wrapped = BrowserMounts.WrapSchema(JsonSerializer.SerializeToElement(new Dictionary<string, object>
             {
@@ -156,13 +203,15 @@ public static class BrowserTests
             if (Path.GetFileNameWithoutExtension(exe).Equals("dotnet", StringComparison.OrdinalIgnoreCase)) fixtureArgs.Add(Assembly.GetExecutingAssembly().Location);
             fixtureArgs.AddRange(["--browser-fixture", root]);
             string missingBackend = Path.Combine(directory, "missing-backend" + (OperatingSystem.IsWindows() ? ".exe" : ""));
+            string ownProfile = Path.Combine(directory, "own-profile");
             config.BrowserMounts =
             [
                 // kind=playwright with the dedicated profile proves the launch really receives the profile directory.
                 new() { Id = "fixture", RootId = "test", Kind = "playwright", ProfileMode = "dedicated", Command = exe, Args = [.. fixtureArgs],
                     ReadOnlyTools = ["snapshot", "picture", "process", "resource", LongToolName] },
                 new() { Id = "missing", RootId = "test", Kind = "custom", Command = missingBackend },
-                new() { Id = "badprofile", RootId = "test", Kind = "playwright", Command = exe, Args = ["--user-data-dir", root] },
+                // A dedicated Playwright mount whose own args already select browser state.
+                new() { Id = "ownstate", RootId = "test", Kind = "playwright", Command = exe, Args = [.. fixtureArgs, "--user-data-dir", ownProfile], ReadOnlyTools = ["process"] },
                 new() { Id = "FIXTURE", RootId = "test", Kind = "custom", Command = exe, Args = [.. fixtureArgs] },
                 new() { Id = "exiter", RootId = "test", Kind = "custom", Command = exe, Args = [.. fixtureArgs], ReadOnlyTools = ["snapshot"] },
                 new() { Id = "stubborn", RootId = "test", Kind = "custom", Command = exe, Args = [.. fixtureArgs, "--ignore-stdin-eof"] }
@@ -174,8 +223,8 @@ public static class BrowserTests
             {
                 await runtime.Browsers.InitializeAsync();
                 string[] mounted = runtime.Browsers.Tools.Select(t => t.ProtocolTool.Name).ToArray();
-                Check(mounted.Count(n => n.StartsWith("browser_fixture_", StringComparison.Ordinal)) == 7 && mounted.Length == 21,
-                    "a real stdio handshake discovers seven tools on each of the three connected fixture mounts");
+                Check(mounted.Count(n => n.StartsWith("browser_fixture_", StringComparison.Ordinal)) == 7 && mounted.Length == 28,
+                    "a real stdio handshake discovers seven tools on each of the four connected fixture mounts");
                 Check(mounted.All(n => n.Length <= BrowserMounts.MaxToolName && Regex.IsMatch(n, "^[a-zA-Z0-9_-]+$")) && mounted.Contains(shortened),
                     "every mounted tool name matches ^[a-zA-Z0-9_-]+$ and is at most 64 characters, including the shortened long name");
                 stubbornPid = runtime.Browsers.Resources("stubborn").ProcessId ?? 0;
@@ -188,21 +237,22 @@ public static class BrowserTests
                     await using var client = await McpClient.CreateAsync(new HttpClientTransport(new() { Endpoint = new Uri(address + "/mcp") }),
                         new() { ProtocolVersion = CodexishRuntime.ProtocolVersion });
                     var listed = await client.ListToolsAsync();
-                    Check(listed.Count == CodexishRuntime.ToolNames.Length + 21 && CodexishRuntime.ToolNames.All(n => listed.Any(t => t.Name == n)),
+                    Check(listed.Count == CodexishRuntime.ToolNames.Length + 28 && CodexishRuntime.ToolNames.All(n => listed.Any(t => t.Name == n)),
                         "HTTP lists all coding and desktop tools together with the connected mounts' tools while other mounts failed");
                     var empty = new Dictionary<string, JsonElement>();
                     var capabilities = (await client.CallToolAsync(new CallToolRequestParams { Name = "host_capabilities", Arguments = empty })).StructuredContent!.Value.GetProperty("data");
                     var browser = capabilities.GetProperty("browser");
                     var states = browser.GetProperty("mounted").EnumerateArray().ToDictionary(m => m.GetProperty("id").GetString()!, m => m);
-                    Check(states["fixture"].GetProperty("state").GetString() == "connected" && states["missing"].GetProperty("state").GetString() == "unavailable" &&
-                        states["missing"].GetProperty("error").GetString() is { Length: > 0 },
-                        "host_capabilities reports a mount that failed to start with its state and error");
-                    Check(states["badprofile"].GetProperty("state").GetString() == "invalid_config" &&
-                        states["badprofile"].GetProperty("error").GetString()!.Contains("profile_mode=existing", StringComparison.Ordinal),
-                        "a dedicated Playwright mount with its own profile flag is reported as invalid configuration and never started");
+                    Check(states["fixture"].GetProperty("state").GetString() == "connected" && states["missing"].GetProperty("state").GetString() == "retrying" &&
+                        states["missing"].GetProperty("error").GetString() is { Length: > 0 } && states["missing"].GetProperty("attempts").GetInt32() >= 1 &&
+                        states["missing"].GetProperty("next_retry").ValueKind == JsonValueKind.String,
+                        "host_capabilities reports a mount that failed to start with its state, last error, attempts and next retry time");
+                    Check(states["ownstate"].GetProperty("state").GetString() == "connected" &&
+                        states["ownstate"].GetProperty("warning").GetString()!.Contains("unchanged", StringComparison.Ordinal),
+                        "a dedicated Playwright mount with its own profile flag starts instead of being refused, and carries a warning");
                     Check(states["FIXTURE"].GetProperty("state").GetString() == "invalid_config" && states["FIXTURE"].GetProperty("tools").GetArrayLength() == 0,
                         "a mount whose id differs from an earlier one only in case is reported as invalid configuration and never started");
-                    Check(capabilities.GetProperty("tools").GetArrayLength() == CodexishRuntime.ToolNames.Length + 21,
+                    Check(capabilities.GetProperty("tools").GetArrayLength() == CodexishRuntime.ToolNames.Length + 28,
                         "host_capabilities lists the mounted tool names beside the base tools");
                     Check(browser.GetProperty("boundary").GetString()!.Contains("not contained by the root or its grants", StringComparison.Ordinal) &&
                         browser.GetProperty("read_only_tools").GetString()!.Contains("bypass the ledger", StringComparison.Ordinal),
@@ -266,6 +316,11 @@ public static class BrowserTests
                     string[] inherited = info.GetProperty("environment").EnumerateArray().Select(e => e.GetString()!).ToArray();
                     Check(!inherited.Contains(SecretVariable, StringComparer.OrdinalIgnoreCase) && !inherited.Any(Redaction.IsSecretName),
                         "the backend process inherits no credential-named variable from the server");
+                    string[] own = JsonDocument.Parse(Texts(await Call("process", new { }, mount: "ownstate"))[0]).RootElement
+                        .GetProperty("args").EnumerateArray().Select(a => a.GetString()!).ToArray();
+                    Check(own.Count(a => a == "--user-data-dir") == 1 && own.SkipWhile(a => a != "--user-data-dir").Skip(1).First() == ownProfile &&
+                        !Directory.Exists(Path.Combine(config.StateDir, "browser-profiles", "ownstate")),
+                        "a mount whose own args select browser state runs with them unchanged and without a CODEXish profile directory");
 
                     config.Roots[0].Write = false;
                     Check(Reply.CodeOf(await Call("edit", new { text = "denied" }, "browser-denied")) == "PERMISSION_DENIED" && File.ReadAllText(effect) == "written through MCP",
@@ -276,17 +331,24 @@ public static class BrowserTests
                     config.Roots[0].Write = true;
                     config.Roots[0].Shell = true;
 
-                    // A backend that exits on its own releases its session and job at once.
+                    // A backend that exits on its own releases its session and job at once, keeps its tools listed, and is restarted.
                     var exiter = runtime.Browsers.Resources("exiter");
                     exiterPid = exiter.ProcessId ?? 0;
                     using (var exiting = Process.GetProcessById(exiterPid)) exiting.Kill(entireProcessTree: true);
-                    var exitWatch = Stopwatch.StartNew();
-                    while (runtime.Browsers.Resources("exiter").State != "exited" && exitWatch.Elapsed < TimeSpan.FromSeconds(30)) await Task.Delay(50);
-                    var exited = runtime.Browsers.Resources("exiter");
+                    Check(await Until(() => runtime.Browsers.Resources("exiter").State != "connected", 30), "the exit of a backend is noticed");
+                    var down = runtime.Browsers.Resources("exiter");
                     var afterExit = await Call("snapshot", new { }, mount: "exiter");
+                    var unavailable = afterExit.StructuredContent!.Value.GetProperty("error");
                     Check(exiter is { State: "connected", Session: true } && (exiter.Job || !OperatingSystem.IsWindows()) &&
-                        exited is { State: "exited", Session: false, Job: false } && Reply.CodeOf(afterExit) == "BROWSER_UNAVAILABLE",
-                        "a backend that exits on its own is reported exited, releases its session and job, and its tools answer BROWSER_UNAVAILABLE");
+                        down is { State: "retrying" or "starting", Session: false, Job: false } && Reply.CodeOf(afterExit) == "BROWSER_UNAVAILABLE" &&
+                        unavailable.GetProperty("details").GetProperty("next_retry").ValueKind == JsonValueKind.String &&
+                        unavailable.GetProperty("message").GetString()!.Contains("keeps restarting", StringComparison.Ordinal) &&
+                        (await client.ListToolsAsync()).Any(t => t.Name == BrowserMounts.ToolName("exiter", "snapshot")),
+                        "a backend that exits on its own releases its session and job; its tools stay listed and answer BROWSER_UNAVAILABLE with the next retry time");
+                    Check(await Until(() => runtime.Browsers.Resources("exiter").State == "connected", 60) &&
+                        Reply.CodeOf(await Call("snapshot", new { }, mount: "exiter")) is null,
+                        "the backend is restarted with backoff and its tools work again without a server restart");
+                    exiterPid = runtime.Browsers.Resources("exiter").ProcessId ?? 0;
                 }
                 finally { await app.StopAsync(); }
 
@@ -295,12 +357,111 @@ public static class BrowserTests
                 var disposal = Task.Run(runtime.Dispose);
                 disposed = await Task.WhenAny(disposal, Task.Delay(TimeSpan.FromSeconds(60))) == disposal;
                 Console.WriteLine($"BROWSER NOTE runtime disposal took {disposeWatch.Elapsed.TotalSeconds:0.0} s");
-                Check(disposed && stubbornPid != 0 && !Alive(stubbornPid) && runtime.Browsers.Resources("stubborn").State == "stopped" && fixturePid != 0 && !Alive(fixturePid),
-                    "disposal terminates a backend that ignores end of input after the bounded grace period and ends every backend process");
+                Check(disposed && stubbornPid != 0 && !Alive(stubbornPid) && runtime.Browsers.Resources("stubborn").State == "stopped" && fixturePid != 0 && !Alive(fixturePid) &&
+                    runtime.Browsers.Resources("missing").State == "stopped",
+                    "disposal terminates a backend that ignores end of input after the bounded grace period, ends every backend process and ends supervision");
             }
             finally
             {
                 if (!disposed) runtime.Dispose();
+            }
+
+            // P13: a backend that never answers its handshake delays neither the host nor any other mount.
+            var hangConfig = ServerConfig.Create("", "test-only-password", [("test", root)], [], 0, Path.Combine(directory, "hang-state"));
+            hangConfig.BrowserMounts =
+            [
+                new() { Id = "hang", RootId = "test", Kind = "custom", Command = exe, Args = [.. fixtureArgs, "--hang-initialize"] },
+                new() { Id = "quick", RootId = "test", Kind = "custom", Command = exe, Args = [.. fixtureArgs], ReadOnlyTools = ["snapshot"] }
+            ];
+            using (var hangRuntime = new CodexishRuntime(hangConfig, true))
+            {
+                await using var hangApp = CodexishHost.Build(hangRuntime, 0);
+                await hangApp.StartAsync();
+                try
+                {
+                    string address = hangApp.Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>()!.Addresses.Single();
+                    await using var hangClient = await McpClient.CreateAsync(new HttpClientTransport(new() { Endpoint = new Uri(address + "/mcp") }),
+                        new() { ProtocolVersion = CodexishRuntime.ProtocolVersion });
+                    var early = await hangClient.CallToolAsync(new CallToolRequestParams { Name = "workspace_info", Arguments = new Dictionary<string, JsonElement>() });
+                    Check(Reply.CodeOf(early) is null && hangRuntime.Browsers.Resources("hang").State is "starting" or "not_started",
+                        "the host listens and answers while a mount is still in its handshake");
+                    Check(await Until(() => hangRuntime.Browsers.Resources("quick").State == "connected", 60) &&
+                        hangRuntime.Browsers.Resources("hang").State == "starting" &&
+                        (await hangClient.ListToolsAsync()).Any(t => t.Name == BrowserMounts.ToolName("quick", "snapshot")) &&
+                        Reply.CodeOf(await hangClient.CallToolAsync(new CallToolRequestParams
+                        {
+                            Name = BrowserMounts.ToolName("quick", "snapshot"),
+                            Arguments = new Dictionary<string, JsonElement> { ["arguments"] = JsonSerializer.SerializeToElement(new { }) }
+                        })) is null,
+                        "a mount that never answers its handshake affects only itself: another mount connects and its tools appear without a restart");
+                }
+                finally { await hangApp.StopAsync(); }
+            }
+
+            // P14: failed starts and exits are retried with backoff, and the last tool list survives a restart.
+            string counter = Path.Combine(directory, "start-counter.txt");
+            var flakyConfig = ServerConfig.Create("", "test-only-password", [("test", root)], [], 0, Path.Combine(directory, "flaky-state"));
+            flakyConfig.BrowserMounts =
+            [
+                new() { Id = "flaky", RootId = "test", Kind = "custom", Command = exe, Args = [.. fixtureArgs, "--fail-starts", "2", "--start-counter", counter], ReadOnlyTools = ["snapshot"] },
+                new() { Id = "brief", RootId = "test", Kind = "custom", Command = exe, Args = [.. fixtureArgs, "--exit-after-calls", "2"], ReadOnlyTools = ["snapshot"] }
+            ];
+            using (var flakyRuntime = new CodexishRuntime(flakyConfig, true))
+            {
+                await using var flakyApp = CodexishHost.Build(flakyRuntime, 0);
+                await flakyApp.StartAsync();
+                try
+                {
+                    string address = flakyApp.Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>()!.Addresses.Single();
+                    await using var flakyClient = await McpClient.CreateAsync(new HttpClientTransport(new() { Endpoint = new Uri(address + "/mcp") }),
+                        new() { ProtocolVersion = CodexishRuntime.ProtocolVersion });
+                    Task<CallToolResult> Snapshot(string mount) => flakyClient.CallToolAsync(new CallToolRequestParams
+                    {
+                        Name = BrowserMounts.ToolName(mount, "snapshot"),
+                        Arguments = new Dictionary<string, JsonElement> { ["arguments"] = JsonSerializer.SerializeToElement(new { }) }
+                    }).AsTask();
+                    Check(await Until(() => flakyRuntime.Browsers.Resources("flaky").State == "connected", 90) &&
+                        File.ReadAllText(counter) == "3" && flakyRuntime.Browsers.Resources("flaky").Attempts == 2 &&
+                        Reply.CodeOf(await Snapshot("flaky")) is null,
+                        "a backend that fails its first two starts is restarted with backoff until it connects");
+                    Check(await Until(() => flakyRuntime.Browsers.Resources("brief").State == "connected", 60) &&
+                        Reply.CodeOf(await Snapshot("brief")) is null && Reply.CodeOf(await Snapshot("brief")) is null,
+                        "a backend answers its calls until it exits");
+                    Check(await Until(() => flakyRuntime.Browsers.Resources("brief").State != "connected", 30), "the exit after its second call is noticed");
+                    var gone = await Snapshot("brief");
+                    Check(Reply.CodeOf(gone) == "BROWSER_UNAVAILABLE" &&
+                        gone.StructuredContent!.Value.GetProperty("error").GetProperty("details").GetProperty("next_retry").ValueKind == JsonValueKind.String,
+                        "a call to a backend that exited answers BROWSER_UNAVAILABLE with the time of the next retry");
+                    Check(await Until(() => flakyRuntime.Browsers.Resources("brief").State == "connected", 60) && Reply.CodeOf(await Snapshot("brief")) is null &&
+                        File.Exists(Path.Combine(flakyConfig.StateDir, "browser-profiles", "brief.manifest.json")),
+                        "the exited backend is started again, and its tool list is saved beside the browser profiles");
+                }
+                finally { await flakyApp.StopAsync(); }
+            }
+            flakyConfig.BrowserMounts = [new() { Id = "brief", RootId = "test", Kind = "custom", Command = missingBackend, ReadOnlyTools = ["snapshot"] }];
+            using (var afterRuntime = new CodexishRuntime(flakyConfig, true))
+            {
+                Check(afterRuntime.Browsers.Tools.Count == 7 && afterRuntime.Browsers.Resources("brief").ToolsSource == "manifest",
+                    "after a restart the saved tool list is published before the backend has connected");
+                await using var afterApp = CodexishHost.Build(afterRuntime, 0);
+                await afterApp.StartAsync();
+                try
+                {
+                    string address = afterApp.Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>()!.Addresses.Single();
+                    await using var afterClient = await McpClient.CreateAsync(new HttpClientTransport(new() { Endpoint = new Uri(address + "/mcp") }),
+                        new() { ProtocolVersion = CodexishRuntime.ProtocolVersion });
+                    Check(await Until(() => afterRuntime.Browsers.Resources("brief").State == "retrying", 30), "the missing backend is being retried");
+                    var listedAfter = await afterClient.ListToolsAsync();
+                    var saved = await afterClient.CallToolAsync(new CallToolRequestParams
+                    {
+                        Name = BrowserMounts.ToolName("brief", "snapshot"),
+                        Arguments = new Dictionary<string, JsonElement> { ["arguments"] = JsonSerializer.SerializeToElement(new { }) }
+                    });
+                    Check(listedAfter.Count == CodexishRuntime.ToolNames.Length + 7 && Reply.CodeOf(saved) == "BROWSER_UNAVAILABLE" &&
+                        saved.StructuredContent!.Value.GetProperty("error").GetProperty("details").GetProperty("state").GetString() == "retrying",
+                        "while the backend is down its saved tools stay listed and calls answer BROWSER_UNAVAILABLE instead of disappearing");
+                }
+                finally { await afterApp.StopAsync(); }
             }
 
             // JSON null collections and fields: a null browser_mounts or tunnel is "none configured", and malformed
@@ -333,7 +494,7 @@ public static class BrowserTests
                 await malformedRuntime.Browsers.InitializeAsync();
                 string?[] malformedStates = JsonSerializer.SerializeToElement(malformedRuntime.Browsers.Describe()).GetProperty("mounted").EnumerateArray()
                     .Select(m => m.GetProperty("state").GetString()).ToArray();
-                Check(malformedStates.SequenceEqual(["invalid_config", "invalid_config", "unavailable", "invalid_config", "invalid_config"]),
+                Check(malformedStates.SequenceEqual(["invalid_config", "invalid_config", "retrying", "invalid_config", "invalid_config"]),
                     "null mount entries, ids, argument items, kinds and profile modes are invalid_config and null lists become empty, without throwing out of initialization");
             }
 

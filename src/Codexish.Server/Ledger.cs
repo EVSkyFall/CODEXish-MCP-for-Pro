@@ -81,6 +81,19 @@ public sealed class Ledger : IDisposable
         if (waitMs < 0)
             return Reply.Error("INVALID_ARGUMENT", "wait_ms must be zero or greater. It is a response wait, never an execution deadline.");
         string digest = Digest(tool, args);
+        try { return await Accept(id, tool, args, resource, action, waitMs, releaseChainOnStart, digest); }
+        catch (Microsoft.Data.Sqlite.SqliteException error)
+        {
+            // The call was never recorded, so nothing ran; the same call can simply be sent again.
+            try { log($"ledger_unavailable {id}: {error.Message}"); } catch (IOException) { }
+            return Reply.Error("EXECUTION_FAILED", "The ledger could not record this call, so nothing was started. Send the same call again.",
+                details: new { operation_id = id, ledger_error = error.Message });
+        }
+    }
+
+    private async Task<CallToolResult> Accept(string id, string tool, object args, string resource,
+        Func<Job, Task<CallToolResult>> action, int waitMs, bool releaseChainOnStart, string digest)
+    {
         Task<CallToolResult> task;
         bool pausedAtAcceptance;
         lock (gate)
@@ -89,18 +102,21 @@ public sealed class Ledger : IDisposable
             var row = store.Invocation(id);
             if (row is not null)
             {
+                if (row.Status == Store.Unreadable) return Unreadable(id);
                 if (row.Digest != digest)
                     return Reply.Error("IDEMPOTENCY_CONFLICT",
                         "This invocation_id was accepted with different arguments. Inspect it, or use a new id for a different action.",
                         details: new { operation_id = id, recorded_tool = row.Tool });
                 if (persistFailed.TryGetValue(id, out var unknown)) return unknown;
-                if (row.Result is not null) return JsonSerializer.Deserialize<CallToolResult>(row.Result)!;
+                if (row.Result is not null) return Stored(id, row.Result);
                 if (!live.TryGetValue(id, out task!)) return Recovered(row.Status, id);
             }
             else
             {
                 store.InsertInvocation(id, digest, tool);
-                store.Event("accepted", id, new { tool, resource, digest });
+                // The row above is the acceptance; a diagnostic event that cannot be written must not undo it.
+                try { store.Event("accepted", id, new { tool, resource, digest }); }
+                catch (Microsoft.Data.Sqlite.SqliteException) { }
                 var proxy = new TaskCompletionSource<CallToolResult>(TaskCreationOptions.RunContinuationsAsynchronously);
                 var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
                 var cancellation = new CancellationTokenSource();
@@ -130,14 +146,25 @@ public sealed class Ledger : IDisposable
         lock (gate) resumeTask = resume.Task;
         await resumeTask;
         bool cancelled;
+        string? unrecorded = null;
         lock (gate)
         {
             cancelled = cancelRequested.Remove(id) || stopping;
-            if (!cancelled) store.UpdateInvocationStatus(id, "running");
+            // The start is recorded before the effect runs; if that record cannot be written the effect is not started,
+            // so a restart can never mistake a real effect for queued work that never ran.
+            if (!cancelled)
+                try { store.UpdateInvocationStatus(id, "running"); }
+                catch (Microsoft.Data.Sqlite.SqliteException error) { unrecorded = error.Message; }
         }
         if (cancelled)
         {
             Finish(id, Reply.Error("CANCELLED", "Cancelled while queued; the effect never started.", recovery: "no_effects_to_inspect"), proxy);
+            return;
+        }
+        if (unrecorded is not null)
+        {
+            Finish(id, Reply.Error("EXECUTION_FAILED", "The ledger could not record the start of this operation, so it was not started. " +
+                "Send it again with a new invocation_id.", details: new { operation_id = id, ledger_error = unrecorded }), proxy);
             return;
         }
         Task<CallToolResult> effect = Execute(id, tool, action, proxy, started, cancellation);
@@ -202,6 +229,22 @@ public sealed class Ledger : IDisposable
             reason: "persist_failed",
             recovery: "inspect effects; do not replay");
 
+    // A stored record that cannot be read affects only the response that needed it.
+    private static CallToolResult Stored(string id, string json)
+    {
+        try
+        {
+            if (JsonSerializer.Deserialize<CallToolResult>(json) is { StructuredContent: not null } result) return result;
+        }
+        catch (Exception error) when (error is JsonException or NotSupportedException or InvalidOperationException or ArgumentException) { }
+        return Unreadable(id);
+    }
+
+    private static CallToolResult Unreadable(string id) =>
+        Reply.Error("EXECUTION_UNKNOWN",
+            "The stored record of this operation cannot be read, so its outcome is unconfirmed here. Inspect the target; do not replay it.",
+            "unknown", details: new { operation_id = id }, reason: "stored_result_unreadable", recovery: "inspect effects; do not replay");
+
     private static CallToolResult Recovered(string status, string id) => status switch
     {
         "cancelled" => Reply.Error("CANCELLED", "This operation was queued when the server restarted and never ran.",
@@ -220,8 +263,9 @@ public sealed class Ledger : IDisposable
             var row = store.Invocation(id);
             if (row is null)
                 return Reply.Error("NOT_FOUND", "Unknown operation_id. Only accepted invocations are recorded.");
+            if (row.Status == Store.Unreadable) return Unreadable(id);
             if (persistFailed.TryGetValue(id, out var unknown)) return unknown;
-            if (row.Result is not null) return JsonSerializer.Deserialize<CallToolResult>(row.Result)!;
+            if (row.Result is not null) return Stored(id, row.Result);
             if (row.Status == "queued") return Reply.Queued(id, Paused);
             if (row.Status == "running") return Reply.Running(id, new { tool = row.Tool });
             return Recovered(row.Status, id);
@@ -236,6 +280,7 @@ public sealed class Ledger : IDisposable
         {
             var row = store.Invocation(id);
             if (row is null) return Reply.Error("NOT_FOUND", "Unknown operation_id; nothing was cancelled.");
+            if (row.Status == Store.Unreadable) return Unreadable(id);
             if (persistFailed.ContainsKey(id) || row.Result is not null)
                 return Reply.Ok(new { operation_id = id, cancelled = false, state = row.Status, reason = "already_terminal" });
             if (row.Status == "queued")
