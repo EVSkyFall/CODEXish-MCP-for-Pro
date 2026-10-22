@@ -6,7 +6,9 @@ namespace Codexish.Server;
 public sealed class CodexishRuntime : IDisposable
 {
     public const string ProtocolVersion = "2025-11-25";
-    public const string ServerVersion = "1.0.0-slice1";
+    public const string ServerVersion = "1.0.0-slice2";
+    private readonly Lazy<DesktopService> desktop = new(() => new DesktopService());
+    public DesktopService Desktop => desktop.Value;
 
     public ServerConfig Config { get; }
     public Store Store { get; }
@@ -61,11 +63,14 @@ public sealed class CodexishRuntime : IDisposable
         "observed failures. Long commands return handles: poll them; a response wait is not a deadline and never " +
         "kills the process. Reuse invocation_id only when retrying the same action; inspect unknown operations, " +
         "never replay them. Report actual exit codes, diffs, and file contents, not inferred success. Call " +
-        "session_checkpoint after each milestone so work can resume across turns.";
+        "session_checkpoint after each milestone so work can resume across turns. For GUI: observe before acting; " +
+        "prefer UIA elements, explicitly choose image coordinates or physical pixels, and inspect the observation " +
+        "returned after every action. Focus the selected window when needed. Crop for detail, never replay " +
+        "unverified input, and verify saved files separately from input delivery.";
 
     private static readonly (string Feature, string Reason)[] Unsupported =
     [
-        ("computer_observe / screenshot / click / type_text", "Desktop observation and input are slice 2 of v1; the P0 probe still holds that code."),
+
         ("browser_*", "An external browser MCP is mounted in slice 3; this server does not drive a browser."),
         ("lsp_*", "Not implemented; diagnostics come from the project's own build and test commands through shell_run."),
         ("git write tools (commit, checkout, push)", "Deliberate: Git writes run through shell_run under the root's shell grant, so one execution policy covers them."),
@@ -89,6 +94,7 @@ public sealed class CodexishRuntime : IDisposable
         },
         roots = Config.Roots.Select(r => new { id = r.Id, path = r.Path, grants = new { r.Read, r.Write, r.Shell } }),
         tools = ToolNames,
+        desktop = new { native_available = OperatingSystem.IsWindows(), coordinate_space = "virtual desktop physical pixels", uia_thread = "dedicated MTA", input_tick = "metadata only" },
         unsupported = Unsupported.Select(u => new { feature = u.Feature, reason = u.Reason }),
         limits = Limits.Describe(),
         shell = new { @default = Config.Shell.Default, allowed = Config.Shell.Allowed },
@@ -159,7 +165,7 @@ public sealed class CodexishRuntime : IDisposable
         "host_capabilities", "workspace_info", "fs_list", "fs_read", "fs_search", "fs_stat", "fs_write",
         "fs_apply_patch", "shell_run", "process_start", "process_poll", "process_write", "process_stop",
         "git_status", "git_diff", "git_log", "artifact_read", "artifact_search", "operation_inspect",
-        "operation_cancel", "session_checkpoint"
+        "operation_cancel", "session_checkpoint", "computer_observe", "computer_query_ui", "computer_act"
     ];
 
     public void Dispose()
@@ -168,6 +174,7 @@ public sealed class CodexishRuntime : IDisposable
         disposed = true;
         Ledger.Dispose();
         Processes.Dispose();
+        if (desktop.IsValueCreated) desktop.Value.Dispose();
         Store.Event("server_stop", null, new { });
         Store.Dispose();
         instanceLock.Dispose();
