@@ -2,6 +2,8 @@
 
 Read README.md, IMPLEMENTATION_STATUS.md and docs/review-response.md first.
 
+v1 implementers start from docs/v1-design.md. It is the decision record for src/Codexish.Server and it wins over the older v0.1 documents wherever they disagree about v1 code; docs/v1-plan.md gives the slice order. Slice 1, the coding core with 21 underscore-named tools, is implemented. Do not add a computer_*, browser or LSP tool to it, do not add Git write tools (Git writes go through shell_run under the root's shell grant), and do not introduce confirmation prompts, rate or time caps, or BUSY/ALREADY_RUNNING rejections: contention is expressed as queued or running with a handle, and the only limits are protocol frame and page sizes reported with their source. src/Codexish.P0 stays unchanged until M-1 through M-8 are recorded.
+
 The design review of 8cecfc7 remains CHANGES_REQUESTED for full v1 until M-1–M-8. The newer verification §6a accepts F-1/F-2 after reviewer-reported Windows build and 96/96 tests. The user supplied the Codex read-only review and Claude triage and asked to proceed. Publish F-1/F-2 plus the triage's L-1 PID-error mapping and H-1/H-2/H-3 measurement procedure changes on PR #2. Record constructor-test coverage separately from the statically reviewed live-exit branch. Keep C-1–C-7 and the triaged persistence/FIFO/partial-key findings for v1. P0 resource exclusion is mutual exclusion, not acceptance-order FIFO; do not call its tests ordered-queue tests.
 
 Build one C#/.NET 10 application. Chat Pro performs reasoning; this server provides tools, not another model. Do not rebuild the proposed TypeScript Gateway, custom WSS, mTLS enrollment or broker split for v1.
