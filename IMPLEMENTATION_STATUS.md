@@ -283,3 +283,45 @@ Two test-harness bugs were fixed before these runs: the first focus now acts on 
 - Tray test 27 (busy port, supervised start) was flaky (about 1 in 5-10 runs): the blocker's system-assigned port
   could be reused as the source port of the test's own keep-alive connections. It now uses a port from 10000-29999,
   below the dynamic ranges; 10/10 local runs passed.
+
+## v1.0.1: concurrent sessions and `--init` without a root (2026-10-23)
+
+Branch `feat/v1.0.1` from `origin/main` 6500a5d. The runs below used the uncommitted working tree on the owner's
+Windows 11 PC with portable SDK 10.0.402, as a framework-dependent Release build. Nothing here involved ChatGPT, a
+tunnel, a notification icon or window, the installed app or its state folder, the real Startup folder or port 38451.
+
+| Item | What changed |
+| --- | --- |
+| A `--init` | Moved into `CommandLine.Init`. `--root` is optional: without one the file has `"roots": []`, the output says `Roots: none`, and after the existing "No usable root" warning it prints `WARNING: No folder is shared yet; add one with --root id=path, the tray's Edit roots and grants, or by editing codexish.json.` A non-numeric `--port` is now an `ArgumentException` (`--port expects a number from 0 to 65535, received '…'`) instead of a `FormatException`. |
+| A errors | Every `ArgumentException` from option parsing (including `--config` and the `--tray` options), `--init`, `ServerConfig.Load` and `Validate`, `NoAuthRefusal` and `TransportRefusal` prints `CODEXish: <message>` as one stderr line and exits with 2. The tray run, the server run, the test entries and the state lock (an `IOException` from the runtime) are outside that handler and keep their stack trace. Refusal texts are unchanged. |
+| B guidance | `Ledger.InvocationIdGuidance` ("Make every invocation_id unique for each new action: a short word plus a random suffix such as run-tests-7f3a9c2e. Other conversations may use this server at the same time. Reuse an invocation_id only to retry the identical action.") is the `invocation_id` parameter description of all seven native tools that take one (`computer_act` had none before), and part of the mounted browser tools' `invocation_id` description, `initialize.instructions`, the ledger's missing-id `INVALID_ARGUMENT` message and the Project custom instructions in `docs/reference.md`. Ledger semantics are unchanged. |
+| C checkpoints | `session_checkpoint` takes an optional `task`: missing or blank is `default`, anything else is trimmed and stored as given. A nullable `checkpoints.task` column joins the existing migration list (same transient retry); rows without it read as `default`. `host_capabilities.checkpoint` is unchanged apart from its new `task`; the new `checkpoints` lists the newest checkpoint of every task, newest first, with the same fields. Retention deletes only rows older than `output_days` that are not the newest (`MAX(seq)`) of their task. The `checkpoint` event carries the task as its `ref`. |
+| D | `<Version>1.0.1</Version>`; `docs/release-notes/v1.0.1.md`; README "Two conversations at once" (the tool table stays at 24); reference: `--init` without a root, exit code 2, "Checkpoints and parallel conversations" and the retention rule. AGENTS.md is unchanged: none of its statements became false. |
+| Tray test 27 | The remaining cause of its flakiness was a race in the test: `Running` turns true when the host exists, but the status reads "server running" only after the start attempt returns, and the test read the status once right after `Running`. It now waits, within the same 30 s, until all three conditions hold. |
+
+| Command | Result |
+| --- | --- |
+| Release build | 0 warnings, 0 errors |
+| Server project copy with its Windows conditions set to false (net10.0), offline restore | 0 warnings, 0 errors; a compile check on Windows, not a Linux run |
+| `--self-test`, two runs on the final source | SELF_TEST_PASSED 366 (357 before) in each; DESKTOP_CORE_PASSED 56; DESKTOP_REGRESSIONS 11 passed, 0 failed |
+| `--browser-tests`, two runs | BROWSER_TESTS_PASSED 55 (54 before) in each |
+| `--tray-tests`, two runs plus eight more | TRAY_CONTROLLER_PASSED 54 in all ten |
+| `--tray-tests` before the test-27 fix | 6500a5d: 5 of 7 runs passed, 2 failed at test 27; this branch before the fix: 8 of 9 passed, 1 failed at test 27 |
+| CLI by hand, each with a `--config` in a scratch folder | `--init` without `--root` exited 0 and wrote `"roots": []`; a missing `--password`, `--port many`, `--port 70000`, `--public-url ftp://…`, a missing value for `--config`, a missing configuration file, an http `public_url` (TransportRefusal), `--no-auth` with a public host (NoAuthRefusal) and `"port": 70000` in the file each printed one `CODEXish:` line and exited 2; an unreadable file without `.bak` kept its `InvalidDataException` stack trace (exit -532462766) |
+
+New checks:
+- Self-test, over HTTP: exactly the seven tools that take an `invocation_id` describe it with the guidance, and `initialize.instructions` contains it; `session_checkpoint` has an optional, described `task`.
+- Self-test, hardening (this executable as a child process, every run with a `--config` in the test directory):
+  - `--init` without `--root` writes `"roots": []` and prints the warning.
+  - Five argument and configuration errors print one `CODEXish:` line and exit 2, and none writes a file.
+- Self-test, checkpoints:
+  - Missing or blank `task` is `default`, and a task is trimmed.
+  - Two tasks keep separate newest checkpoints, listed newest first.
+  - `checkpoint` is still the overall newest.
+  - A sweep with every checkpoint past `output_days` keeps exactly the newest of each task.
+  - A v1.0.0 `checkpoints` table migrates and keeps its rows as `default`.
+- Browser tests: a wrapped mutating schema and the listed mounted `edit` tool carry the guidance; a read-only one does not.
+
+Not run and not claimed: ChatGPT, two real conversations, the tray UI, `--tray` itself, `--tray-smoke-test`,
+`--self-test-desktop`, `--self-test-desktop-http`, `--browser-live-test`, the P0 self-test, CI, a Linux run, a second
+server on the same `state_dir`, and any use of Tailscale or cloudflared.

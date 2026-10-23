@@ -50,7 +50,8 @@ public sealed class Store : IDisposable
         ("tokens", "family", "TEXT NOT NULL DEFAULT ''"),
         ("tokens", "scope", "TEXT NOT NULL DEFAULT ''"),
         ("tokens", "revoked_at", "TEXT"),
-        ("processes", "updated_at", "TEXT")
+        ("processes", "updated_at", "TEXT"),
+        ("checkpoints", "task", "TEXT")
     ];
 
     public Store(string path)
@@ -444,15 +445,27 @@ public sealed class Store : IDisposable
         return (removed, revoked);
     }
 
-    public void AddCheckpoint(string json) =>
-        Execute("INSERT INTO checkpoints(utc,json) VALUES($n,$j)", ("$n", Now), ("$j", json));
+    public const string DefaultTask = "default";
 
-    public (long Seq, string Utc, string Json)? LatestCheckpoint()
+    // A row written before checkpoints had a task belongs to the default task.
+    private const string CheckpointTask = "COALESCE(NULLIF(task,''),'" + DefaultTask + "')";
+
+    public void AddCheckpoint(string json, string task = DefaultTask) =>
+        Execute("INSERT INTO checkpoints(utc,json,task) VALUES($n,$j,$t)", ("$n", Now), ("$j", json), ("$t", task));
+
+    private static (long Seq, string Utc, string Json, string Task) MapCheckpoint(SqliteDataReader r) =>
+        (r.GetInt64(0), r.GetString(1), r.GetString(2), r.GetString(3));
+
+    public (long Seq, string Utc, string Json, string Task)? LatestCheckpoint()
     {
-        var rows = ReadAll("SELECT seq,utc,json FROM checkpoints ORDER BY seq DESC LIMIT 1",
-            r => (Seq: r.GetInt64(0), Utc: r.GetString(1), Json: r.GetString(2)));
+        var rows = ReadAll($"SELECT seq,utc,json,{CheckpointTask} FROM checkpoints ORDER BY seq DESC LIMIT 1", MapCheckpoint);
         return rows.Count == 0 ? null : rows[0];
     }
+
+    // The newest checkpoint of every task, newest first.
+    public List<(long Seq, string Utc, string Json, string Task)> NewestCheckpoints() =>
+        ReadAll($"SELECT seq,utc,json,{CheckpointTask} FROM checkpoints WHERE seq IN " +
+            $"(SELECT MAX(seq) FROM checkpoints GROUP BY {CheckpointTask}) ORDER BY seq DESC", MapCheckpoint);
 
     // Retention (P17). Every statement touches only rows past the cutoff and outside the protected states; timestamps
     // are ISO 8601 UTC strings, which order the same way as the instants they name.
@@ -478,8 +491,10 @@ public sealed class Store : IDisposable
 
     public int DeleteEvents(string cutoff) => DeleteInBatches("events", "seq", "utc < $c", ("$c", cutoff));
 
+    // The newest checkpoint of every task stays, however old it is.
     public int DeleteOldCheckpoints(string cutoff) =>
-        DeleteInBatches("checkpoints", "seq", "utc < $c AND seq < (SELECT MAX(seq) FROM checkpoints)", ("$c", cutoff));
+        DeleteInBatches("checkpoints", "seq",
+            $"utc < $c AND seq NOT IN (SELECT MAX(seq) FROM checkpoints GROUP BY {CheckpointTask})", ("$c", cutoff));
 
     // Expired or revoked tokens only. A refresh token counts as expired only while refresh_token_days is positive,
     // matching Tokens.Validate, so a kept refresh token stored with an old finite expiry is never removed.

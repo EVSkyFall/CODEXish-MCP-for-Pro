@@ -18,6 +18,7 @@ internal static class HardeningTests
         await MissingRoot(temp, password);
         ConfigurationFiles(temp, password);
         ConcurrentConfiguration(temp, password);
+        InitWithoutRoot(temp, password);
         await MalformedEntries(temp, password);
         DriveRoot(temp, password);
         await Secrets(temp, password);
@@ -28,6 +29,7 @@ internal static class HardeningTests
         await MigrationUnderLock(temp);
         await Orphans(temp, password);
         await Retention(temp, password);
+        CheckpointTasks(temp, password);
     }
 
     private static string Executable(string name) => OperatingSystem.IsWindows() ? name + ".exe" : name;
@@ -158,6 +160,56 @@ internal static class HardeningTests
         catch (InvalidDataException failure) { error = failure.Message; }
         Check(error is not null && error.Contains("could not be read") && Directory.GetFiles(directory, "codexish.json.broken-*").Length == 2,
             "without a readable .bak the real parse error is raised and the unreadable file is still kept");
+    }
+
+    // This executable as a child process, the way a user runs it from a terminal.
+    private static (int Code, string Out, string Error) Self(params string[] arguments)
+    {
+        string exe = Environment.ProcessPath!;
+        var start = new ProcessStartInfo(exe)
+        {
+            UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true
+        };
+        if (Path.GetFileNameWithoutExtension(exe).Equals("dotnet", StringComparison.OrdinalIgnoreCase))
+            start.ArgumentList.Add(typeof(HardeningTests).Assembly.Location);
+        foreach (string argument in arguments) start.ArgumentList.Add(argument);
+        using var process = Process.Start(start)!;
+        var output = process.StandardOutput.ReadToEndAsync();
+        var error = process.StandardError.ReadToEndAsync();
+        process.WaitForExit();
+        return (process.ExitCode, output.GetAwaiter().GetResult(), error.GetAwaiter().GetResult());
+    }
+
+    // v1.0.1 A: --init without --root writes no root and says how to add one, and a bad or missing argument is one line
+    // on stderr with exit code 2. Every run names a --config in the test directory, so no other configuration is
+    // read or written.
+    private static void InitWithoutRoot(string temp, string password)
+    {
+        string directory = Path.Combine(temp, "init");
+        Directory.CreateDirectory(directory);
+        string path = Path.Combine(directory, "codexish.json"), state = Path.Combine(directory, "state");
+        var created = Self("--init", "--config", path, "--password", password, "--public-url", "https://init.test", "--state-dir", state);
+        int written;
+        using (var file = JsonDocument.Parse(File.ReadAllBytes(path))) written = file.RootElement.GetProperty("roots").GetArrayLength();
+        Check(created.Code == 0 && written == 0 && created.Out.Contains("Roots: none", StringComparison.Ordinal) &&
+              created.Out.Contains("WARNING: " + CommandLine.NoFolderShared, StringComparison.Ordinal) && ServerConfig.Load(path).Roots.Length == 0,
+            "--init without --root writes \"roots\": [] and prints that no folder is shared yet and how to add one");
+
+        string refused = Path.Combine(directory, "refused.json");
+        bool OneLine((int Code, string Out, string Error) run, string message)
+        {
+            string text = run.Error.ReplaceLineEndings("\n").TrimEnd('\n');
+            return run.Code == 2 && !text.Contains('\n') && text.StartsWith("CODEXish: ", StringComparison.Ordinal) &&
+                text.Contains(message, StringComparison.Ordinal);
+        }
+        Check(OneLine(Self("--init", "--config", refused, "--public-url", "https://init.test", "--state-dir", state), "--init requires --password") &&
+              OneLine(Self("--init", "--config", refused, "--password"), "Missing value for --password") &&
+              OneLine(Self("--init", "--config", refused, "--password", password, "--public-url", "https://init.test", "--port", "many", "--state-dir", state),
+                  "--port expects a number") &&
+              OneLine(Self("--init", "--config", refused, "--password", password, "--public-url", "https://init.test", "--root", "no-separator", "--state-dir", state),
+                  "--root expects id=path") &&
+              OneLine(Self("--config", Path.Combine(directory, "absent.json")), "No configuration at") && !File.Exists(refused),
+            "a missing or malformed argument and a missing configuration print one line, CODEXish: <message>, on stderr and exit with code 2");
     }
 
     // C1 and C2: recovery never overwrites a file another writer saved in between, and an unreadable copy never
@@ -759,5 +811,65 @@ internal static class HardeningTests
         Sql("INSERT INTO events(utc,kind,ref,json) VALUES($o,'kept-forever',NULL,'{}')", ("$o", old));
         runtime.Retention.Sweep(now);
         Check(store.Events("kept-forever").Count == 1, "output_days 0 keeps that state forever");
+    }
+
+    // v1.0.1 C: every task keeps its own newest checkpoint, through host_capabilities and retention, and a checkpoints
+    // table written before tasks existed keeps its rows as task "default".
+    private static void CheckpointTasks(string temp, string password)
+    {
+        var config = BuildConfig(Path.Combine(temp, "checkpoint-tasks"), password);
+        using (var runtime = new CodexishRuntime(config))
+        {
+            var tools = new CodexishTools(runtime);
+            string Line(ModelContextProtocol.Protocol.CallToolResult result) => Data(result).GetProperty("task").GetString()!;
+            var unnamed = tools.SessionCheckpoint("first default goal", "check one", [], ["a"], []);
+            var api = tools.SessionCheckpoint("first api goal", "check two", [], [], [], task: "  api-tests ");
+            var blank = tools.SessionCheckpoint("second default goal", "check three", [], [], [], task: " ");
+            tools.SessionCheckpoint("ui goal", "check four", [], [], [], task: "ui");
+            var newer = tools.SessionCheckpoint("second api goal", "check five", [], [], [], task: "api-tests");
+            Check(Line(unnamed) == "default" && Line(blank) == "default" && Line(api) == "api-tests" && Line(newer) == "api-tests",
+                "a checkpoint without a task, or with a blank one, is task \"default\", and a task is stored trimmed");
+            var capabilities = Data(tools.HostCapabilities());
+            var listed = capabilities.GetProperty("checkpoints").EnumerateArray().ToArray();
+            long[] seqs = listed.Select(c => c.GetProperty("seq").GetInt64()).ToArray();
+            Check(listed.Select(c => c.GetProperty("task").GetString()).SequenceEqual(["api-tests", "ui", "default"]) &&
+                  listed.Select(c => c.GetProperty("checkpoint").GetProperty("goal").GetString()).SequenceEqual(["second api goal", "ui goal", "second default goal"]) &&
+                  seqs.SequenceEqual(seqs.OrderDescending()) && listed.All(c => c.GetProperty("utc").GetString() is { Length: > 0 }),
+                "two tasks keep separate newest checkpoints, and host_capabilities lists the newest of every task, newest first");
+            var latest = capabilities.GetProperty("checkpoint");
+            Check(latest.GetProperty("checkpoint").GetProperty("goal").GetString() == "second api goal" &&
+                  latest.GetProperty("task").GetString() == "api-tests" && latest.GetProperty("seq").GetInt64() == seqs[0],
+                "the latest checkpoint field is still the overall newest, and names its task");
+
+            // Every checkpoint is past output_days, so only the newest of each task may stay.
+            runtime.Store.Execute("UPDATE checkpoints SET utc=$o", ("$o", DateTimeOffset.UtcNow.AddDays(-40).ToString("o")));
+            var report = runtime.Retention.Sweep(DateTimeOffset.UtcNow);
+            Check(report.ErrorCount == 0 && runtime.Store.ExecuteCount("UPDATE checkpoints SET json=json") == 3 &&
+                  runtime.Store.NewestCheckpoints().Select(c => c.Seq).SequenceEqual(seqs),
+                "retention past output_days keeps the newest checkpoint of every task and removes the older ones");
+        }
+
+        string legacy = Path.Combine(temp, "checkpoints-legacy.db");
+        using (var connection = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = legacy, Pooling = false }.ToString()))
+        {
+            connection.Open();
+            using var command = connection.CreateCommand();
+            // The table as v1.0.0 wrote it.
+            command.CommandText = """
+                CREATE TABLE checkpoints(seq INTEGER PRIMARY KEY AUTOINCREMENT, utc TEXT NOT NULL, json TEXT NOT NULL);
+                INSERT INTO checkpoints(utc,json) VALUES('2026-10-01T00:00:00.0000000+00:00','{"goal":"older"}');
+                INSERT INTO checkpoints(utc,json) VALUES('2026-10-02T00:00:00.0000000+00:00','{"goal":"newer"}');
+                """;
+            command.ExecuteNonQuery();
+        }
+        using (var store = new Store(legacy))
+        {
+            bool migrated = store.MigrationErrors.Count == 0 && store.ExecuteCount("UPDATE checkpoints SET task=task") == 2 &&
+                store.LatestCheckpoint() is { Task: "default", Json: "{\"goal\":\"newer\"}" } &&
+                store.NewestCheckpoints() is [{ Task: "default" }];
+            store.AddCheckpoint("{\"goal\":\"tasked\"}", "api-tests");
+            Check(migrated && store.NewestCheckpoints().Select(c => c.Task).SequenceEqual(["api-tests", "default"]),
+                "a database with the old checkpoints table opens, gains the task column and keeps its rows as task \"default\"");
+        }
     }
 }

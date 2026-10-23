@@ -563,7 +563,7 @@ public sealed class BrowserMounts : IAsyncDisposable
                 ["type"] = "string",
                 ["description"] = readOnly
                     ? "Not needed for this read-only tool; reads are not queued or recorded."
-                    : "Required. A new id per action; reuse it only for an identical retry and inspect unknown effects instead of replaying."
+                    : "Required. " + Ledger.InvocationIdGuidance + " Inspect unknown effects instead of replaying."
             },
             ["wait_ms"] = new JsonObject
             {

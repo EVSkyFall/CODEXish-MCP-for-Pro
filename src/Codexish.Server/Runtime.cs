@@ -102,7 +102,7 @@ public sealed class CodexishRuntime : IDisposable
         "is met and verified; do not stop to ask unless permission is missing or the user cancels. Read before " +
         "editing and pass the returned sha256 to writes. After every edit run the relevant tests or build and fix " +
         "observed failures. Long commands return handles: poll them; a response wait is not a deadline and never " +
-        "kills the process. Reuse invocation_id only when retrying the same action; inspect unknown operations, " +
+        "kills the process. " + Ledger.InvocationIdGuidance + " Inspect unknown operations, " +
         "never replay them. Report actual exit codes, diffs, and file contents, not inferred success. Call " +
         "session_checkpoint after each milestone so work can resume across turns. For GUI: observe before acting; " +
         "prefer UIA elements, explicitly choose image coordinates or physical pixels, and inspect the observation " +
@@ -153,6 +153,7 @@ public sealed class CodexishRuntime : IDisposable
         authentication = AuthDisabled ? "disabled (loopback development only)" : "built-in OAuth 2.1 with PKCE, opaque bearer tokens",
         paused = Ledger.Paused,
         checkpoint = LatestCheckpoint(),
+        checkpoints = NewestCheckpoints(),
         recovery = new
         {
             invocations_cancelled_on_restart = RecoveredInvocations.Cancelled,
@@ -191,30 +192,38 @@ public sealed class CodexishRuntime : IDisposable
         next_tool = "fs_list or git_status"
     };
 
+    // The newest checkpoint of all tasks.
+    public object? LatestCheckpoint() => Store.LatestCheckpoint() is { } row ? DescribeCheckpoint(row) : null;
+
+    // The newest checkpoint of every task, newest first. Retention bounds the list.
+    public object[] NewestCheckpoints() => Store.NewestCheckpoints().Select(DescribeCheckpoint).ToArray();
+
     // A stored checkpoint that is not valid JSON is reported as unreadable in this one response.
-    public object? LatestCheckpoint()
+    private static object DescribeCheckpoint((long Seq, string Utc, string Json, string Task) row)
     {
-        var row = Store.LatestCheckpoint();
-        if (row is null) return null;
-        try { return new { seq = row.Value.Seq, utc = row.Value.Utc, checkpoint = JsonDocument.Parse(row.Value.Json).RootElement.Clone() }; }
+        try { return new { seq = row.Seq, utc = row.Utc, task = row.Task, checkpoint = JsonDocument.Parse(row.Json).RootElement.Clone() }; }
         catch (JsonException error)
         {
-            return new { seq = row.Value.Seq, utc = row.Value.Utc, unreadable = true, error = "The stored checkpoint is not valid JSON: " + error.Message };
+            return new { seq = row.Seq, utc = row.Utc, task = row.Task, unreadable = true, error = "The stored checkpoint is not valid JSON: " + error.Message };
         }
     }
 
-    public CallToolResult Checkpoint(string goal, string completionCondition, string[] done, string[] remaining, string[] handles)
+    public CallToolResult Checkpoint(string goal, string completionCondition, string[] done, string[] remaining, string[] handles,
+        string? task = null)
     {
         if (string.IsNullOrWhiteSpace(goal) || string.IsNullOrWhiteSpace(completionCondition))
             throw new CodexishFault("INVALID_ARGUMENT", "goal and completion_condition are required and must be observable.");
+        string line = string.IsNullOrWhiteSpace(task) ? Store.DefaultTask : task.Trim();
         var checkpoint = new { goal, completion_condition = completionCondition, done, remaining, handles };
-        Store.AddCheckpoint(JsonSerializer.Serialize(checkpoint));
-        Store.Event("checkpoint", null, checkpoint);
+        Store.AddCheckpoint(JsonSerializer.Serialize(checkpoint), line);
+        Store.Event("checkpoint", line, checkpoint);
         return Reply.Ok(new
         {
             stored = true,
+            task = line,
             checkpoint,
-            note = "host_capabilities returns the latest checkpoint at the start of the next turn.",
+            note = "At the start of the next turn host_capabilities returns this as the newest checkpoint of its task in " +
+                "checkpoints, and as checkpoint while no other task has a newer one.",
             next_tool = "continue the remaining work"
         });
     }

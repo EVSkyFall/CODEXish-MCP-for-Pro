@@ -678,7 +678,8 @@ public static class TrayTests
                     "a server start on a busy port returns as retrying with its concrete cause instead of failing");
             }
             finally { blocker.Stop(); }
-            Check(await Eventually(() => busy.Running, 30) && busy.Address?.Port == port && busy.Status == "server running",
+            // Running turns true when the host exists; the status says "running" only after the start attempt returns.
+            Check(await Eventually(() => busy.Running && busy.Address?.Port == port && busy.Status == "server running", 30),
                 "the supervised start succeeds on a later attempt once the port is free");
             await busy.StopAsync();
             Check(!busy.Running && busy.Status == "server stopped", "a user stop ends server supervision");
