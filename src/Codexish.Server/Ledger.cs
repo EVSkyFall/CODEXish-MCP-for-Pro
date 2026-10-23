@@ -18,6 +18,12 @@ public sealed class Job(string id, CancellationToken token, TaskCompletionSource
 // the ledger insert under this gate, and each resource runs its accepted work in exactly that order.
 public sealed class Ledger : IDisposable
 {
+    // The key is global: conversations share one OAuth connection, so an id another conversation already used with
+    // identical arguments returns that stored result instead of running. Every description of invocation_id says this.
+    public const string InvocationIdGuidance =
+        "Make every invocation_id unique for each new action: a short word plus a random suffix such as run-tests-7f3a9c2e. " +
+        "Other conversations may use this server at the same time. Reuse an invocation_id only to retry the identical action.";
+
     private readonly Store store;
     private readonly Action<string> log;
     private readonly object gate = new();
@@ -77,7 +83,7 @@ public sealed class Ledger : IDisposable
         Func<Job, Task<CallToolResult>> action, int waitMs, bool releaseChainOnStart = false)
     {
         if (string.IsNullOrWhiteSpace(id) || id.Length > 128)
-            return Reply.Error("INVALID_ARGUMENT", "Supply an invocation_id of 1-128 characters; reuse it only to retry the same action.");
+            return Reply.Error("INVALID_ARGUMENT", "Supply an invocation_id of 1-128 characters. " + InvocationIdGuidance);
         if (waitMs < 0)
             return Reply.Error("INVALID_ARGUMENT", "wait_ms must be zero or greater. It is a response wait, never an execution deadline.");
         string digest = Digest(tool, args);

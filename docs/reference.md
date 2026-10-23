@@ -1,7 +1,8 @@
 # CODEXish reference
 
-Everything the [README](../README.md) leaves out: configuration, OAuth details, the control API, shells and Git, the
-ledger and retention, browser mounts, the tray, tests and known gaps.
+Everything the [README](../README.md) leaves out: configuration, OAuth details, checkpoints and parallel
+conversations, the control API, shells and Git, the ledger and retention, browser mounts, the tray, tests and known
+gaps.
 
 ## Install from source
 
@@ -32,8 +33,10 @@ secret and the loopback control token with `RandomNumberGenerator`, stores the p
 and puts the hostname from `--public-url` into `allow_hosts` and its origin into `allow_origins` (the tunnel
 terminates TLS, so the login form's own POST arrives with an https Origin over an http connection).
 `--public-url` must be https unless you run with `--no-auth`, because the access token would otherwise cross
-the tunnel in clear text. `--port` is the local listening port (default 3000). Repeat `--root id=path` for more
-roots; each root grants read, write and shell unless you edit the file afterwards. Roots may overlap or nest: each
+the tunnel in clear text. `--port` is the local listening port (default 3000). `--root id=path` is optional and
+repeatable; each root grants read, write and shell unless you edit the file afterwards. Without one, `--init` writes
+`"roots": []` and warns that no folder is shared yet; add one in the tray's **Edit roots and grants** or in
+`codexish.json` (running `--init` again with `--root` works too, but creates new secrets). Roots may overlap or nest: each
 call uses the grants of the `root_id` it names, and changes to files reachable through several roots wait in one
 queue. `--state-dir` moves the ledger, artifacts and backups; keep it outside every root, because a root that
 contains it exposes them to that root's tools. Any https callback is accepted (see below), so
@@ -53,6 +56,11 @@ previous version as `codexish.json.bak`. If `codexish.json` cannot be parsed, it
 `codexish.json.broken-<utc>` (`-2`, `-3` and so on when that name is taken) and a readable `codexish.json.bak` is
 loaded and restored in its place. If another program saved `codexish.json` in the meantime, nothing is overwritten:
 a readable new version is loaded instead, and otherwise the `.bak` is loaded without being restored.
+
+A missing or malformed argument (for example `--init` without `--password`, `--port many` or `--root` without `=`),
+a missing configuration file, and the refusals above except the `state_dir` lock print one line,
+`CODEXish: <message>`, on stderr and exit with code 2. A second server on the same `state_dir`, and anything
+unexpected, keep their full exception and stack trace.
 
 ## Running without the tray
 
@@ -163,10 +171,37 @@ Paste this into the Project's custom instructions so the harness text survives a
 > You are operating the user's Windows PC through these tools. Work until the stated completion condition is met
 > and verified; do not stop to ask unless permission is missing or the user cancels. Read before editing and pass
 > the returned sha256 to writes. After every edit run the relevant tests or build and fix observed failures. Long
-> commands return handles: poll them; a response wait is not a deadline and never kills the process. Reuse
-> invocation_id only when retrying the same action; inspect unknown operations, never replay them. Report actual
-> exit codes, diffs, and file contents, not inferred success. Call session_checkpoint after each milestone so work
-> can resume across turns.
+> commands return handles: poll them; a response wait is not a deadline and never kills the process. Make every
+> invocation_id unique for each new action: a short word plus a random suffix such as run-tests-7f3a9c2e. Other
+> conversations may use this server at the same time. Reuse an invocation_id only to retry the identical action.
+> Inspect unknown operations, never replay them. Report actual exit codes, diffs, and file contents, not inferred
+> success. Call session_checkpoint after each milestone so work can resume across turns.
+
+Instructions pasted before v1.0.1 lack the `invocation_id` sentences; replace them with this text.
+
+## Checkpoints and parallel conversations
+
+`session_checkpoint` stores the goal, the completion condition, the finished and remaining steps and the handles of
+the work. Its optional `task` names the line of work: the same `task` for one line of work keeps parallel work, for
+example two conversations, in separate checkpoints. A missing or blank `task` is `default`; any other value is
+trimmed and stored as given, with no limit on its length or characters.
+
+`host_capabilities` returns both views:
+
+- `checkpoint` is the newest checkpoint of all tasks, as before, and now names its `task`. It has `seq`, `utc`,
+  `task` and the stored `checkpoint`, or `unreadable` and `error` when the stored text is not valid JSON.
+  `workspace_info` returns the same field.
+- `checkpoints` is the newest checkpoint of every task, newest first, each with the same fields. It has no cap;
+  [retention](#ledger-and-retention) bounds it.
+
+CODEXish cannot tell conversations apart: they share one OAuth connection, and the ledger key, `invocation_id`, is
+global. An `invocation_id` that another conversation already used with identical arguments returns that stored result
+instead of running. The ledger itself is unchanged: the server instructions and every tool that takes an
+`invocation_id` ask for one that is unique for each new action, a short word plus a random suffix such as
+`run-tests-7f3a9c2e`.
+
+A ledger written by v1.0.0 gains the `task` column the first time v1.0.1 opens it; its checkpoints keep their
+content and belong to `default`.
 
 ## Local control API
 
@@ -217,10 +252,10 @@ CODEXish deletes its own old state, never your roots, files or Git history:
 ```
 
 About a minute after start and then every 6 hours, artifacts (command output and stored reads), finished ledger
-entries, events, exited processes with their output, expired or revoked tokens, older checkpoints, client
+entries, events, exited processes with their output, expired or revoked tokens, older checkpoints of each task, client
 registrations that never completed a sign-in and the tray's log files older than `output_days` are deleted; pre-edit backups, quarantined ledgers and `codexish.json.broken-*` copies
 older than `backup_days` are deleted. A missing section means these defaults, and `0` keeps that state forever.
-Running and reattachable processes, queued or running operations, the newest checkpoint, live tokens and browser
+Running and reattachable processes, queued or running operations, the newest checkpoint of every task, live tokens and browser
 profiles are never deleted, and neither is an exited process whose job still holds a running descendant, nor its
 output, until that descendant ends. A failed step is retried at the next sweep; `host_capabilities.retention` shows
 the settings and the last sweep.
