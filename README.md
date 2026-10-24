@@ -117,6 +117,14 @@ desktop app is required. You do not need them.
   place: read before writing, poll long commands, report real exit codes.
 - **Desktop work.** ChatGPT observes before it acts. Do not use the PC's mouse and keyboard while it works on the
   desktop.
+- **Two conversations at once.** CODEXish cannot tell conversations apart, so keep them out of each other's way:
+  - Give each conversation its own folder, for example a git worktree shared as a separate root.
+  - Run desktop work in one conversation at a time.
+  - Name a `task` for each line of work, for example "checkpoint as task login-fix". `session_checkpoint` then keeps
+    a separate checkpoint for each one, and `host_capabilities` lists them all.
+  - The instructions tell ChatGPT to make every `invocation_id` unique for each new action, a short word plus a
+    random suffix such as `run-tests-7f3a9c2e`, because other conversations may use the server at the same time. It
+    reuses one only to retry the identical action.
 
 ## Everyday control
 
@@ -185,8 +193,8 @@ dotnet run --project src/Codexish.Server -c Release -- --tray-tests
 ## Documentation
 
 - [Security policy](SECURITY.md): the security model, what is in and out of scope, and how to report a vulnerability.
-- [Reference](docs/reference.md): configuration, OAuth, the control API, shells and Git, the ledger and retention,
-  browser mounts, the tray, tests, and limits.
+- [Reference](docs/reference.md): configuration, OAuth, checkpoints and parallel conversations, the control API,
+  shells and Git, the ledger and retention, browser mounts, the tray, tests, and limits.
 - [Design](docs/v1-design.md) and [plan](docs/v1-plan.md).
 - [Implementation status](IMPLEMENTATION_STATUS.md).
 - [P0 probe](docs/p0-probe.md): the original measurement fixture in `src/Codexish.P0`.

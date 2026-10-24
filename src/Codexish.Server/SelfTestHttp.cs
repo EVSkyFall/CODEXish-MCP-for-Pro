@@ -771,6 +771,26 @@ internal static partial class HttpTests
             "fs_write is not annotated read-only");
         Check(tools.All(t => t.GetProperty("description").GetString()!.Contains("next tool", StringComparison.OrdinalIgnoreCase)),
             "every tool description names the next tool to call");
+        // Conversations share one connection and the ledger key is global, so every description of invocation_id
+        // must ask for an id that is unique per action.
+        string? Described(JsonElement tool, string parameter) =>
+            tool.GetProperty("inputSchema").TryGetProperty("properties", out var properties) &&
+            properties.TryGetProperty(parameter, out var schema) && schema.TryGetProperty("description", out var text) ? text.GetString() : null;
+        bool Takes(JsonElement tool, string parameter) =>
+            tool.GetProperty("inputSchema").TryGetProperty("properties", out var properties) && properties.TryGetProperty(parameter, out _);
+        string[] withId = tools.Where(t => Takes(t, "invocation_id")).Select(t => t.GetProperty("name").GetString()!).Order(StringComparer.Ordinal).ToArray();
+        Check(withId.SequenceEqual(["computer_act", "fs_apply_patch", "fs_write", "process_start", "process_stop", "process_write", "shell_run"]) &&
+              tools.Where(t => Takes(t, "invocation_id")).All(t => Described(t, "invocation_id") == Ledger.InvocationIdGuidance) &&
+              initialized.GetProperty("instructions").GetString()!.Contains(Ledger.InvocationIdGuidance, StringComparison.Ordinal) &&
+              Ledger.InvocationIdGuidance.Contains("random suffix such as run-tests-7f3a9c2e", StringComparison.Ordinal) &&
+              Ledger.InvocationIdGuidance.Contains("Other conversations may use this server at the same time", StringComparison.Ordinal) &&
+              Ledger.InvocationIdGuidance.Contains("only to retry the identical action", StringComparison.Ordinal),
+            "all seven tools that take an invocation_id, and initialize.instructions, say to make it unique per action because other conversations share the server");
+        var checkpointTool = tools.Single(t => t.GetProperty("name").GetString() == "session_checkpoint");
+        Check(Described(checkpointTool, "task") is { } task && task.Contains("keeps separate checkpoints", StringComparison.Ordinal) &&
+              !checkpointTool.GetProperty("inputSchema").GetProperty("required").EnumerateArray().Any(r => r.GetString() == "task") &&
+              checkpointTool.GetProperty("description").GetString()!.Contains("Pass the same task for one line of work", StringComparison.Ordinal),
+            "session_checkpoint takes an optional task and says to pass the same one for one line of work");
         if (Environment.GetEnvironmentVariable("CODEXISH_TEST_OUTPUT") is { Length: > 0 } evidence)
         {
             Directory.CreateDirectory(evidence);

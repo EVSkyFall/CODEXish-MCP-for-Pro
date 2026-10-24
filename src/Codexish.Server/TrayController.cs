@@ -678,7 +678,8 @@ public static class TrayTests
                     "a server start on a busy port returns as retrying with its concrete cause instead of failing");
             }
             finally { blocker.Stop(); }
-            Check(await Eventually(() => busy.Running, 30) && busy.Address?.Port == port && busy.Status == "server running",
+            // Running turns true when the host exists; the status says "running" only after the start attempt returns.
+            Check(await Eventually(() => busy.Running && busy.Address?.Port == port && busy.Status == "server running", 30),
                 "the supervised start succeeds on a later attempt once the port is free");
             await busy.StopAsync();
             Check(!busy.Running && busy.Status == "server stopped", "a user stop ends server supervision");
@@ -845,9 +846,9 @@ public static class TrayTests
                 string executable = Environment.ProcessPath!;
                 string custom = Path.Combine(directory, "custom config.json");
                 var autostart = new TrayAutostart(startup, executable, custom);
-                Check(new TrayAutostart(startup, executable, ServerConfig.DefaultPath).Arguments == "--tray --start" &&
+                Check(new TrayAutostart(startup, executable, ServerConfig.DefaultPath).Arguments == $"--tray --start --config \"{Path.GetFullPath(ServerConfig.DefaultPath)}\"" &&
                       autostart.Arguments == $"--tray --start --config \"{custom}\"",
-                    "the shortcut passes --config only for a configuration outside the default path");
+                    "the shortcut always passes the configuration's full path, the default location included");
                 Check(!autostart.Enabled, "autostart is off while no shortcut exists");
                 autostart.Enable();
                 var written = autostart.Read();
@@ -864,6 +865,9 @@ public static class TrayTests
                 File.Delete(moved);
                 Check(autostart.Heal() && autostart.Read().Target.Equals(executable, StringComparison.OrdinalIgnoreCase),
                     "a shortcut whose target file no longer exists is rewritten to the current executable");
+                new TrayAutostart(startup, executable, ServerConfig.DefaultPath).Enable();
+                Check(autostart.Heal() && autostart.Read().Arguments == autostart.Arguments,
+                    "a shortcut that starts the tray with other arguments, such as one without --config, is rewritten");
                 File.WriteAllText(autostart.ShortcutPath, "not a shell link");
                 Check(autostart.Heal() && autostart.Read().Target.Equals(executable, StringComparison.OrdinalIgnoreCase),
                     "an unreadable shortcut is rewritten as well");

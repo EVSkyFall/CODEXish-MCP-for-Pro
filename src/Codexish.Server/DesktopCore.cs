@@ -532,7 +532,7 @@ public sealed class DesktopTools(CodexishRuntime runtime, DesktopService desktop
         desktop.Query(observation_id, role, name, cursor, page_size);
     [McpServerTool(Name = "computer_act", ReadOnly = false, Destructive = true, OpenWorld = true)]
     [Description("Perform one Windows action then observe by default. Actions: click_element, click_coordinate, double_click, right_click, move, scroll, drag, type_text, key_combo, key_press, focus_window, minimize_window, maximize_window, restore_window. coordinate_space is required: image/desktop_physical_px for points, none for keyboard/window/element. Focus_window can recover lost foreground; it reports activation.method, and when Windows holds the foreground lock it may send one synthetic ALT tap, counted in activation_inputs_sent. Use same invocation_id only for identical retries. Partial input releases delivered key-downs and is never replayed; verify actual files after saving. Next tool: computer_observe or fs_read to verify the outcome.")]
-    public Task<CallToolResult> Act(string observation_id, string action, string coordinate_space, string invocation_id,
+    public Task<CallToolResult> Act(string observation_id, string action, string coordinate_space, [Description(Ledger.InvocationIdGuidance)] string invocation_id,
         int? x = null, int? y = null, int? end_x = null, int? end_y = null, string? element_id = null,
         string? text = null, string? key = null, int wheel_delta = -120, bool observe_after = true) =>
         runtime.Ledger.Invoke(invocation_id, "computer_act", new { observation_id, action, coordinate_space, x, y, end_x, end_y, element_id, text, key, wheel_delta, observe_after },

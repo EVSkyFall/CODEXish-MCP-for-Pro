@@ -13,7 +13,8 @@ public sealed class CodexishTools(CodexishRuntime runtime)
     [Description("Call this first in a session. Returns protocol and schema versions, the configured roots and their " +
         "read/write/shell grants, the execution boundary (there is no sandbox: shell and build commands run as the " +
         "logged-in Windows user), the features this build does not implement and why, the frame and page limits with " +
-        "their source, and the latest session_checkpoint so you can resume. Next tool: workspace_info, then fs_list " +
+        "their source, and session checkpoints so you can resume: checkpoint is the latest of any task, checkpoints the " +
+        "newest of every task, newest first. Next tool: workspace_info, then fs_list " +
         "or git_status. No error codes other than transport failures.")]
     public CallToolResult HostCapabilities() => Reply.Guard(() => Reply.Ok(runtime.Capabilities()));
 
@@ -96,7 +97,7 @@ public sealed class CodexishTools(CodexishRuntime runtime)
         [Description("File path relative to the root.")] string path,
         [Description("Complete new content of the file.")] string text,
         [Description("create for a new file, replace for an existing one.")] string mode,
-        [Description("New id for a new write; the same id only to retry that write.")] string invocation_id,
+        [Description(Ledger.InvocationIdGuidance)] string invocation_id,
         [Description("sha256 from fs_read. Required for replace, forbidden for create.")] string? expected_sha256 = null) =>
         runtime.Ledger.Invoke(invocation_id, "fs_write", new { root_id, path, text, mode, expected_sha256 },
             "files:" + runtime.Workspace.QueueKey(root_id), _ => Task.FromResult(Reply.Guard(() => runtime.Files.Write(root_id, path, text, mode, expected_sha256))), 15000);
@@ -113,7 +114,7 @@ public sealed class CodexishTools(CodexishRuntime runtime)
         [Description("Root id from workspace_info; the root needs the write grant.")] string root_id,
         [Description("Unified diff text with ---/+++ headers and @@ hunks.")] string patch,
         [Description("One entry per file the patch touches.")] PatchExpectation[] expected,
-        [Description("New id for a new patch; the same id only to retry it.")] string invocation_id) =>
+        [Description(Ledger.InvocationIdGuidance)] string invocation_id) =>
         runtime.Ledger.Invoke(invocation_id, "fs_apply_patch", new { root_id, patch, expected = expected.Select(e => new { e.Path, e.ExpectedSha256 }) },
             "files:" + runtime.Workspace.QueueKey(root_id), _ => Task.FromResult(Reply.Guard(() => runtime.Patches.Apply(root_id, patch, expected))), 30000);
 
@@ -128,7 +129,7 @@ public sealed class CodexishTools(CodexishRuntime runtime)
         "root directory does not exist. Next tool: process_poll with the returned process_id, or artifact_read for full output.")]
     public Task<CallToolResult> ShellRun(
         [Description("Root id from workspace_info; the root needs the shell grant.")] string root_id,
-        [Description("New id for a new command; the same id only to retry it.")] string invocation_id,
+        [Description(Ledger.InvocationIdGuidance)] string invocation_id,
         [Description("Working directory relative to the root. Empty means the root itself.")] string cwd = "",
         [Description("Command line for the chosen shell.")] string? command = null,
         [Description("pwsh, powershell or cmd. Optional: the configured default shell runs the command when this is omitted.")] string? shell = null,
@@ -145,7 +146,7 @@ public sealed class CodexishTools(CodexishRuntime runtime)
         "Next tool: process_poll for incremental output, process_write for stdin, process_stop to end it.")]
     public Task<CallToolResult> ProcessStart(
         [Description("Root id from workspace_info; the root needs the shell grant.")] string root_id,
-        [Description("New id for a new process; the same id only to retry the start.")] string invocation_id,
+        [Description(Ledger.InvocationIdGuidance)] string invocation_id,
         [Description("Working directory relative to the root.")] string cwd = "",
         [Description("Command line for the chosen shell.")] string? command = null,
         [Description("pwsh, powershell or cmd. Optional: the configured default shell runs the command when this is omitted.")] string? shell = null,
@@ -245,7 +246,7 @@ public sealed class CodexishTools(CodexishRuntime runtime)
     public Task<CallToolResult> ProcessWrite(
         [Description("process_id from shell_run or process_start.")] string process_id,
         [Description("Exact text to write, including any trailing newline.")] string text,
-        [Description("New id for new input; the same id only to retry it.")] string invocation_id) =>
+        [Description(Ledger.InvocationIdGuidance)] string invocation_id) =>
         runtime.Ledger.Invoke(invocation_id, "process_write", new { process_id, text }, $"process:{process_id}",
             _ => Task.FromResult(Reply.Guard(() => runtime.Processes.WriteStdin(process_id, text))), 5000);
 
@@ -257,7 +258,7 @@ public sealed class CodexishTools(CodexishRuntime runtime)
     public Task<CallToolResult> ProcessStop(
         [Description("process_id from shell_run or process_start.")] string process_id,
         [Description("graceful or kill_tree.")] string mode,
-        [Description("New id for a new stop; the same id only to retry it.")] string invocation_id) =>
+        [Description(Ledger.InvocationIdGuidance)] string invocation_id) =>
         runtime.Ledger.Invoke(invocation_id, "process_stop", new { process_id, mode }, $"process:{process_id}",
             _ => Reply.GuardAsync(() => runtime.Processes.Stop(process_id, mode)), 10000);
 
@@ -348,14 +349,18 @@ public sealed class CodexishTools(CodexishRuntime runtime)
     [McpServerTool(Name = "session_checkpoint", ReadOnly = false, Destructive = false, OpenWorld = false)]
     [Description("Stores the observable state of the work so a later turn can resume it: the goal, the condition that " +
         "proves it is done, what is finished, what is left, and the handles (paths, process ids, operation ids) the " +
-        "next turn needs. Call it after each milestone. host_capabilities returns the latest checkpoint. It stores " +
-        "text only and changes no permission. INVALID_ARGUMENT: goal and completion_condition must be observable. " +
-        "Next tool: continue the remaining work.")]
+        "next turn needs. Call it after each milestone. Pass the same task for one line of work so parallel work, for " +
+        "example two conversations, keeps separate checkpoints. host_capabilities returns the newest checkpoint of every " +
+        "task and the latest of all. It stores text only and changes no permission. INVALID_ARGUMENT: goal and " +
+        "completion_condition must be observable. Next tool: continue the remaining work.")]
     public CallToolResult SessionCheckpoint(
         [Description("What the user asked for, in one sentence.")] string goal,
         [Description("The observable condition that proves the goal is met, such as a passing test command.")] string completion_condition,
         [Description("Steps already finished and verified.")] string[] done,
         [Description("Steps still to do.")] string[] remaining,
-        [Description("Handles the next turn needs: paths, process ids, operation ids, artifact ids.")] string[] handles) =>
-        Reply.Guard(() => runtime.Checkpoint(goal, completion_condition, done, remaining, handles));
+        [Description("Handles the next turn needs: paths, process ids, operation ids, artifact ids.")] string[] handles,
+        [Description("The line of work this checkpoint belongs to, for example fix-login-tests. Pass the same task for one " +
+            "line of work so parallel work, for example two conversations, keeps separate checkpoints. Missing or blank " +
+            "means \"default\".")] string? task = null) =>
+        Reply.Guard(() => runtime.Checkpoint(goal, completion_condition, done, remaining, handles, task));
 }

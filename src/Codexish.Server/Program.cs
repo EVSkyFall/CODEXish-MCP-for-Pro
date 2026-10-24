@@ -1,3 +1,4 @@
+using System.Globalization;
 using Codexish.Server;
 
 if (args.Contains("--design-preview"))
@@ -39,56 +40,26 @@ if (args.Contains("--self-test"))
 }
 
 string? Option(string name) => CommandLine.Values(args, name).FirstOrDefault();
-string configPath = Option("--config") ?? ServerConfig.DefaultPath;
-if (args.Contains("--tray")) return await TrayApplication.Run(configPath, TrayOptions.Parse(args), arguments: args);
-
-if (args.Contains("--init"))
-{
-    string password = Option("--password")
-        ?? throw new ArgumentException("--init requires --password <pw>. It is hashed with PBKDF2-SHA256; nothing is read from the environment.");
-    string publicUrl = Option("--public-url")
-        ?? throw new ArgumentException("--init requires --public-url <https://your-tunnel-host> so OAuth metadata and the Host allowlist match.");
-    var roots = CommandLine.Values(args, "--root").Select(value =>
-    {
-        int separator = value.IndexOf('=');
-        if (separator <= 0) throw new ArgumentException($"--root expects id=path, received '{value}'.");
-        return (Id: value[..separator], Path: value[(separator + 1)..]);
-    }).ToArray();
-    if (roots.Length == 0) throw new ArgumentException("--init requires at least one --root id=path.");
-    var created = ServerConfig.Create(publicUrl, password, roots, CommandLine.Values(args, "--redirect-uri"),
-        int.Parse(Option("--port") ?? "3000"), Option("--state-dir"));
-    created.Save(configPath);
-    Console.WriteLine($"""
-        Wrote {configPath}
-
-        ChatGPT connector fields
-          MCP endpoint        {created.PublicUrl}/mcp
-          Authorization URL   {created.PublicUrl}/authorize
-          Token URL           {created.PublicUrl}/token
-          Client ID           {created.OAuth.ClientId}
-          Client secret       {created.OAuth.ClientSecret}
-          Scope               mcp
-          Redirect URIs       any https callback; listed: {string.Join(", ", created.OAuth.RedirectUris)}
-
-        Local control token (loopback only, never send it through the tunnel)
-          {created.ControlToken}
-
-        Roots: {string.Join(", ", created.Roots.Select(r => $"{r.Id}={r.Path}"))}
-        State dir: {created.StateDir}
-        Allowed Host header(s): {string.Join(", ", created.AllowHosts.Concat(["127.0.0.1", "localhost"]))}
-
-        Any https callback without a fragment is accepted, and the sign-in page names the host it returns to.
-        Only a callback that is not https has to be listed: the server logs a refused one with its offered
-        redirect_uri, and --init --redirect-uri <that value> lists it.
-        """);
-    foreach (string warning in created.Warnings) Console.WriteLine("WARNING: " + warning);
-    return 0;
-}
-
-var config = ServerConfig.Load(configPath);
 bool noAuth = args.Contains("--no-auth");
-if (noAuth && ServerConfig.NoAuthRefusal(config) is { } refusal) throw new ArgumentException(refusal);
-if (ServerConfig.TransportRefusal(config, noAuth) is { } insecure) throw new ArgumentException(insecure);
+string configPath;
+TrayOptions? tray = null;
+ServerConfig? loaded = null;
+// Only parsing, --init and loading are covered: the tray and the running server keep their own error handling.
+try
+{
+    configPath = Option("--config") ?? ServerConfig.DefaultPath;
+    if (args.Contains("--tray")) tray = TrayOptions.Parse(args);
+    else if (args.Contains("--init")) return CommandLine.Init(args, configPath, Console.Out);
+    else
+    {
+        loaded = ServerConfig.Load(configPath);
+        if (noAuth && ServerConfig.NoAuthRefusal(loaded) is { } refusal) throw new ArgumentException(refusal);
+        if (ServerConfig.TransportRefusal(loaded, noAuth) is { } insecure) throw new ArgumentException(insecure);
+    }
+}
+catch (ArgumentException error) { return CommandLine.Refuse(error, Console.Error); }
+if (tray is not null) return await TrayApplication.Run(configPath, tray, arguments: args);
+var config = loaded!;
 
 using var runtime = new CodexishRuntime(config, noAuth);
 // Browser mounts connect in the background once the listener is up, so none of them can delay or stop the server.
@@ -112,6 +83,9 @@ namespace Codexish.Server
 {
     public static class CommandLine
     {
+        public const string NoFolderShared =
+            "No folder is shared yet; add one with --root id=path, the tray's Edit roots and grants, or by editing codexish.json.";
+
         public static string[] Values(string[] args, string name)
         {
             List<string> values = [];
@@ -123,6 +97,60 @@ namespace Codexish.Server
                     values.Add(args[++i]);
                 }
             return values.ToArray();
+        }
+
+        // A bad or missing argument is the user's to fix, so it is one readable line rather than a stack trace.
+        public static int Refuse(ArgumentException error, TextWriter output)
+        {
+            output.WriteLine("CODEXish: " + error.Message.ReplaceLineEndings(" "));
+            return 2;
+        }
+
+        // Roots are optional, as in the tray's first-run form: without one the file has "roots": [].
+        public static int Init(string[] args, string configPath, TextWriter output)
+        {
+            string? Option(string name) => Values(args, name).FirstOrDefault();
+            string password = Option("--password")
+                ?? throw new ArgumentException("--init requires --password <pw>. It is hashed with PBKDF2-SHA256; nothing is read from the environment.");
+            string publicUrl = Option("--public-url")
+                ?? throw new ArgumentException("--init requires --public-url <https://your-tunnel-host> so OAuth metadata and the Host allowlist match.");
+            var roots = Values(args, "--root").Select(value =>
+            {
+                int separator = value.IndexOf('=');
+                if (separator <= 0) throw new ArgumentException($"--root expects id=path, received '{value}'.");
+                return (Id: value[..separator], Path: value[(separator + 1)..]);
+            }).ToArray();
+            string portText = Option("--port") ?? "3000";
+            if (!int.TryParse(portText, NumberStyles.Integer, CultureInfo.InvariantCulture, out int port))
+                throw new ArgumentException($"--port expects a number from 0 to 65535, received '{portText}'.");
+            var created = ServerConfig.Create(publicUrl, password, roots, Values(args, "--redirect-uri"), port, Option("--state-dir"));
+            created.Save(configPath);
+            output.WriteLine($"""
+                Wrote {configPath}
+
+                ChatGPT connector fields
+                  MCP endpoint        {created.PublicUrl}/mcp
+                  Authorization URL   {created.PublicUrl}/authorize
+                  Token URL           {created.PublicUrl}/token
+                  Client ID           {created.OAuth.ClientId}
+                  Client secret       {created.OAuth.ClientSecret}
+                  Scope               mcp
+                  Redirect URIs       any https callback; listed: {string.Join(", ", created.OAuth.RedirectUris)}
+
+                Local control token (loopback only, never send it through the tunnel)
+                  {created.ControlToken}
+
+                Roots: {(created.Roots.Length == 0 ? "none" : string.Join(", ", created.Roots.Select(r => $"{r.Id}={r.Path}")))}
+                State dir: {created.StateDir}
+                Allowed Host header(s): {string.Join(", ", created.AllowHosts.Concat(["127.0.0.1", "localhost"]))}
+
+                Any https callback without a fragment is accepted, and the sign-in page names the host it returns to.
+                Only a callback that is not https has to be listed: the server logs a refused one with its offered
+                redirect_uri, and --init --redirect-uri <that value> lists it.
+                """);
+            foreach (string warning in created.Warnings) output.WriteLine("WARNING: " + warning);
+            if (created.Roots.Length == 0) output.WriteLine("WARNING: " + NoFolderShared);
+            return 0;
         }
     }
 }

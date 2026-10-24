@@ -192,6 +192,10 @@ public static class BrowserTests
                 wrapped.GetProperty("$schema").GetString() == "http://json-schema.org/draft-07/schema#" && !inner.TryGetProperty("$schema", out _) &&
                 wrapped.GetProperty("required").EnumerateArray().Select(r => r.GetString()).SequenceEqual(["arguments", "invocation_id"]),
                 "a wrapped backend schema keeps local references resolvable, declares its dialect once and requires invocation_id for changes");
+            var readOnlyWrapped = BrowserMounts.WrapSchema(JsonSerializer.SerializeToElement(new { type = "object" }), readOnly: true);
+            Check(wrapped.GetProperty("properties").GetProperty("invocation_id").GetProperty("description").GetString()!.Contains(Ledger.InvocationIdGuidance, StringComparison.Ordinal) &&
+                !readOnlyWrapped.GetProperty("properties").GetProperty("invocation_id").GetProperty("description").GetString()!.Contains("unique", StringComparison.Ordinal),
+                "a mounted change describes invocation_id as unique per action because other conversations share the server; a read-only tool needs none");
 
             var environment = BrowserMounts.ChildEnvironment();
             Check(environment.Keys.Any(k => k.Equals("PATH", StringComparison.OrdinalIgnoreCase)) && !environment.Keys.Any(Redaction.IsSecretName),
@@ -275,8 +279,9 @@ public static class BrowserTests
                     var edit = listed.Single(t => t.Name == BrowserMounts.ToolName("fixture", "edit")).ProtocolTool;
                     Check(edit.InputSchema.GetProperty("required").EnumerateArray().Any(p => p.GetString() == "invocation_id") &&
                         edit.InputSchema.GetProperty("properties").GetProperty("arguments").GetProperty("properties").TryGetProperty("text", out _) &&
+                        edit.InputSchema.GetProperty("properties").GetProperty("invocation_id").GetProperty("description").GetString()!.Contains(Ledger.InvocationIdGuidance, StringComparison.Ordinal) &&
                         edit.Annotations?.ReadOnlyHint == false,
-                        "a mutating backend tool keeps its input schema inside arguments and requires a ledger invocation_id");
+                        "a mutating backend tool keeps its input schema inside arguments and requires a ledger invocation_id described as unique per action");
                     var snapshotTool = listed.Single(t => t.Name == BrowserMounts.ToolName("fixture", "snapshot")).ProtocolTool;
                     Check(!snapshotTool.InputSchema.GetProperty("required").EnumerateArray().Any(p => p.GetString() == "invocation_id") &&
                         snapshotTool.Annotations?.ReadOnlyHint == true,

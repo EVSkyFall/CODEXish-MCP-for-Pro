@@ -6,8 +6,8 @@ namespace Codexish.Server;
 public sealed record SweepReport(DateTimeOffset At, int Rows, int Files, long Bytes, int ErrorCount, string[] Errors);
 
 // P17. Age-based cleanup of CODEXish's own state only: never root contents, user files or Git history. Anything that
-// belongs to a running or reattachable process, queued or running ledger entries, the newest checkpoint, live tokens
-// and browser profiles are never deleted. A failed step is recorded and simply tried again at the next sweep.
+// belongs to a running or reattachable process, queued or running ledger entries, the newest checkpoint of every task,
+// live tokens and browser profiles are never deleted. A failed step is recorded and simply tried again at the next sweep.
 // state_dir may lie inside a root, so a file is deleted only when its whole name is one CODEXish itself gives its files;
 // everything else in these folders is left alone, and no directory is ever deleted.
 public sealed partial class Retention(CodexishRuntime runtime)
@@ -44,7 +44,8 @@ public sealed partial class Retention(CodexishRuntime runtime)
         keep_forever_when = "a value of 0",
         schedule = $"{FirstSweepAfter.TotalSeconds:0} s after start, then every {Interval.TotalHours:0} hours",
         scope = "CODEXish state only, and only files named the way CODEXish names them: artifacts, finished ledger rows, " +
-            "events, exited processes, expired or revoked tokens, older checkpoints, client registrations that never signed in " +
+            "events, exited processes, expired or revoked tokens, checkpoints older than the newest of their task, client " +
+            "registrations that never signed in " +
             "and tray logs after output_days; " +
             "pre-edit backups, quarantined ledgers and unreadable configuration copies after backup_days. Never root " +
             "contents, other files, directories, Git history or browser profiles.",
