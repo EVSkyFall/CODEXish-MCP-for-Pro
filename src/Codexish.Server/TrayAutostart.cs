@@ -19,10 +19,10 @@ public sealed class TrayAutostart
         ShortcutPath = Path.Combine(startupDirectory, ShortcutName);
         this.executable = executable;
         workingDirectory = Path.GetDirectoryName(hostedAssembly ?? executable) ?? "";
-        // The full path, so the shortcut works from its own working directory whatever --config was relative to.
+        // Always the full path, even for the default location: the tray started at sign-in then never depends on
+        // resolving the default folder at that moment, and the shortcut works from its own working directory.
         string full = Path.GetFullPath(configPath);
-        bool isDefault = string.Equals(full, Path.GetFullPath(ServerConfig.DefaultPath), StringComparison.OrdinalIgnoreCase);
-        Arguments = (hostedAssembly is null ? "" : $"\"{hostedAssembly}\" ") + "--tray --start" + (isDefault ? "" : $" --config \"{full}\"");
+        Arguments = (hostedAssembly is null ? "" : $"\"{hostedAssembly}\" ") + $"--tray --start --config \"{full}\"";
     }
 
     public static TrayAutostart ForThisProcess(string configPath)
@@ -80,10 +80,11 @@ public sealed class TrayAutostart
     public bool Heal()
     {
         if (!Enabled) return false;
-        string target;
-        try { target = Read().Target; }
-        catch (Exception) { target = ""; }
-        if (target.Length > 0 && File.Exists(target)) return false;
+        string target, arguments;
+        try { (target, arguments, _) = Read(); }
+        catch (Exception) { target = arguments = ""; }
+        // Also rewritten when it starts the tray differently, for example a shortcut from before --config was always set.
+        if (target.Length > 0 && File.Exists(target) && arguments == Arguments) return false;
         Enable();
         return true;
     }

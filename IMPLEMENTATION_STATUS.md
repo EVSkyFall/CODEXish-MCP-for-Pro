@@ -325,3 +325,9 @@ New checks:
 Not run and not claimed: ChatGPT, two real conversations, the tray UI, `--tray` itself, `--tray-smoke-test`,
 `--self-test-desktop`, `--self-test-desktop-http`, `--browser-live-test`, the P0 self-test, CI, a Linux run, a second
 server on the same `state_dir`, and any use of Tailscale or cloudflared.
+- Autostart fix (owner's restart on 2026-10-25): the tray started from the Startup shortcut at 03:39, five minutes
+  after logon, did not see the existing `%LOCALAPPDATA%\Codexish\codexish.json` and opened the first-run setup; the
+  same command started by hand minutes later loaded it. The cause of that one failed check was not recoverable (no
+  log exists before a configuration loads). Now `--start` never opens setup: a missing file is retried like an
+  unreadable one and the earlier failure is logged once it loads; the shortcut always passes `--config "<full path>"`,
+  and `Heal` rewrites a shortcut whose arguments differ.

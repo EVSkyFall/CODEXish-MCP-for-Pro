@@ -350,11 +350,16 @@ status window, offers **Open configuration folder**, and tries again every minut
 the server and a configured tunnel.
 
 **Start with Windows**, a checkable menu item and the setup checkbox, writes `CODEXish.lnk` into your Startup folder.
-It runs this executable with `--tray --start` (plus `--config "<path>"` for a configuration outside the default
-location) from the executable's folder, with the console window minimized; unchecking it deletes the shortcut. When
-the tray starts and the shortcut names a file that no longer exists, for example after the install folder moved, the
-shortcut is rewritten to the running executable. `--start` starts the server once the tray is up, then the tunnel if
-`tunnel.command` is configured. A plain `--tray` waits for **Start server**.
+It runs this executable with `--tray --start --config "<full path of codexish.json>"` from the executable's folder,
+with the console window minimized; unchecking it deletes the shortcut. When the tray starts and the shortcut names a
+file that no longer exists, for example after the install folder moved, or starts the tray with other arguments (such
+as a shortcut written before v1.0.1 without `--config`), it is rewritten. `--start` starts the server once the tray is
+up, then the tunnel if `tunnel.command` is configured. A plain `--tray` waits for **Start server**.
+
+With `--start` the first-run setup never opens. If the configuration file cannot be found at that moment, the tray
+treats it like one that cannot be loaded: the amber icon names the reason, it tries again every minute, and once the
+file loads it starts the server and logs the earlier failure. To create a new configuration, exit the tray and start
+CODEXish without `--start`.
 
 The icon shows the state with a badge: green while the server runs, grey while it is stopped, and amber while the
 server or the owned tunnel is retrying or the configuration has not loaded. The first row of the menu repeats it, and

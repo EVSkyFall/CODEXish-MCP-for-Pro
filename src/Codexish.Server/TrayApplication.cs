@@ -174,7 +174,9 @@ public static class TrayApplication
                 bool start = options.Start;
                 ServerConfig? config = null;
                 string? loadError = null;
-                if (!smoke && File.Exists(path)) (config, loadError) = TrayInstance.TryLoad(path);
+                // Started at sign-in (--start), the file existed when autostart was turned on, so a file that cannot be
+                // seen now is retried like an unreadable one: never a first run whose setup would overwrite it.
+                if (!smoke && (File.Exists(path) || options.Start)) (config, loadError) = TrayInstance.TryLoad(path);
                 else if (!smoke)
                 {
                     config = Setup(path, options);
@@ -396,7 +398,8 @@ public static class TrayApplication
         private string NotLoaded() =>
             $"The configuration at {path} is not loaded:{Environment.NewLine}{loadError}{Environment.NewLine}{Environment.NewLine}" +
             "CODEXish tries to load it again every minute and then starts the server. Open configuration folder shows the file, " +
-            "and a readable codexish.json.bak next to it is restored automatically.";
+            "and a readable codexish.json.bak next to it is restored automatically. To create a new configuration instead, " +
+            "choose Exit and start CODEXish without --start.";
 
         private void Attach(ServerConfig loaded, bool start)
         {
@@ -429,7 +432,9 @@ public static class TrayApplication
                 return;
             }
             reload.Stop();
+            string? earlier = loadError;
             Attach(loaded, start: true);
+            controller?.Note("Configuration loaded after an earlier attempt failed: " + earlier);
             icon.ShowBalloonTip(5000, "CODEXish", "The configuration loaded; the server is starting.", Forms.ToolTipIcon.Info);
         }
 
