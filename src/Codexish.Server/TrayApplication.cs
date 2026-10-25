@@ -118,21 +118,178 @@ public static class TrayInstance
 
 public enum TrayLook { Running, Stopped, Attention }
 
-// What the tray icon and the menu's header show for TrayController.Status; null means the configuration is not loaded.
+// What the tray knows about its server: the supervision states of the server and the owned tunnel ("starting",
+// "running", "retrying: <cause>", "waiting for the server" or "stopped"), the listening port, and whether changes are
+// paused. A configuration that is not loaded has no server at all.
+public sealed record TrayState(bool Loaded, string Server, string Tunnel, bool TunnelConfigured, int? Port, bool Paused)
+{
+    public static readonly TrayState NotLoaded = new(false, "stopped", "stopped", false, null, false);
+
+    public bool ServerRunning => Server == "running";
+}
+
+[Flags]
+public enum TrayCommand
+{
+    None = 0, Status = 1 << 0, Log = 1 << 1, StartServer = 1 << 2, StopServer = 1 << 3, StartTunnel = 1 << 4, StopTunnel = 1 << 5,
+    PauseChanges = 1 << 6, StopChildren = 1 << 7, RevokeTokens = 1 << 8, RemoveClients = 1 << 9, EditRoots = 1 << 10,
+    OpenFolder = 1 << 11, StartWithWindows = 1 << 12, Exit = 1 << 13,
+}
+
+// A menu item that is a switch. Its state shows twice, as the drawn switch and as the word in the right-hand column.
+public sealed record TrayToggle(string Label, bool On)
+{
+    public string Word => On ? "On" : "Off";
+    public string Glyph => On ? "switch-on" : "switch-off";
+    public string AccessibleName => Label + (On ? ", on" : ", off");
+}
+
+// Everything the tray menu shows for one state, so the rules can be checked without a menu.
+public sealed record TrayMenuModel(string Header, TrayLook Look, TrayCommand Disabled, TrayToggle StartWithWindows, TrayToggle PauseChanges)
+{
+    public const string ServerOnly = "Available while the server runs.";
+    private const TrayCommand NeedsServer = TrayCommand.PauseChanges | TrayCommand.StopChildren | TrayCommand.RevokeTokens | TrayCommand.RemoveClients;
+
+    public bool Enabled(TrayCommand command) => (Disabled & command) == 0;
+
+    public TrayToggle? Toggle(TrayCommand command) =>
+        command == TrayCommand.StartWithWindows ? StartWithWindows : command == TrayCommand.PauseChanges ? PauseChanges : null;
+
+    // The accessible description of an item that is greyed out because the server is not running.
+    public string? Hint(TrayCommand command) => (NeedsServer & command) != 0 && !Enabled(command) ? ServerOnly : null;
+
+    // Each start applies only while its part is stopped and each stop while it is not, so a part that retries can
+    // always be stopped. The session, token and client items and Pause changes act through the running server.
+    public static TrayMenuModel From(TrayState state, bool autostart)
+    {
+        var disabled = TrayCommand.None;
+        void Unless(bool applies, TrayCommand command) { if (!applies) disabled |= command; }
+        Unless(state.Loaded && state.Server == "stopped", TrayCommand.StartServer);
+        Unless(state.Loaded && state.Server != "stopped", TrayCommand.StopServer);
+        Unless(state.Loaded && state.Tunnel == "stopped" && state.TunnelConfigured && state.Port is not null, TrayCommand.StartTunnel);
+        Unless(state.Loaded && state.Tunnel != "stopped", TrayCommand.StopTunnel);
+        Unless(state.Loaded && state.ServerRunning, NeedsServer);
+        Unless(state.Loaded, TrayCommand.EditRoots);
+        return new TrayMenuModel(TrayStatus.Header(state), TrayStatus.Look(state), disabled,
+            new TrayToggle("Start with Windows", autostart), new TrayToggle("Pause changes", state.Paused));
+    }
+}
+
+// What the tray icon, its tooltip and the menu's header show.
 public static class TrayStatus
 {
-    // Running once the server runs and nothing retries; attention while a part retries or nothing is loaded.
-    public static TrayLook Look(string? status) =>
-        status is null || status.Contains("retrying", StringComparison.Ordinal) ? TrayLook.Attention
-        : status.StartsWith("server running", StringComparison.Ordinal) ? TrayLook.Running
-        : TrayLook.Stopped;
+    public const int HeaderLength = 64;
+    public const string NotLoadedLine = "Configuration error, retrying every minute";
 
-    // The header's status line, capitalized and shortened so a long retry cause cannot widen the whole menu.
-    public static string Line(string? status)
+    // Running once the server runs and nothing retries; attention while a part retries or nothing is loaded.
+    public static TrayLook Look(TrayState state) =>
+        !state.Loaded || state.Server.StartsWith("retrying", StringComparison.Ordinal) || state.Tunnel.StartsWith("retrying", StringComparison.Ordinal)
+            ? TrayLook.Attention
+            : state.ServerRunning ? TrayLook.Running : TrayLook.Stopped;
+
+    // Every state that is not the default: the server, the tunnel when one is configured or still owned, and paused
+    // changes, for example "Server running · tunnel stopped · changes paused".
+    public static string Header(TrayState state)
     {
-        string text = string.IsNullOrEmpty(status) ? "Configuration error, retrying every minute" : char.ToUpperInvariant(status[0]) + status[1..];
-        return text.Length <= 64 ? text : text[..63] + "…";
+        if (!state.Loaded) return NotLoadedLine;
+        List<Part> parts = [Part.Of("Server", state.Server)];
+        if (state.TunnelConfigured || state.Tunnel != "stopped") parts.Add(Part.Of("tunnel", state.Tunnel));
+        if (state.Paused) parts.Add(new Part("changes paused", null, false));
+        string text = string.Join(" · ", parts);
+        // A long retry cause must not widen the whole menu or push the other states out, so only causes are shortened,
+        // the longest first, and every state word stays.
+        while (text.Length > HeaderLength)
+        {
+            int longest = -1;
+            for (int i = 0; i < parts.Count; i++)
+                if (parts[i].Cause is { Length: > 0 } && (longest < 0 || parts[i].ToString().Length > parts[longest].ToString().Length)) longest = i;
+            if (longest < 0) break;
+            var cut = parts[longest];
+            parts[longest] = cut with { Cause = cut.Cause![..^1].TrimEnd(), Cut = true };
+            text = string.Join(" · ", parts);
+        }
+        return text.Length <= HeaderLength ? text : text[..(HeaderLength - 1)] + "…";
     }
+
+    private sealed record Part(string Words, string? Cause, bool Cut)
+    {
+        public static Part Of(string name, string state)
+        {
+            int separator = state.IndexOf(": ", StringComparison.Ordinal);
+            return separator < 0 ? new Part(name + " " + state, null, false) : new Part(name + " " + state[..separator], state[(separator + 2)..], false);
+        }
+
+        public override string ToString() =>
+            Cause is null ? Words : Cause.Length == 0 ? Words + "…" : Words + ": " + Cause + (Cut ? "…" : "");
+    }
+}
+
+// The notification each menu action ends with. Each text comes from what the action actually did: the state after it
+// or the control endpoint's answer, never from what was asked.
+public static class TrayNotice
+{
+    public static string ServerStarted(TrayState after) =>
+        after.ServerRunning ? $"Server started on port {after.Port}."
+        : Retrying(after.Server) is { } cause ? "The server did not start yet; CODEXish keeps retrying: " + cause + "."
+        : "Server " + after.Server + ".";
+
+    public static string ServerStopped(TrayState after) => after.Server == "stopped" ? "Server stopped." : "Server " + after.Server + ".";
+
+    public static string TunnelStarted(TrayState after) =>
+        after.Tunnel == "running" ? "Tunnel started."
+        : Retrying(after.Tunnel) is { } cause ? "The tunnel did not start yet; CODEXish keeps retrying: " + cause + "."
+        : "Tunnel " + after.Tunnel + ".";
+
+    public static string TunnelStopped(TrayState after) => after.Tunnel == "stopped" ? "Tunnel stopped." : "Tunnel " + after.Tunnel + ".";
+
+    public static string Paused(bool paused) => paused ? "Changes paused: writes wait until you resume." : "Changes resumed.";
+
+    public static string StartWithWindows(bool on) => on ? "Start with Windows is on: CODEXish starts when you sign in." : "Start with Windows is off.";
+
+    // Saving stops the server and starts again whatever was running; the text says whether that start succeeded.
+    public static string RootsSaved(bool restarted, TrayState after) =>
+        !restarted ? "Roots saved."
+        : after.ServerRunning ? "Roots saved; the server restarted."
+        : "Roots saved. " + ServerStarted(after);
+
+    // The answer of /control/<action>. A field the answer lacks only makes the text less specific.
+    public static string Control(string action, string json)
+    {
+        JsonElement root;
+        try
+        {
+            using var document = JsonDocument.Parse(json);
+            root = document.RootElement.Clone();
+        }
+        catch (JsonException) { root = default; }
+        int? Count(string name) =>
+            root.ValueKind == JsonValueKind.Object && root.TryGetProperty(name, out var value) && value.TryGetInt32(out int count) ? count : null;
+        bool? Flag(string name) =>
+            root.ValueKind == JsonValueKind.Object && root.TryGetProperty(name, out var value) && value.ValueKind is JsonValueKind.True or JsonValueKind.False
+                ? value.GetBoolean() : null;
+        return action switch
+        {
+            "pause" or "resume" => Paused(Flag("paused") ?? action == "pause"),
+            "kill-children" => Count("killed") switch
+            {
+                0 => "No processes were running.",
+                1 => "Stopped 1 process ChatGPT started.",
+                { } killed => $"Stopped {killed} processes ChatGPT started.",
+                null => "Stopped the processes ChatGPT started.",
+            },
+            "revoke-tokens" => "All tokens revoked: ChatGPT will ask for the password again.",
+            "remove-clients" => Count("removed") switch
+            {
+                1 => "Removed 1 registered client.",
+                { } removed => $"Removed {removed} registered clients.",
+                null => "Removed the registered clients.",
+            },
+            _ => "Done: " + action + ".",
+        };
+    }
+
+    private static string? Retrying(string state) =>
+        state.StartsWith("retrying: ", StringComparison.Ordinal) ? state["retrying: ".Length..].TrimEnd().TrimEnd('.') : null;
 }
 
 // Windows Forms exists only in the Windows build; elsewhere the command-line server remains the whole product.
@@ -236,55 +393,44 @@ public static class TrayApplication
     }
 
     internal sealed record MenuActions(Func<Task> Status, Func<Task> Log, Func<Task> StartServer, Func<Task> StopServer,
-        Func<Task> StartTunnel, Func<Task> StopTunnel, Func<Task> Pause, Func<Task> Resume, Func<Task> StopChildren,
+        Func<Task> StartTunnel, Func<Task> StopTunnel, Func<Task> PauseChanges, Func<Task> StopChildren,
         Func<Task> RevokeTokens, Func<Task> RemoveClients, Func<Task> EditRoots, Func<Task> OpenFolder, Func<Task> StartWithWindows,
         Func<Task> Exit);
 
     // The tray menu in display order, grouped by what the items act on; --design-preview builds the same menu.
-    internal static (TrayMenu Menu, Forms.ToolStripMenuItem StartWithWindows) BuildMenu(MenuActions actions, Func<Func<Task>, Task> run)
+    internal static TrayMenu BuildMenu(MenuActions actions, Func<Func<Task>, Task> run)
     {
         var menu = new TrayMenu(new Ui(96, Palette.Current));
-        Forms.ToolStripMenuItem Add(string text, string glyph, Func<Task> action, bool emphasized = false)
-        {
-            var item = menu.Add(text, glyph, emphasized);
-            item.Click += async (_, _) => await run(action);
-            return item;
-        }
+        void Add(TrayCommand command, string text, string glyph, Func<Task> action, bool emphasized = false) =>
+            menu.Add(command, text, glyph, emphasized).Click += async (_, _) => await run(action);
         // Bold, as Windows marks the item a double-click on the icon opens.
-        Add("Status / roots / processes", "activity", actions.Status, emphasized: true);
-        Add("Connection log", "scroll-text", actions.Log);
+        Add(TrayCommand.Status, "Status / roots / processes", "activity", actions.Status, emphasized: true);
+        Add(TrayCommand.Log, "Connection log", "scroll-text", actions.Log);
         menu.Separator();
-        Add("Start server", "play", actions.StartServer);
-        Add("Stop server and owned tunnel", "square", actions.StopServer);
-        Add("Start configured tunnel", "cloud", actions.StartTunnel);
-        Add("Stop owned tunnel", "cloud-off", actions.StopTunnel);
+        Add(TrayCommand.StartServer, "Start server", "play", actions.StartServer);
+        Add(TrayCommand.StopServer, "Stop server and owned tunnel", "square", actions.StopServer);
+        Add(TrayCommand.StartTunnel, "Start configured tunnel", "cloud", actions.StartTunnel);
+        Add(TrayCommand.StopTunnel, "Stop owned tunnel", "cloud-off", actions.StopTunnel);
         menu.Separator();
-        Add("Pause changes", "circle-pause", actions.Pause);
-        Add("Resume changes", "circle-play", actions.Resume);
-        Add("Stop session children", "octagon-x", actions.StopChildren);
+        Add(TrayCommand.PauseChanges, "Pause changes", "switch-off", actions.PauseChanges);
+        Add(TrayCommand.StopChildren, "Stop session children", "octagon-x", actions.StopChildren);
         menu.Separator();
-        Add("Revoke all tokens", "key-round", actions.RevokeTokens);
-        Add("Remove registered clients", "user-x", actions.RemoveClients);
+        Add(TrayCommand.RevokeTokens, "Revoke all tokens", "key-round", actions.RevokeTokens);
+        Add(TrayCommand.RemoveClients, "Remove registered clients", "user-x", actions.RemoveClients);
         menu.Separator();
-        Add("Edit roots and grants", "folder-cog", actions.EditRoots);
-        Add("Open configuration folder", "folder-open", actions.OpenFolder);
-        var startWithWindows = Add("Start with Windows", "toggle-left", actions.StartWithWindows);
+        Add(TrayCommand.EditRoots, "Edit roots and grants", "folder-cog", actions.EditRoots);
+        Add(TrayCommand.OpenFolder, "Open configuration folder", "folder-open", actions.OpenFolder);
+        Add(TrayCommand.StartWithWindows, "Start with Windows", "switch-off", actions.StartWithWindows);
         menu.Separator();
-        Add("Exit", "power", actions.Exit);
-        return (menu, startWithWindows);
-    }
-
-    // Checked exactly when the shortcut exists; the switch icon shows the same state.
-    internal static void ShowAutostart(Forms.ToolStripMenuItem item, bool enabled)
-    {
-        item.Checked = enabled;
-        item.Tag = new MenuGlyph(enabled ? "toggle-right" : "toggle-left", false);
+        Add(TrayCommand.Exit, "Exit", "power", actions.Exit);
+        return menu;
     }
 
     private sealed class Context : Forms.ApplicationContext
     {
         private readonly Forms.NotifyIcon icon;
         private readonly TrayMenu menu;
+        private TrayMenuModel? applied;
         private TrayLook shown;
         private readonly Forms.Form dispatcher = new() { ShowInTaskbar = false };
         private readonly Forms.Timer timer = new() { Interval = 500 };
@@ -294,6 +440,7 @@ public static class TrayApplication
         private TrayController? controller;
         private ServerConfig? config;
         private string? loadError;
+        private string? startupNote;
         private bool exiting;
         public int ExitCode { get; private set; }
 
@@ -305,7 +452,8 @@ public static class TrayApplication
             string? autostartProblem = null;
             try { autostart = smoke ? null : TrayAutostart.ForThisProcess(path); }
             catch (Exception error) { autostartProblem = "Autostart is unavailable: " + error.GetType().Name + ": " + error.Message; }
-            (menu, var startWithWindows) = BuildMenu(new MenuActions(
+            async Task Control(string action) => Notify(TrayNotice.Control(action, await Controller().ControlAsync(action)));
+            menu = BuildMenu(new MenuActions(
                 Status: ShowStatus,
                 Log: () =>
                 {
@@ -315,15 +463,15 @@ public static class TrayApplication
                           string.Join(Environment.NewLine, controller.Diagnostics), controller is null ? Tone.Warning : null);
                     return Task.CompletedTask;
                 },
-                StartServer: async () => await Controller().StartAsync(),
-                StopServer: async () => await Controller().StopAsync(),
-                StartTunnel: async () => await Controller().StartTunnelAsync(),
-                StopTunnel: async () => await Controller().StopTunnelAsync(),
-                Pause: async () => { await Controller().ControlAsync("pause"); },
-                Resume: async () => { await Controller().ControlAsync("resume"); },
-                StopChildren: async () => { await Controller().ControlAsync("kill-children"); },
-                RevokeTokens: async () => { await Controller().ControlAsync("revoke-tokens"); },
-                RemoveClients: async () => { await Controller().ControlAsync("remove-clients"); },
+                StartServer: async () => { await Controller().StartAsync(); Notify(TrayNotice.ServerStarted(Controller().State)); },
+                StopServer: async () => { await Controller().StopAsync(); Notify(TrayNotice.ServerStopped(Controller().State)); },
+                StartTunnel: async () => { await Controller().StartTunnelAsync(); Notify(TrayNotice.TunnelStarted(Controller().State)); },
+                StopTunnel: async () => { await Controller().StopTunnelAsync(); Notify(TrayNotice.TunnelStopped(Controller().State)); },
+                // The switch flips the hold the server has now, which another local client may have changed since the menu opened.
+                PauseChanges: () => Control(Controller().Paused ? "resume" : "pause"),
+                StopChildren: () => Control("kill-children"),
+                RevokeTokens: () => Control("revoke-tokens"),
+                RemoveClients: () => Control("remove-clients"),
                 EditRoots: EditRoots,
                 OpenFolder: () =>
                 {
@@ -338,16 +486,16 @@ public static class TrayApplication
                     if (autostart.Enabled) autostart.Disable();
                     else autostart.Enable();
                     controller?.Note((autostart.Enabled ? "Autostart shortcut written: " : "Autostart shortcut removed: ") + autostart.ShortcutPath);
+                    Notify(TrayNotice.StartWithWindows(autostart.Enabled));
                     return Task.CompletedTask;
                 },
                 Exit: Exit), Guard);
-            // The autostart state is read again, and the menu sized for the screen it opens on, every time it opens.
+            // The state is read again, and the menu sized for the screen it opens on, every time it opens; the timer
+            // below keeps it current while it stays open.
             menu.Strip.Opening += (_, _) =>
             {
-                ShowAutostart(startWithWindows, autostart?.Enabled == true);
-                string? status = controller?.Status;
-                menu.Apply(new Ui(DesignNative.DpiAt(Forms.Cursor.Position, menu.Strip.DeviceDpi), Palette.Current),
-                    TrayStatus.Line(status), TrayStatus.Look(status));
+                applied = Model();
+                menu.Apply(new Ui(DesignNative.DpiAt(Forms.Cursor.Position, menu.Strip.DeviceDpi), Palette.Current), applied);
             };
             shown = !smoke && config is null ? TrayLook.Attention : TrayLook.Stopped;
             icon = new Forms.NotifyIcon { Icon = TrayIcons.For(shown, Forms.SystemInformation.SmallIconSize.Width), Text = "CODEXish — stopped", ContextMenuStrip = menu.Strip, Visible = true };
@@ -356,16 +504,16 @@ public static class TrayApplication
             {
                 try
                 {
-                    if (autostart.Heal()) autostartProblem = "The autostart shortcut named a file that no longer exists; it now starts " + Environment.ProcessPath;
+                    if (autostart.Heal() is { } reason) autostartProblem = autostart.Rewritten(reason);
                 }
                 catch (Exception error) { autostartProblem = "Repairing the autostart shortcut failed: " + error.GetType().Name + ": " + error.Message; }
             }
             reload.Tick += (_, _) => Reload();
             if (!smoke)
             {
+                startupNote = autostartProblem;
                 if (config is not null) Attach(config, start);
                 else ReportLoadError();
-                if (autostartProblem is not null) controller?.Note(autostartProblem);
             }
             timer.Tick += async (_, _) =>
             {
@@ -380,18 +528,33 @@ public static class TrayApplication
                 }
                 else
                 {
-                    string? status = controller?.Status;
-                    icon.Text = Tooltip(status ?? "configuration error, retrying every minute");
-                    var look = TrayStatus.Look(status);
+                    var state = State();
+                    string header = TrayStatus.Header(state);
+                    icon.Text = Tooltip(header);
+                    var look = TrayStatus.Look(state);
                     if (look != shown)
                     {
                         shown = look;
                         icon.Icon = TrayIcons.For(look, Forms.SystemInformation.SmallIconSize.Width);
                     }
+                    if (menu.Strip.Visible && Model(state) is var model && model != applied)
+                    {
+                        applied = model;
+                        menu.Apply(menu.Ui, model);
+                    }
                 }
             };
             timer.Start();
         }
+
+        private TrayState State() => controller?.State ?? TrayState.NotLoaded;
+
+        private TrayMenuModel Model(TrayState? state = null) => TrayMenuModel.From(state ?? State(), autostart?.Enabled == true);
+
+        // Windows may hold a balloon back, for example under Do Not Disturb; the menu and its header stay the record. A
+        // balloon holds at most 255 characters, which a long retry cause could exceed.
+        private void Notify(string text) =>
+            icon.ShowBalloonTip(5000, "CODEXish", text.Length <= 255 ? text : text[..254] + "…", Forms.ToolTipIcon.Info);
 
         private TrayController Controller() => controller ?? throw new InvalidOperationException(NotLoaded());
 
@@ -406,6 +569,9 @@ public static class TrayApplication
             config = loaded;
             loadError = null;
             controller = new TrayController(loaded);
+            // The log lives in state_dir, so what happened to the autostart shortcut is written once a configuration loads.
+            if (startupNote is not null) controller.Note(startupNote);
+            startupNote = null;
             // Posted to the message loop, so the server and tunnel start once the tray is up.
             if (start) dispatcher.BeginInvoke(new Action(async () => await Guard(controller.StartConfiguredAsync)));
         }
@@ -469,15 +635,18 @@ public static class TrayApplication
                 var candidate = JsonSerializer.Deserialize<ServerConfig>(JsonSerializer.Serialize(editing))!;
                 candidate.Roots = roots;
                 candidate.Validate();
-                bool serverWasRunning = owner.Running, tunnelWasRunning = owner.TunnelRunning;
+                // Anything not stopped, running or still retrying, was wanted on, so it comes back after the save.
+                var before = owner.State;
+                bool serverWasRunning = before.Server != "stopped", tunnelWasRunning = before.Tunnel != "stopped";
                 await owner.StopAsync();
                 candidate.Save(path);
                 editing.Roots = candidate.Roots;
                 // The running configuration is reused on the next start; recompute its warnings for the new roots.
                 editing.Validate();
-                // Saving must not leave ChatGPT disconnected: bring back exactly what was running.
+                // Saving must not leave ChatGPT disconnected: bring back exactly what was on.
                 if (serverWasRunning) await owner.StartAsync();
                 if (tunnelWasRunning) await owner.StartTunnelAsync();
+                Notify(TrayNotice.RootsSaved(serverWasRunning, owner.State));
                 if (candidate.Warnings.Count > 0) ShowText("CODEXish roots saved with warnings", string.Join(Environment.NewLine, candidate.Warnings), Tone.Warning);
                 form.Close();
             });

@@ -19,6 +19,7 @@ internal static class HardeningTests
         ConfigurationFiles(temp, password);
         ConcurrentConfiguration(temp, password);
         InitWithoutRoot(temp, password);
+        StateLock(temp, password);
         await MalformedEntries(temp, password);
         DriveRoot(temp, password);
         await Secrets(temp, password);
@@ -210,6 +211,28 @@ internal static class HardeningTests
                   "--root expects id=path") &&
               OneLine(Self("--config", Path.Combine(directory, "absent.json")), "No configuration at") && !File.Exists(refused),
             "a missing or malformed argument and a missing configuration print one line, CODEXish: <message>, on stderr and exit with code 2");
+    }
+
+    // v1.0.2: a second server on a state_dir another CODEXish holds prints one line and exits with code 2. The lock is
+    // held by a runtime in this process, so the server started as a child can never get past it.
+    private static void StateLock(string temp, string password)
+    {
+        string directory = Path.Combine(temp, "state-lock");
+        Directory.CreateDirectory(directory);
+        string path = Path.Combine(directory, "codexish.json");
+        ServerConfig.Create("https://lock.test", password, [], [], 0, Path.Combine(directory, "state")).Save(path);
+        var config = ServerConfig.Load(path);
+        using (new CodexishRuntime(config))
+        {
+            var second = Self("--config", path);
+            string expected = $"CODEXish: another CODEXish is already running with state_dir {config.StateDir}; stop it first or use another --state-dir.";
+            Check(second.Code == 2 && second.Error.ReplaceLineEndings("\n").TrimEnd('\n') == expected && second.Out.Length == 0,
+                "a second server on a state_dir another CODEXish holds prints exactly one CODEXish: line naming it and exits with code 2");
+        }
+        Check(!StateLockedException.IsSharingViolation(new IOException("not a sharing violation")) &&
+              !StateLockedException.IsSharingViolation(new FileNotFoundException("missing")) &&
+              !StateLockedException.IsSharingViolation(new IOException("access", unchecked((int)0x80070005))),
+            "only a sharing violation on the lock file counts as another CODEXish; other IO errors are left as they are");
     }
 
     // C1 and C2: recovery never overwrites a file another writer saved in between, and an unreadable copy never
@@ -581,6 +604,14 @@ internal static class HardeningTests
         var tools = new CodexishTools(runtime);
         var quick = await tools.ShellRun("proj", "release-1", executable: Shells.Executable(shell), args: Shells.DirectArguments(shell, "released"), wait_ms: 60000);
         var managed = runtime.Processes.Lookup(Data(quick).GetProperty("process_id").GetString()!);
+        // Release follows the recorded result, and the job closes once Windows reports no process left in it, which
+        // can trail the exit by a moment (a console host leaving); the periodic release closes it then, so this waits
+        // for that the same way.
+        for (int attempt = 0; attempt < 100 && (!managed.Released || managed.JobHandle != 0); attempt++)
+        {
+            runtime.Processes.ReleaseIdleJobs();
+            if (!managed.Released || managed.JobHandle != 0) await Task.Delay(100);
+        }
         bool closed;
         try { _ = managed.Process.Handle; closed = false; }
         catch (Exception error) when (error is InvalidOperationException or ObjectDisposedException) { closed = true; }

@@ -58,9 +58,10 @@ loaded and restored in its place. If another program saved `codexish.json` in th
 a readable new version is loaded instead, and otherwise the `.bak` is loaded without being restored.
 
 A missing or malformed argument (for example `--init` without `--password`, `--port many` or `--root` without `=`),
-a missing configuration file, and the refusals above except the `state_dir` lock print one line,
-`CODEXish: <message>`, on stderr and exit with code 2. A second server on the same `state_dir`, and anything
-unexpected, keep their full exception and stack trace.
+a missing configuration file, and the refusals above print one line, `CODEXish: <message>`, on stderr and exit with
+code 2. A second server on the same `state_dir` prints `CODEXish: another CODEXish is already running with state_dir
+<path>; stop it first or use another --state-dir.` Only the sharing violation on the state directory's lock file
+counts as that; any other error opening it, and anything unexpected, keep their full exception and stack trace.
 
 ## Running without the tray
 
@@ -349,12 +350,14 @@ configured tunnel. When the file exists but cannot be loaded even from
 status window, offers **Open configuration folder**, and tries again every minute; once the file loads, it starts
 the server and a configured tunnel.
 
-**Start with Windows**, a checkable menu item and the setup checkbox, writes `CODEXish.lnk` into your Startup folder.
+**Start with Windows**, a switch in the menu and the setup checkbox, writes `CODEXish.lnk` into your Startup folder.
 It runs this executable with `--tray --start --config "<full path of codexish.json>"` from the executable's folder,
-with the console window minimized; unchecking it deletes the shortcut. When the tray starts and the shortcut names a
-file that no longer exists, for example after the install folder moved, or starts the tray with other arguments (such
-as a shortcut written before v1.0.1 without `--config`), it is rewritten. `--start` starts the server once the tray is
-up, then the tunnel if `tunnel.command` is configured. A plain `--tray` waits for **Start server**.
+with the console window minimized; turning it off deletes the shortcut. When the tray starts and the shortcut names a
+file that no longer exists, for example after the install folder moved, starts the tray with other arguments (such
+as a shortcut written before v1.0.1 without `--config`), or cannot be read, it is rewritten, and the connection log
+says so once a configuration loads: `The autostart shortcut was rewritten to start <exe> --tray --start --config
+"<path>" because <reason>.` `--start` starts the server once the tray is up, then the tunnel if `tunnel.command` is
+configured. A plain `--tray` waits for **Start server**.
 
 With `--start` the first-run setup never opens. If the configuration file cannot be found at that moment, the tray
 treats it like one that cannot be loaded: the amber icon names the reason, it tries again every minute, and once the
@@ -362,9 +365,31 @@ file loads it starts the server and logs the earlier failure. To create a new co
 CODEXish without `--start`.
 
 The icon shows the state with a badge: green while the server runs, grey while it is stopped, and amber while the
-server or the owned tunnel is retrying or the configuration has not loaded. The first row of the menu repeats it, and
-double-clicking the icon opens the status. The menu, the windows and their icons follow Windows' light or dark app
-mode and the display scale of the screen they open on.
+server or the owned tunnel is retrying or the configuration has not loaded. The first row of the menu repeats it with
+every state that is not the default: the server, the tunnel when one is configured or still owned, and paused changes,
+for example "Server running · tunnel stopped · changes paused" (a long retry cause is shortened, never the other
+states). The icon's tooltip shows the same text, and double-clicking the icon opens the status. The menu, the windows
+and their icons follow Windows' light or dark app mode and the display scale of the screen they open on.
+
+The menu is read again every time it opens, and updated while it stays open. Items that do not apply are greyed
+out, never hidden:
+
+| Item | Greyed out while |
+| --- | --- |
+| Start server | the server is not stopped (it runs, starts or retries) |
+| Stop server and owned tunnel | the server is stopped |
+| Start configured tunnel | the tunnel is not stopped, no `tunnel.command` is configured, or the server is not listening |
+| Stop owned tunnel | the owned tunnel is stopped |
+| Pause changes, Stop session children, Revoke all tokens, Remove registered clients | the server is not running ("Available while the server runs.") |
+| Edit roots and grants | the configuration is not loaded |
+
+**Pause changes** and **Start with Windows** are switches: on is filled with the accent color, its knob on the right,
+and says **On**; off is a muted outline, its knob on the left, and says **Off**. Screen readers hear the state in
+the item's name, for example "Start with Windows, on". Every action that changes something ends with a notification
+that says what actually happened, for example "Server started on port 38451.", "The server did not start yet; CODEXish keeps
+retrying: <cause>.", "Stopped 2 processes ChatGPT started." or "Roots saved; the server restarted." A failure opens
+the error window instead. Windows may hold notifications back, for example under Do Not Disturb; the menu and its
+first row always show the current state.
 
 The server and the owned tunnel are supervised. A failed server start (a busy port, for example), a server that
 stops without being asked to, and an owned tunnel that exits without being asked to are retried after 1 s, doubling
@@ -375,7 +400,7 @@ in progress. If stopping the owned tunnel fails, the server stops anyway and the
 own. The icon's tooltip shows whether each part is running, retrying (with a short cause) or stopped, and every
 failure and restart is in the connection log with its cause.
 
-The menu also offers status with roots, processes and registered clients, pause and resume, stopping session
+The menu also offers status with roots, processes and registered clients, **Pause changes**, stopping session
 children, revoking all tokens, **Remove registered clients**, the connection log, **Open configuration folder**, and
 **Edit roots and grants**: each root with its folder (**Browse…**) and Read, Write and Shell, **Add root** and a
 remove button per row; **Save and restart** saves the file and restarts whatever was running, server and owned tunnel, so ChatGPT stays connected. The connection log window shows the latest 5,000 lines; every line, redacted the same way, is also
@@ -419,10 +444,11 @@ Explicit local checks, never run in CI:
 - `--browser-live-test <node.exe> <@playwright/mcp cli.js> <chrome.exe>`: a headless browser with a dedicated
   profile against a loopback page served by the test itself.
 - `--tray-smoke-test`: creates and removes a notification icon.
-- `--design-preview <dir>`: renders the setup, connection details, roots and text windows, the tray menu and the
-  tray icons to PNG at 100% and 150%, light and dark, and writes the sign-in and error pages as HTML. Every window is
-  created hidden and printed, so nothing appears on screen; it opens no server, port or configuration. Windows only
-  for the PNGs.
+- `--design-preview <dir>`: renders the setup, connection details, roots and text windows, the tray menu (running
+  with Start with Windows on, stopped with it off, running and paused, and configuration not loaded) and the tray
+  icons to PNG at 100% and 150%, light and dark, writes every menu notification text to `tray-notifications.txt`, and
+  writes the sign-in and error pages as HTML. Every window and menu is created hidden and printed, so nothing
+  appears on screen; it opens no server, port or configuration. Windows only for the PNGs.
 - `assets/build-icons.ps1` regenerates `assets/generated` (the app and tray icons and the glyph sheets) from the SVG
   sources in `assets/`; the build only embeds its output. Lucide's license is in
   [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md).

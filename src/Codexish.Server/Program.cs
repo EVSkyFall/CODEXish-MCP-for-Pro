@@ -61,7 +61,10 @@ catch (ArgumentException error) { return CommandLine.Refuse(error, Console.Error
 if (tray is not null) return await TrayApplication.Run(configPath, tray, arguments: args);
 var config = loaded!;
 
-using var runtime = new CodexishRuntime(config, noAuth);
+CodexishRuntime opened;
+try { opened = new CodexishRuntime(config, noAuth); }
+catch (StateLockedException error) { return CommandLine.Refuse(error, Console.Error); }
+using var runtime = opened;
 // Browser mounts connect in the background once the listener is up, so none of them can delay or stop the server.
 var app = CodexishHost.Build(runtime, config.Port, instructions: !args.Contains("--no-instructions"));
 Console.WriteLine($"""
@@ -99,8 +102,9 @@ namespace Codexish.Server
             return values.ToArray();
         }
 
-        // A bad or missing argument is the user's to fix, so it is one readable line rather than a stack trace.
-        public static int Refuse(ArgumentException error, TextWriter output)
+        // A bad or missing argument, or a state_dir another CODEXish holds, is the user's to fix, so it is one readable
+        // line rather than a stack trace.
+        public static int Refuse(Exception error, TextWriter output)
         {
             output.WriteLine("CODEXish: " + error.Message.ReplaceLineEndings(" "));
             return 2;

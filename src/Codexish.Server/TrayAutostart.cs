@@ -34,7 +34,11 @@ public sealed class TrayAutostart
 
     public string ShortcutPath { get; }
     public string Arguments { get; }
+    public string Command => executable + " " + Arguments;
     public bool Enabled => File.Exists(ShortcutPath);
+
+    // The connection log line for a shortcut Heal rewrote.
+    public string Rewritten(string reason) => $"The autostart shortcut was rewritten to start {Command} because {reason}.";
 
     [SupportedOSPlatform("windows")]
     public void Enable()
@@ -75,18 +79,25 @@ public sealed class TrayAutostart
     }
 
     // Self-heal on evidence only: an existing shortcut whose target file is gone, or that cannot be read at all, is
-    // rewritten to this executable. A missing shortcut means autostart is off and stays off.
+    // rewritten to this executable. A missing shortcut means autostart is off and stays off. Returns why the shortcut
+    // was rewritten, or null when it was left as it is.
     [SupportedOSPlatform("windows")]
-    public bool Heal()
+    public string? Heal()
     {
-        if (!Enabled) return false;
-        string target, arguments;
-        try { (target, arguments, _) = Read(); }
-        catch (Exception) { target = arguments = ""; }
-        // Also rewritten when it starts the tray differently, for example a shortcut from before --config was always set.
-        if (target.Length > 0 && File.Exists(target) && arguments == Arguments) return false;
-        Enable();
-        return true;
+        if (!Enabled) return null;
+        string? reason;
+        try
+        {
+            var (target, arguments, _) = Read();
+            // Also rewritten when it starts the tray differently, for example a shortcut from before --config was always set.
+            reason = target.Length == 0 ? "it named no target"
+                : !File.Exists(target) ? $"its target {target} no longer exists"
+                : arguments != Arguments ? $"it started the tray with other arguments ({(arguments.Length == 0 ? "none" : arguments)})"
+                : null;
+        }
+        catch (Exception error) { reason = $"it could not be read ({error.GetType().Name}: {error.Message.Split('\n', 2)[0].TrimEnd('\r')})"; }
+        if (reason is not null) Enable();
+        return reason;
     }
 
     [ComImport, Guid("00021401-0000-0000-C000-000000000046")]

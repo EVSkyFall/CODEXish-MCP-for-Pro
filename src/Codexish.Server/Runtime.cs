@@ -65,8 +65,7 @@ public sealed class CodexishRuntime : IDisposable
         Directory.CreateDirectory(HooksDirectory);
         Directory.CreateDirectory(Path.Combine(config.StateDir, "artifacts"));
         Directory.CreateDirectory(Path.Combine(config.StateDir, "backups"));
-        instanceLock = new FileStream(Path.Combine(config.StateDir, "instance.lock"),
-            FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+        instanceLock = StateLockedException.Open(config.StateDir);
         try
         {
             Store = new Store(Path.Combine(config.StateDir, "codexish.db"));
@@ -274,4 +273,25 @@ public sealed class CodexishRuntime : IDisposable
         }
         if (first is not null) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(first).Throw();
     }
+}
+
+// Another CODEXish holds this state directory. Only the sharing violation on its lock file becomes this exception;
+// any other failure to open the file is thrown as it is.
+public sealed class StateLockedException(string stateDir, IOException cause)
+    : IOException($"another CODEXish is already running with state_dir {stateDir}; stop it first or use another --state-dir.", cause)
+{
+    public string StateDir { get; } = stateDir;
+
+    public static FileStream Open(string stateDir)
+    {
+        try { return new FileStream(Path.Combine(stateDir, "instance.lock"), FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None); }
+        catch (IOException error) when (IsSharingViolation(error)) { throw new StateLockedException(stateDir, error); }
+    }
+
+    // Windows reports ERROR_SHARING_VIOLATION (32) or ERROR_LOCK_VIOLATION (33) as an HRESULT; elsewhere .NET locks
+    // with flock and reports its EWOULDBLOCK errno, 11 on Linux and 35 on macOS and the BSDs.
+    public static bool IsSharingViolation(IOException error) =>
+        OperatingSystem.IsWindows() ? error.HResult is unchecked((int)0x80070020) or unchecked((int)0x80070021)
+        : OperatingSystem.IsLinux() || OperatingSystem.IsAndroid() ? error.HResult == 11
+        : error.HResult == 35;
 }

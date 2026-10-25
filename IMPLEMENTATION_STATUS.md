@@ -331,3 +331,41 @@ server on the same `state_dir`, and any use of Tailscale or cloudflared.
   log exists before a configuration loads). Now `--start` never opens setup: a missing file is retried like an
   unreadable one and the earlier failure is logged once it loads; the shortcut always passes `--config "<full path>"`,
   and `Heal` rewrites a shortcut whose arguments differ.
+
+## v1.0.2: a tray menu that shows state and confirms every action (2026-10-26)
+
+Branch `feat/v1.0.2` from `main` eb800c6. The owner reported that the tray menu could not tell whether Start with
+Windows (or anything else) was on, or whether a click did anything. The runs below used the uncommitted working tree
+on the owner's Windows 11 PC with portable SDK 10.0.402, as a framework-dependent Release build. Nothing here showed a
+window, menu, notification icon or balloon, or touched the installed app, its state folder, the real Startup folder,
+port 38451 or a running Codexish.Server.
+
+| Item | What changed |
+| --- | --- |
+| 1 switches | `TrayToggle` (label, on): word `On`/`Off`, glyph `switch-on`/`switch-off`, accessible name "Start with Windows, on". `Switches` draws them (16 px logical): on is a pill filled with `Primary` and an `OnPrimary` knob on the right; off a 1 px `OnSurfaceVariant` outline with a 4 px knob on the left; disabled ones keep their shape in the 38% disabled tone. The word is the item's `ShortcutKeyDisplayString`, drawn right-aligned in `OnSurfaceVariant` by `MenuRenderer`; `Checked` follows the state. **Pause changes** is one switch over the existing `pause`/`resume` control, chosen from the server's own `Ledger.Paused` at click time, and replaces Pause changes and Resume changes. |
+| 2 greyed items | `TrayMenuModel.From(TrayState, autostart)` is the only source. Start server applies only while the server is stopped, Stop server whenever it is not (starting, running, retrying); Start configured tunnel only while the tunnel is stopped, `tunnel.command` is set and the server listens; Stop owned tunnel whenever the tunnel is not stopped (running, starting, retrying, waiting). Pause changes, Stop session children, Revoke all tokens and Remove registered clients need a running server (their accessible description then says "Available while the server runs."); Edit roots and grants needs a loaded configuration. The menu applies the model on `Opening` and, while it is visible, on the 500 ms timer whenever the model changes. Disabled glyphs are tinted with the same 38% tone as disabled text. |
+| 3 notifications | `TrayNotice` builds each text from the result: the controller's `State` after a start or stop, or the control endpoint's JSON (`paused`, `killed`, `removed`). `Notify` shows it with `ShowBalloonTip(5000, "CODEXish", …, Info)`, cut to 255 characters. Status, the log and the windows that open are their own confirmation; a failure keeps the error window. |
+| 4 header | `TrayStatus.Header(TrayState)`: "Server <state>", "tunnel <state>" when one is configured or still owned, and "changes paused", joined with " · ". Over 64 characters, only retry causes are shortened, the longest first. The tooltip shows the same text after "CODEXish — ". `TrayStatus.Line(string)` and `TrayStatus.Look(string)` were replaced by state-based versions. |
+| 5 preview | `--design-preview` writes `tray-menu-{running,stopped,paused,not-loaded}-{light,dark}-{100,150}.png` (running with autostart on, stopped with it off, running and paused, not loaded) and `tray-notifications.txt`. `docs/images/tray-menu-{light,dark}.png` are the running renders at 100%. |
+| 6 tests | Tray tests, platform-neutral: enabled items in running, stopped, starting, retrying, waiting and not-loaded states; hints; switch words, glyphs and accessible names; icon look; header texts and shortening; every notification text, including those from the control endpoint's real answers; the live controller's `State` before and after start, pause, resume and stop, a retrying start and a running tunnel. |
+| 7 Heal | `TrayAutostart.Heal()` returns the reason or null: "its target <path> no longer exists", "it named no target", "it started the tray with other arguments (<old>)" or "it could not be read (<error>)". The log line is `The autostart shortcut was rewritten to start <exe> --tray --start --config "<path>" because <reason>.` It is now written when a configuration loads, also after a retry; before, a tray that started without a loadable configuration dropped it. |
+| 8 state lock | `StateLockedException` (an `IOException`) wraps only the sharing violation on `instance.lock` (HRESULT 0x80070020/0x80070021 on Windows, flock's EWOULDBLOCK elsewhere); the server run prints `CODEXish: another CODEXish is already running with state_dir <path>; stop it first or use another --state-dir.` and exits 2. Other IO errors are unchanged. The tray's supervised start keeps retrying it, now with that message as the cause. |
+| Docs | `<Version>1.0.2</Version>`; `docs/release-notes/v1.0.2.md`; README "Everyday control"; reference: tray (header, greyed items table, switches, notifications, Heal line), state-lock line, design preview. |
+
+| Command | Result |
+| --- | --- |
+| Release build | 0 warnings, 0 errors; `1.0.2` |
+| Server project copy with its Windows conditions set to false (net10.0), offline restore | 0 warnings, 0 errors; a compile check on Windows, not a Linux run |
+| `--self-test`, four runs on the final build | Runs 2-4: SELF_TEST_PASSED 368 (366 before), DESKTOP_CORE_PASSED 56, DESKTOP_REGRESSIONS 11 passed, 0 failed. Run 1 failed after 344 at the existing P10 check "an exited process releases its process and job handles and stays pollable from its metadata" (`HardeningTests.Orphans`), in process code this change does not touch; the check reads `JobHandle == 0` right after `shell_run` returns, and the job closes only once no process is left in it |
+| `--browser-tests`, two runs | BROWSER_TESTS_PASSED 55 in each (unchanged) |
+| `--tray-tests`, four runs | TRAY_CONTROLLER_PASSED 73 in all four (54 before) |
+| `--design-preview` | DESIGN_PREVIEW_PASSED, 49 PNG files (16 menu renders), 3 HTML pages and `tray-notifications.txt`; no window was shown. The renders were checked by eye in both themes at 100% and 150%, and the switches magnified at 16 px |
+
+New checks:
+- Self-test, hardening: with a runtime in the test holding the lock, this executable as a child (`--config` in the test
+  directory) prints exactly the state-lock line on stderr, nothing on stdout, and exits 2; a non-sharing IO error is
+  not taken for a lock.
+- Tray tests: 19 new, listed under item 6, plus Heal checks that now verify each reason and the log line.
+
+Not run and not claimed: the tray UI itself (`--tray`, `--tray-smoke-test`, a real balloon or a real open menu), a
+screen reader, ChatGPT, CI, a Linux run, `--self-test-desktop`, `--self-test-desktop-http` and `--browser-live-test`.

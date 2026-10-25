@@ -8,8 +8,9 @@ using System.Windows.Forms;
 
 namespace Codexish.Server;
 
-// --design-preview <dir>: the tray's windows, menu and icons rendered to PNG at 100% and 150%, light and dark, and the
-// sign-in and error pages written as standalone HTML. No window is ever shown: each one is created hidden and printed,
+// --design-preview <dir>: the tray's windows, its menu in four states and its icons rendered to PNG at 100% and 150%,
+// light and dark, the menu's notification texts as a list, and the sign-in and error pages written as standalone
+// HTML. No window, menu or notification is ever shown: each one is created hidden and printed,
 // so it is safe while another CODEXish runs. It opens no server, port, tunnel, state directory or configuration file.
 public static class DesignPreview
 {
@@ -82,15 +83,63 @@ public static class DesignPreview
                 Window("text-viewer", "CODEXish status", form => TrayWindows.Viewer(form, SampleStatus, null));
                 Window("text-viewer-error", "CODEXish operation failed", form => TrayWindows.Viewer(form,
                     "InvalidOperationException: Start the server first.", Tone.Error));
-                Menu(directory, ui, suffix);
-                written++;
+                foreach (var (name, state, autostart, hovered) in MenuStates)
+                {
+                    Menu(Path.Combine(directory, $"tray-menu-{name}-{suffix}.png"), ui, TrayMenuModel.From(state, autostart), hovered);
+                    written++;
+                }
             }
         }
         Application.SetColorMode(SystemColorMode.Classic);
         Icons(directory);
         written++;
-        Console.WriteLine($"DESIGN_PREVIEW_PASSED: {written} PNG files and 3 HTML pages in {directory}; no window was shown.");
+        File.WriteAllText(Path.Combine(directory, "tray-notifications.txt"), Notifications(), new UTF8Encoding(false));
+        Console.WriteLine($"DESIGN_PREVIEW_PASSED: {written} PNG files, 3 HTML pages and the notification texts in {directory}; no window was shown.");
         return 0;
+    }
+
+    // The menu as it opens in the states that decide what it offers, each with one item that applies hovered.
+    private static readonly (string Name, TrayState State, bool Autostart, TrayCommand Hovered)[] MenuStates =
+    [
+        ("running", new TrayState(true, "running", "stopped", true, 38451, false), true, TrayCommand.StopServer),
+        ("stopped", new TrayState(true, "stopped", "stopped", true, null, false), false, TrayCommand.StartServer),
+        ("paused", new TrayState(true, "running", "stopped", false, 38451, true), true, TrayCommand.PauseChanges),
+        ("not-loaded", TrayState.NotLoaded, true, TrayCommand.OpenFolder),
+    ];
+
+    // Every notification a menu action can end with, from sample results; Windows draws the balloon itself.
+    private static string Notifications()
+    {
+        var running = new TrayState(true, "running", "running", true, 38451, false);
+        var stopped = new TrayState(true, "stopped", "stopped", true, null, false);
+        var retrying = new TrayState(true, "retrying: IOException: Failed to bind to address http://127.0.0.1:38451: address already in use.",
+            "waiting for the server", true, null, false);
+        var tunnelRetrying = running with { Tunnel = "retrying: exited with code 1" };
+        (string Action, string Text)[] samples =
+        [
+            ("Start server", TrayNotice.ServerStarted(running)),
+            ("Start server, first attempt failed", TrayNotice.ServerStarted(retrying)),
+            ("Stop server and owned tunnel", TrayNotice.ServerStopped(stopped)),
+            ("Start configured tunnel", TrayNotice.TunnelStarted(running)),
+            ("Start configured tunnel, first attempt failed", TrayNotice.TunnelStarted(tunnelRetrying)),
+            ("Stop owned tunnel", TrayNotice.TunnelStopped(running with { Tunnel = "stopped" })),
+            ("Pause changes, off to on", TrayNotice.Control("pause", """{"paused":true}""")),
+            ("Pause changes, on to off", TrayNotice.Control("resume", """{"paused":false}""")),
+            ("Stop session children, 3 running", TrayNotice.Control("kill-children", """{"killed":3}""")),
+            ("Stop session children, 1 running", TrayNotice.Control("kill-children", """{"killed":1}""")),
+            ("Stop session children, none running", TrayNotice.Control("kill-children", """{"killed":0}""")),
+            ("Revoke all tokens", TrayNotice.Control("revoke-tokens", """{"revoked":4}""")),
+            ("Remove registered clients, 2", TrayNotice.Control("remove-clients", """{"removed":2,"revoked":5}""")),
+            ("Remove registered clients, 1", TrayNotice.Control("remove-clients", """{"removed":1,"revoked":2}""")),
+            ("Start with Windows, off to on", TrayNotice.StartWithWindows(true)),
+            ("Start with Windows, on to off", TrayNotice.StartWithWindows(false)),
+            ("Edit roots and grants, server was running", TrayNotice.RootsSaved(true, running)),
+            ("Edit roots and grants, restart failed", TrayNotice.RootsSaved(true, retrying)),
+            ("Edit roots and grants, server was stopped", TrayNotice.RootsSaved(false, stopped)),
+        ];
+        var text = new StringBuilder("Tray notifications (title \"CODEXish\", info icon, about 5 s). A failure opens the error window instead." + Environment.NewLine + Environment.NewLine);
+        foreach (var (action, notice) in samples) text.Append(action).Append(Environment.NewLine).Append("    ").Append(notice).Append(Environment.NewLine);
+        return text.ToString();
     }
 
     private const string SampleConfiguration = @"C:\Users\you\AppData\Local\Codexish\codexish.json";
@@ -122,18 +171,16 @@ public static class DesignPreview
         }
         """;
 
-    // The tray menu as it opens: header with the running badge, every group, Start with Windows on, one item hovered.
-    private static void Menu(string directory, Ui ui, string suffix)
+    private static void Menu(string file, Ui ui, TrayMenuModel model, TrayCommand hovered)
     {
         Task Nothing() => Task.CompletedTask;
-        var (menu, startWithWindows) = TrayApplication.BuildMenu(new TrayApplication.MenuActions(Nothing, Nothing, Nothing, Nothing, Nothing,
-            Nothing, Nothing, Nothing, Nothing, Nothing, Nothing, Nothing, Nothing, Nothing, Nothing), action => action());
+        var menu = TrayApplication.BuildMenu(new TrayApplication.MenuActions(Nothing, Nothing, Nothing, Nothing, Nothing,
+            Nothing, Nothing, Nothing, Nothing, Nothing, Nothing, Nothing, Nothing, Nothing), action => action());
         using var strip = menu.Strip;
-        TrayApplication.ShowAutostart(startWithWindows, true);
-        menu.Apply(ui, TrayStatus.Line("server running, tunnel stopped"), TrayLook.Running);
+        menu.Apply(ui, model);
         _ = strip.Handle;
         strip.PerformLayout();
-        strip.Items[5].Select();
+        menu.Items[hovered].Select();
         int margin = ui.Px(24);
         using var image = new Bitmap(strip.Width, strip.Height, PixelFormat.Format24bppRgb);
         strip.DrawToBitmap(image, new Rectangle(Point.Empty, image.Size));
@@ -143,7 +190,7 @@ public static class DesignPreview
             graphics.Clear(ui.Colors.IsDark ? Color.FromArgb(0x10, 0x1A, 0x24) : Color.FromArgb(0xD9, 0xE4, 0xEF));
             graphics.DrawImage(image, margin, margin);
         }
-        canvas.Save(Path.Combine(directory, $"tray-menu-{suffix}.png"), ImageFormat.Png);
+        canvas.Save(file, ImageFormat.Png);
     }
 
     // The three tray states and the app icon at the sizes Windows asks for, on a light and a dark taskbar, each also
