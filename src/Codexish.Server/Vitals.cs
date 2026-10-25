@@ -228,6 +228,23 @@ public sealed class Vitals : IDisposable
         return null;
     }
 
+    // Where a file really opens when Windows redirects it into a package's LocalCache, or null. A configuration there
+    // is invisible to every program Windows itself starts.
+    public static string? RedirectedFile(string path)
+    {
+        if (!OperatingSystem.IsWindows()) return null;
+        try
+        {
+            string full = System.IO.Path.GetFullPath(path);
+            if (!File.Exists(full) || ThroughLink(full)) return null;
+            using var handle = File.OpenHandle(full, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            return Native.FinalPath(handle) is { } final && Redirection(full, final) is { } redirected
+                ? System.IO.Path.Combine(redirected.Directory, System.IO.Path.GetFileName(full))
+                : null;
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException) { return null; }
+    }
+
     // A junction or symbolic link in the path explains a different final path by itself, wherever it points; the
     // package's view of AppData is not a link, so only a path without one can show that view.
     public static bool ThroughLink(string path)

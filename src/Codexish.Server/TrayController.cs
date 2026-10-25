@@ -1029,6 +1029,7 @@ public static class TrayTests
                     "turning autostart off removes the shortcut, and self-heal never re-creates a removed one");
             }
             else Console.WriteLine("TRAY SKIP autostart shortcut: Windows only");
+            TrayKeeperTests.Run(directory, Check);
 
             Console.WriteLine($"TRAY_CONTROLLER_PASSED: {passed}; local HTTP lifecycle, supervision and a temporary Startup folder only, no notification icon or external tunnel.");
             return 0;

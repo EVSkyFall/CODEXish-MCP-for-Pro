@@ -38,16 +38,24 @@ if (args.Contains("--self-test"))
     result = await DesktopTests.Run();
     return result == 0 ? await DesktopRegressionTests.Run() : result;
 }
+// Explicit live acceptance: it registers, runs and deletes a temporary Task Scheduler task of its own.
+if (args.Contains("--keeper-live-test")) return await KeeperLiveTests.Run();
 
 string? Option(string name) => CommandLine.Values(args, name).FirstOrDefault();
 bool noAuth = args.Contains("--no-auth");
 string configPath;
 TrayOptions? tray = null;
 ServerConfig? loaded = null;
+// The windowless starter has no console to run anything else in, so started at all it is the keeper.
+bool starter = string.Equals(Path.GetFileName(Environment.ProcessPath), TrayKeeper.StarterName, StringComparison.OrdinalIgnoreCase);
 // Only parsing, --init and loading are covered: the tray and the running server keep their own error handling.
 try
 {
     configPath = Option("--config") ?? ServerConfig.DefaultPath;
+    if (args.Contains("--stop")) return TrayKeeper.Stop(configPath, Console.Out);
+    if (starter && !args.Contains(TrayKeeper.KeepMarker)) return TrayKeeper.StartByHand(configPath, stub: args.Contains("--keeper-stub"));
+    if (starter || args.Contains(TrayKeeper.KeepMarker)) return TrayKeeper.Run(configPath, stub: args.Contains("--keeper-stub"));
+    if (args.Contains("--keeper-stub-child")) return TrayKeeper.StubChild(configPath);
     if (args.Contains("--tray")) tray = TrayOptions.Parse(args);
     else if (args.Contains("--init")) return CommandLine.Init(args, configPath, Console.Out);
     else

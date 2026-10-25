@@ -957,6 +957,8 @@ internal static class HardeningTests
         string keptBackup = Aged(Path.Combine(state, "backups", Guid.NewGuid().ToString("N") + ".bak"), 40);
         string oldLog = Aged(Path.Combine(state, "logs", $"tray-{Day(40)}.log"), 40);
         string todayLog = Aged(Path.Combine(state, "logs", $"tray-{Day(0)}.log"), 0);
+        string oldKeeperLog = Aged(Path.Combine(state, "logs", $"keeper-{Day(40)}.log"), 40);
+        string todayKeeperLog = Aged(Path.Combine(state, "logs", $"keeper-{Day(0)}.log"), 0);
         string profile = Aged(Path.Combine(state, "browser-profiles", "pw", "Preferences"), 400);
         string quarantine = Touch(Path.Combine(state, "ledger.corrupt-" + ServerConfig.UtcStamp(now.AddDays(-100)) + ".db"));
         string brokenOld = Touch(config.SourcePath + ".broken-" + ServerConfig.UtcStamp(now.AddDays(-100)));
@@ -975,6 +977,7 @@ internal static class HardeningTests
             (runtime.Artifacts.Directory, "art_" + hex + ".bin.txt"), (runtime.Artifacts.Directory, "ART_" + hex.ToUpperInvariant() + ".bin"),
             (runtime.Artifacts.Directory, "art_notes.bin"), (Path.Combine(state, "backups"), "notes-" + hex + ".bak"),
             (Path.Combine(state, "logs"), "tray-2020.log"), (Path.Combine(state, "logs"), "tray-20200101.log.txt"),
+            (Path.Combine(state, "logs"), "keeper-2020.log"), (Path.Combine(state, "logs"), "keepers-20200101.log"),
             (state, "ledger.corrupt-notes.db"), (state, "ledger.corrupt-" + ancient + ".db.txt"),
             (configDirectory, "codexish.json.broken-notes"), (configDirectory, "other.json.broken-" + ancient)
         })
@@ -1005,13 +1008,14 @@ internal static class HardeningTests
             "old unreferenced artifacts and orphaned artifact files are removed, recent ones stay");
         Check(store.Artifact(absentId) is null, "an old artifact row whose file is already gone is removed");
         Check(!File.Exists(oldBackup) && File.Exists(keptBackup) && !File.Exists(oldLog) && File.Exists(todayLog) && File.Exists(profile) &&
+              !File.Exists(oldKeeperLog) && File.Exists(todayKeeperLog) &&
               !File.Exists(quarantine) && !File.Exists(brokenOld) && File.Exists(brokenNew),
-            "backups, quarantined ledgers and unreadable configuration copies go after backup_days, tray logs after output_days, and browser profiles stay");
+            "backups, quarantined ledgers and unreadable configuration copies go after backup_days, tray and keeper logs after output_days, and browser profiles stay");
         Check(foreign.All(File.Exists) && Directory.Exists(lookalike) && store.Artifact("x") is not null,
             "files CODEXish did not name survive in every folder the sweep reads, as do a directory named like a tray log and a row whose id CODEXish never issues");
         var described = Data(tools.HostCapabilities()).GetProperty("retention");
         Check(described.GetProperty("output_days").GetInt32() == 30 && described.GetProperty("backup_days").GetInt32() == 90 &&
-              described.GetProperty("last_sweep").GetProperty("files").GetInt32() == report.Files && report.Files == 7 && report.Bytes > 0,
+              described.GetProperty("last_sweep").GetProperty("files").GetInt32() == report.Files && report.Files == 8 && report.Bytes > 0,
             "host_capabilities reports the retention settings and the last sweep, which removed exactly the seven expired CODEXish files");
 
         // R2: a file that cannot be removed keeps its row, so the next sweep tries again. Only Windows refuses to delete

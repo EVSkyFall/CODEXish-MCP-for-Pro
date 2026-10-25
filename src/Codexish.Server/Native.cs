@@ -151,6 +151,43 @@ internal static class Native
         return IsProcessInJob(self.Handle, 0, out bool result) && result;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct TokenStatistics
+    {
+        public long TokenId, AuthenticationId, ExpirationTime;
+        public int TokenType, ImpersonationLevel, DynamicCharged, DynamicAvailable, GroupCount, PrivilegeCount;
+        public long ModifiedId;
+    }
+
+    private const int TokenStatisticsClass = 10, TokenLinkedTokenClass = 19;
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern bool GetTokenInformation(nint token, int infoClass, out TokenStatistics info, int length, out int returned);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern bool GetTokenInformation(nint token, int infoClass, out nint linkedToken, int length, out int returned);
+
+    // The sign-in session this process runs in: the token's authentication id, which changes with every sign-in. An
+    // administrator's elevated and normal processes of one sign-in hold linked tokens with different ids, so the smaller
+    // of the two is used, which is the same from either side.
+    public static long? LogonSessionId()
+    {
+        if (!OperatingSystem.IsWindows()) return null;
+        using var identity = System.Security.Principal.WindowsIdentity.GetCurrent();
+        if (!GetTokenInformation(identity.Token, TokenStatisticsClass, out TokenStatistics own, Marshal.SizeOf<TokenStatistics>(), out _)) return null;
+        long id = own.AuthenticationId;
+        if (GetTokenInformation(identity.Token, TokenLinkedTokenClass, out nint linked, nint.Size, out _) && linked != 0)
+        {
+            try
+            {
+                if (GetTokenInformation(linked, TokenStatisticsClass, out TokenStatistics other, Marshal.SizeOf<TokenStatistics>(), out _))
+                    id = Math.Min(id, other.AuthenticationId);
+            }
+            finally { CloseHandle(linked); }
+        }
+        return id;
+    }
+
     private const uint SnapProcess = 0x00000002;
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]

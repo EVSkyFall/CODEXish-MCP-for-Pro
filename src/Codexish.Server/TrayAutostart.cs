@@ -8,7 +8,7 @@ namespace Codexish.Server;
 // Sign-in autostart is CODEXish.lnk in the per-user Startup folder. It is written through shell32's IShellLinkW and
 // IPersistFile rather than WScript.Shell, because Windows Script Host is being retired. The Startup folder is a
 // constructor argument so the tests never touch the real one.
-public sealed class TrayAutostart
+public sealed class TrayAutostart : IAutostart
 {
     public const string ShortcutName = "CODEXish.lnk";
     private const int ShowMinimizedNoActive = 7;
@@ -36,6 +36,8 @@ public sealed class TrayAutostart
     public string Arguments { get; }
     public string Command => executable + " " + Arguments;
     public bool Enabled => File.Exists(ShortcutPath);
+    public string Location => "autostart shortcut " + ShortcutPath;
+    public bool Restarts => false;
 
     // The connection log line for a shortcut Heal rewrote.
     public string Rewritten(string reason) => $"The autostart shortcut was rewritten to start {Command} because {reason}.";

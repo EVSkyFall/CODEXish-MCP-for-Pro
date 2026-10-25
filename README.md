@@ -81,7 +81,8 @@ The setup window asks for the following:
 - **Public HTTPS origin and local port.** They are filled in from the command.
 - **A new CODEXish password.** ChatGPT's sign-in page asks for it. It is not your OpenAI password.
 - **A project folder to share.** You can leave it empty and add folders later.
-- **Start CODEXish when I sign in to Windows**, which is on by default.
+- **Start CODEXish when I sign in to Windows**, which is on by default. It also starts CODEXish again whenever it
+  stops without **Exit**.
 
 **Create configuration** saves `%LOCALAPPDATA%\Codexish\codexish.json`, shows the connection details, and starts the
 server. The tray icon shows the state with a dot: green running, grey stopped, amber needs attention.
@@ -140,7 +141,7 @@ default, for example "Server running · changes paused".
 | Revoke all tokens | Signs ChatGPT out; it asks for the password again |
 | Remove registered clients | Forgets every registered app and its tokens |
 | Edit roots and grants | Folders and their Read / Write / Shell switches; saving restarts the server briefly |
-| Start with Windows | A switch for the Startup-folder shortcut |
+| Start with Windows | A switch for the sign-in task, which also starts CODEXish again whenever it stops without **Exit** |
 
 - **Switches show their state twice.** On is a filled switch with the word **On** beside it; off is an outline with
   **Off**.
@@ -150,11 +151,21 @@ default, for example "Server running · changes paused".
   on port 38451." Windows may hold notifications back, for example under Do Not Disturb; the menu always shows the
   current state.
 
-**Updating.** Choose **Exit** in the tray, extract the new zip over `%LOCALAPPDATA%\Programs\Codexish`, then start it
-again. Your configuration and sign-ins stay in `%LOCALAPPDATA%\Codexish`.
+**Updating.** Stop CODEXish with
 
-**Uninstalling.** Choose **Exit**, then turn off **Start with Windows** or delete `CODEXish.lnk` from your Startup
-folder. Delete both folders, and turn off the funnel with `tailscale funnel --https=443 off`.
+```powershell
+& "$env:LOCALAPPDATA\Programs\Codexish\Codexish.Server.exe" --stop
+```
+
+which ends the tray and the part of the sign-in task that keeps it running, and keeps it stopped until you start it
+again. An install without `Codexish.Start.exe` does not know `--stop`; choose **Exit** in its tray instead. Extract
+the new zip over `%LOCALAPPDATA%\Programs\Codexish`; if Windows reports a file in use, choose **Try Again**, since
+the task checks once a minute and lets go within a second. Then start `Codexish.Start.exe` in that folder. Your
+configuration and sign-ins stay in `%LOCALAPPDATA%\Codexish`.
+
+**Uninstalling.** Turn off **Start with Windows**, which deletes the sign-in task, then run the `--stop` command
+above. Delete both folders, and turn off the funnel with `tailscale funnel --https=443 off`. An install without
+`Codexish.Start.exe` has a `CODEXish.lnk` in your Startup folder instead of the task; choose **Exit** and delete it.
 
 ## Safety model
 
@@ -181,7 +192,7 @@ The complete list of limits and known gaps is in the [reference](docs/reference.
 | cmd commands fail with "is not recognized as an internal or external command" | Your `PATH` is longer than 8,191 characters, which cmd.exe cannot handle. Remove entries that no longer exist from the user `PATH`. If many are `…\.dotnet\tools`, set the user environment variable `DOTNET_ADD_GLOBAL_TOOLS_TO_PATH=false` so .NET stops adding them. |
 | ChatGPT asks for the password again | Tokens were revoked, or a damaged ledger was rebuilt (`host_capabilities.ledger_rebuilt`). Sign in again. |
 | The tray dot is amber | Something is retrying. The connection log names the cause, for example a busy port. CODEXish keeps retrying on its own. |
-| ChatGPT reports `Internal error` on every CODEXish call and the tray icon is gone | The CODEXish process ended. After the next start, `host_capabilities` and the connection log say how: "The previous CODEXish … ended without stopping" means it was ended from outside, usually together with the program it was started from. Start CODEXish from the Start menu or the sign-in shortcut, not from a terminal inside another app such as Claude Code. See [Why a server stopped](docs/reference.md#why-a-server-stopped). |
+| ChatGPT reports `Internal error` on every CODEXish call and the tray icon is gone | The CODEXish process ended. After the next start, `host_capabilities` and the connection log say how: "The previous CODEXish … ended without stopping" means it was ended from outside, usually together with the program it was started from. With **Start with Windows** on, CODEXish is started again within seconds and no longer runs inside the program that ended it; otherwise start it from Explorer, not from a terminal inside another app such as Claude Code. See [Why a server stopped](docs/reference.md#why-a-server-stopped). |
 | `host_capabilities` warns "Windows redirects state_dir" | CODEXish was started from inside a packaged app such as Claude Desktop, so its files went into that app's private folder, programs outside that app cannot see them, and the app can end CODEXish without notice. See [Why a server stopped](docs/reference.md#why-a-server-stopped). |
 
 ## Building from source

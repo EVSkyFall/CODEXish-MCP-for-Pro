@@ -21,7 +21,8 @@ public sealed partial class Retention(CodexishRuntime runtime)
     [GeneratedRegex("^art_[0-9a-f]{32}$")] private static partial Regex ArtifactId();
     [GeneratedRegex(@"^art_[0-9a-f]{32}\.bin$")] private static partial Regex ArtifactFile();
     [GeneratedRegex(@"^[0-9a-f]{32}\.bak$")] private static partial Regex BackupFile();
-    [GeneratedRegex(@"^tray-[0-9]{8}\.log$")] private static partial Regex TrayLog();
+    // The tray's and the keeper's daily logs.
+    [GeneratedRegex(@"^(tray|keeper)-[0-9]{8}\.log$")] private static partial Regex TrayLog();
     // ServerConfig.UtcStamp: yyyyMMdd'T'HHmmssfff'Z'.
     [GeneratedRegex(@"^ledger\.corrupt-(?<stamp>[0-9]{8}T[0-9]{9}Z)\.db(-wal|-shm|-journal)?$")] private static partial Regex QuarantinedLedger();
 
@@ -46,7 +47,7 @@ public sealed partial class Retention(CodexishRuntime runtime)
         scope = "CODEXish state only, and only files named the way CODEXish names them: artifacts, finished ledger rows, " +
             "events, exited processes, expired or revoked tokens, checkpoints older than the newest of their task, client " +
             "registrations that never signed in " +
-            "and tray logs after output_days; " +
+            "and the tray's and keeper's logs after output_days; " +
             "pre-edit backups, quarantined ledgers and unreadable configuration copies after backup_days. Never root " +
             "contents, other files, directories, Git history or browser profiles.",
         last_sweep = Last is { } sweep
