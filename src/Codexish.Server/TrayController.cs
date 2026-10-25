@@ -388,8 +388,11 @@ public sealed class TrayController(ServerConfig config) : IAsyncDisposable
                 foreach (string warning in candidate.Warnings) Log("Warning: " + warning);
                 return stopping.Task;
             }
-            catch
+            catch (Exception error)
             {
+                // A start that never served leaves the heartbeat as it found it, so an earlier server's end is still
+                // reported once a later attempt succeeds.
+                candidate.Heartbeat.Abandon("the start failed: " + Describe(error));
                 // The candidate runtime holds the state-directory lock; it is released whatever the host does.
                 try { if (host is not null) await host.DisposeAsync(); }
                 finally { candidate.Dispose(); }
@@ -782,11 +785,31 @@ public static class TrayTests
             Directory.CreateDirectory(Path.Combine(directory, "busy-root"));
             var busyConfig = ServerConfig.Create("https://tray-busy.invalid", "test-only-password", [("busy", Path.Combine(directory, "busy-root"))], [], port, Path.Combine(directory, "busy-state"));
             await using var busy = new TrayController(busyConfig);
+            // An earlier server on this state_dir that was ended from outside: the failed attempts must not erase it.
+            string alive = Path.Combine(busyConfig.StateDir, Vitals.FileName);
+            Directory.CreateDirectory(busyConfig.StateDir);
+            File.WriteAllText(alive, JsonSerializer.Serialize(new Vitals.Record
+            {
+                Pid = 4242, Version = "1.0.1", Started = DateTimeOffset.UtcNow.AddHours(-5), Alive = DateTimeOffset.UtcNow.AddHours(-1), Launch = "by claude.exe 12, inside a job object"
+            }));
             try
             {
                 await busy.StartAsync();
                 Check(!busy.Running && busy.Status.StartsWith("server retrying: IOException", StringComparison.Ordinal) && Count(busy, "Server start failed: IOException") >= 1,
                     "a server start on a busy port returns as retrying with its concrete cause instead of failing");
+                // Retries keep running meanwhile, and each one replaces the file for a moment before putting it back.
+                bool earlierKept = false;
+                for (int attempt = 0; attempt < 100 && !earlierKept; attempt++)
+                {
+                    try
+                    {
+                        using var read = new FileStream(alive, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                        earlierKept = JsonSerializer.Deserialize<Vitals.Record>(read) is { Pid: 4242, Stopped: null };
+                    }
+                    catch (Exception error) when (error is IOException or JsonException) { }
+                    if (!earlierKept) await Task.Delay(20);
+                }
+                Check(earlierKept, "a start attempt that never served leaves the earlier server's heartbeat as it found it");
                 var retryingModel = TrayMenuModel.From(busy.State, false);
                 Check(TrayNotice.ServerStarted(busy.State).StartsWith("The server did not start yet; CODEXish keeps retrying: IOException", StringComparison.Ordinal) &&
                       !retryingModel.Enabled(TrayCommand.StartServer) && retryingModel.Enabled(TrayCommand.StopServer) && retryingModel.Look == TrayLook.Attention,
@@ -796,6 +819,9 @@ public static class TrayTests
             // Running turns true when the host exists; the status says "running" only after the start attempt returns.
             Check(await Eventually(() => busy.Running && busy.Address?.Port == port && busy.Status == "server running", 30),
                 "the supervised start succeeds on a later attempt once the port is free");
+            Check(Count(busy, "Warning: The previous CODEXish on this state_dir (pid 4242, version 1.0.1") == 1 &&
+                  Count(busy, "It had been started by claude.exe 12, inside a job object.") == 1,
+                "the start that succeeds after failed attempts still reports, once, that the earlier server ended without stopping");
             await busy.StopAsync();
             Check(!busy.Running && busy.Status == "server stopped", "a user stop ends server supervision");
 

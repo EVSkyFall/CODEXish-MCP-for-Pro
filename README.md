@@ -181,6 +181,8 @@ The complete list of limits and known gaps is in the [reference](docs/reference.
 | cmd commands fail with "is not recognized as an internal or external command" | Your `PATH` is longer than 8,191 characters, which cmd.exe cannot handle. Remove entries that no longer exist from the user `PATH`. If many are `…\.dotnet\tools`, set the user environment variable `DOTNET_ADD_GLOBAL_TOOLS_TO_PATH=false` so .NET stops adding them. |
 | ChatGPT asks for the password again | Tokens were revoked, or a damaged ledger was rebuilt (`host_capabilities.ledger_rebuilt`). Sign in again. |
 | The tray dot is amber | Something is retrying. The connection log names the cause, for example a busy port. CODEXish keeps retrying on its own. |
+| ChatGPT reports `Internal error` on every CODEXish call and the tray icon is gone | The CODEXish process ended. After the next start, `host_capabilities` and the connection log say how: "The previous CODEXish … ended without stopping" means it was ended from outside, usually together with the program it was started from. Start CODEXish from the Start menu or the sign-in shortcut, not from a terminal inside another app such as Claude Code. See [Why a server stopped](docs/reference.md#why-a-server-stopped). |
+| `host_capabilities` warns "Windows redirects state_dir" | CODEXish was started from inside a packaged app such as Claude Desktop, so its files went into that app's private folder, programs outside that app cannot see them, and the app can end CODEXish without notice. See [Why a server stopped](docs/reference.md#why-a-server-stopped). |
 
 ## Building from source
 

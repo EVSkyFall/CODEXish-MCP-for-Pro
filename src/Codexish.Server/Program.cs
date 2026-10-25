@@ -65,8 +65,20 @@ CodexishRuntime opened;
 try { opened = new CodexishRuntime(config, noAuth); }
 catch (StateLockedException error) { return CommandLine.Refuse(error, Console.Error); }
 using var runtime = opened;
-// Browser mounts connect in the background once the listener is up, so none of them can delay or stop the server.
-var app = CodexishHost.Build(runtime, config.Port, instructions: !args.Contains("--no-instructions"));
+WebApplication app;
+CancellationToken started;
+try
+{
+    // Browser mounts connect in the background once the listener is up, so none of them can delay or stop the server.
+    app = CodexishHost.Build(runtime, config.Port, instructions: !args.Contains("--no-instructions"));
+    // Read now: RunAsync disposes the host before a failure reaches the handler below.
+    started = app.Lifetime.ApplicationStarted;
+}
+catch (Exception error)
+{
+    runtime.Heartbeat.Abandon("the start failed: " + error.GetType().Name);
+    throw;
+}
 Console.WriteLine($"""
     CODEXish v1 (coding core, desktop, browser mounts)
       MCP           http://127.0.0.1:{config.Port}/mcp  (published as {config.PublicUrl}/mcp)
@@ -79,7 +91,14 @@ Console.WriteLine($"""
     Commands run as this Windows user: there is no sandbox. Ctrl+C stops the server.
     """);
 foreach (string warning in runtime.Warnings) Console.WriteLine("WARNING: " + warning);
-await app.RunAsync();
+try { await app.RunAsync(); }
+catch (Exception error)
+{
+    // A host that never started leaves the heartbeat as it found it for the next start; one that ran records the crash.
+    if (started.IsCancellationRequested) runtime.Heartbeat.End(Vitals.Crashed(error));
+    else runtime.Heartbeat.Abandon("the start failed: " + error.GetType().Name);
+    throw;
+}
 return 0;
 
 namespace Codexish.Server

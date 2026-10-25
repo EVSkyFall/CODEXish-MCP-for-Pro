@@ -268,6 +268,31 @@ alone, even when `state_dir` lies inside a root. An artifact's record goes only 
 that cannot be deleted yet is tried again at the next sweep. Reading output that retention removed answers
 `ARTIFACT_EXPIRED` or `NOT_FOUND`; run the command again for fresh output.
 
+## Why a server stopped
+
+`alive.json` in `state_dir` is the running server's heartbeat: the process that holds `state_dir`, its version, how it
+was started (its parent processes by name and whether a job object holds it, never command lines), when it was last
+alive, rewritten every minute, and, once it stops on its own, why: `stopped by CODEXish`, `Windows signed the user out`,
+`Windows shut down or restarted` or `crashed: <exception>`. A process ended from outside runs no code and cannot record
+anything: when the program it was started from closes its job (Claude Desktop does this to everything its Claude Code
+sessions started when it restarts, updates or switches accounts), or through taskkill or Task Manager. The next start
+reads the file, and when the previous heartbeat simply stopped, or recorded a crash, `host_capabilities.warnings` and
+the tray's connection log say so with that process's pid, the last time it was alive and how it had been started. A
+start attempt that never served (for example while another program holds the port) puts the record back as it found
+it, so the attempt that succeeds still reports it. The ledger's `server_start` event carries the previous record
+whichever way it ended, and `server_stop` the reason. The file is replaced whole, so a process killed while writing
+leaves the previous one readable; one that cannot be read is reported in the warnings and replaced. A program that
+reads it should open it sharing delete access; while one holds it without, the next write is retried with backoff.
+None of this can stop or delay a start.
+
+When CODEXish is started from inside a packaged (MSIX) app such as Claude Desktop, for example from a Claude Code
+terminal, Windows gives it that app's view of `AppData`: a `state_dir` under `%LOCALAPPDATA%` that did not exist yet is
+created in `%LOCALAPPDATA%\Packages\<app>\LocalCache\Local\…` instead, where programs outside the app (Explorer, the
+sign-in shortcut, Task Scheduler) never look. The server sees this in the final path of its own lock file and warns
+"Windows redirects state_dir … into …". Start CODEXish from the Start menu, Explorer or the sign-in shortcut instead; to
+keep a configuration and ledger made that way, copy the folder the warning names to `state_dir` with Explorer while
+CODEXish is stopped.
+
 ## Browser mounts
 
 CODEXish does not drive a browser itself. It starts an existing browser MCP server as a stdio child process and

@@ -317,6 +317,9 @@ public static class TrayApplication
                 catch (Exception error) { Console.Error.WriteLine("The tray keeps the light color mode: " + error.GetType().Name + ": " + error.Message); }
                 if (!smoke)
                 {
+                    // Read before the ready signal: the launcher waiting for it then exits, and its own parents can no
+                    // longer be named after that.
+                    _ = Vitals.Launch;
                     instance = TrayInstance.TryAcquire(path);
                     // Either way a tray runs for this configuration now, so a waiting launcher can close.
                     TrayInstance.SignalReady(path);
@@ -511,6 +514,7 @@ public static class TrayApplication
             reload.Tick += (_, _) => Reload();
             if (!smoke)
             {
+                Microsoft.Win32.SystemEvents.SessionEnded += SessionEnded;
                 startupNote = autostartProblem;
                 if (config is not null) Attach(config, start);
                 else ReportLoadError();
@@ -569,7 +573,9 @@ public static class TrayApplication
             config = loaded;
             loadError = null;
             controller = new TrayController(loaded);
-            // The log lives in state_dir, so what happened to the autostart shortcut is written once a configuration loads.
+            // The log lives in state_dir, so how this tray was started and what happened to the autostart shortcut are
+            // written once a configuration loads.
+            controller.Note($"CODEXish {CodexishRuntime.ServerVersion} tray, pid {Environment.ProcessId}, started {Vitals.Launch}.");
             if (startupNote is not null) controller.Note(startupNote);
             startupNote = null;
             // Posted to the message loop, so the server and tunnel start once the tray is up.
@@ -664,9 +670,21 @@ public static class TrayApplication
             finally { icon.Visible = false; ExitThread(); }
         }
 
+        // Windows ends the process right after this event, so the reason has to be written now.
+        private void SessionEnded(object? sender, Microsoft.Win32.SessionEndedEventArgs e)
+        {
+            string reason = e.Reason == Microsoft.Win32.SessionEndReasons.Logoff ? "Windows signed the user out" : "Windows shut down or restarted";
+            Vitals.EndAll(reason);
+            controller?.Note(reason + "; CODEXish ends with the session.");
+        }
+
         protected override void Dispose(bool disposing)
         {
-            if (disposing) { timer.Dispose(); reload.Dispose(); icon.Dispose(); menu.Strip.Dispose(); dispatcher.Dispose(); }
+            if (disposing)
+            {
+                Microsoft.Win32.SystemEvents.SessionEnded -= SessionEnded;
+                timer.Dispose(); reload.Dispose(); icon.Dispose(); menu.Strip.Dispose(); dispatcher.Dispose();
+            }
             base.Dispose(disposing);
         }
     }

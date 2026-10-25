@@ -369,3 +369,51 @@ New checks:
 
 Not run and not claimed: the tray UI itself (`--tray`, `--tray-smoke-test`, a real balloon or a real open menu), a
 screen reader, ChatGPT, CI, a Linux run, `--self-test-desktop`, `--self-test-desktop-http` and `--browser-live-test`.
+
+## Stay-up pass 1: a server that stops leaves its reason (2026-10-26)
+
+Branch `feat/stay-up` on `feat/v1.0.2` (76e40d1). The installed server stopped serving on 2026-10-25 and left nothing
+in its log, the event log or WER. It had been started from a Claude Code session's shell (the install script ends with
+`Start-Process ... --tray --start`), so it ran inside Claude Desktop's job objects, one of them KILL_ON_JOB_CLOSE. At
+20:20:17 KST an account switch made Claude Desktop end every session's CLI job, and Windows terminated CODEXish with
+it; no managed code ran. The server running afterwards was shown, by duplicating the job handles Claude.exe holds and
+calling IsProcessInJob, to sit in the same three jobs. Separately, Claude Desktop is an MSIX package, so the
+`state_dir` created from that shell lives in `%LOCALAPPDATA%\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Local\Codexish`;
+a process started outside Claude (checked through WMI) sees no `%LOCALAPPDATA%\Codexish` at all, so the sign-in
+shortcut cannot find its `--config`. This pass makes such an end visible; restarting the server is the next pass and
+waits for the owner's decision (Task Scheduler task with a windowless starter, recommended, or Explorer hand-off).
+
+| Item | What changed |
+| --- | --- |
+| Heartbeat | `Vitals` (new): `state_dir\alive.json` with pid, version, launch, started, alive and stopped. Begun by `CodexishRuntime` once it holds the state lock (one writer per state_dir), rewritten every minute, replaced whole (`.tmp` + move); a failed write is retried with `Backoff`, the final one three times quickly. Never stops or delays a start. |
+| Launch | `Vitals.Launch`: the parent chain by executable name and pid from a Toolhelp snapshot, stopped at a parent that started after its child (a reused pid) or whose start time cannot be read ("unverified"), plus whether a job object holds the process. No command lines. The tray reads it before its ready signal, because the launcher that waits for that signal exits right after. |
+| Previous end | The next start reports a heartbeat without a stop ("ended without stopping; its heartbeat stopped at …", with how that server had been started) or a recorded crash in `Warnings`, so in `host_capabilities`, `workspace_info`, the console and the tray log. Clean stops, the end of the Windows session and failed starts are not warnings. A record of this very process is not reported, and an unreadable file is. |
+| Failed starts | `Vitals.Abandon`: a runtime whose start failed (in its constructor, the tray's `StartHost`, or the console host before it started) puts back the record it found, so a retry that succeeds still reports the earlier end. A console host that crashes after it started records `crashed: …`. |
+| Stop reasons | `stopped by CODEXish` on disposal; `crashed: <exception>` from `AppDomain.UnhandledException`; `Windows signed the user out` / `Windows shut down or restarted` from `SystemEvents.SessionEnded` in the tray, written before anything else. The first reason recorded wins and is also the ledger's `server_stop.reason`; `server_start` carries `launch` and `previous`. |
+| Redirection | `Vitals.Redirection`: the final path of the open `instance.lock` against the path asked for. Only the exact MSIX correspondence `<AppData>\<Local|Roaming|LocalLow>\<rest>` → `<AppData>\Local\Packages\<package>\LocalCache\<same>\<rest>` counts, so a junction, an 8.3 name or a path chosen inside a package folder is not taken for one. It becomes the warning "Windows redirects state_dir … into …, because this CODEXish was started from inside the packaged app …". |
+| Docs | reference "Why a server stopped"; README troubleshooting rows for the `Internal error` symptom and the redirect warning. |
+
+| Command | Result |
+| --- | --- |
+| Release build | 0 warnings, 0 errors |
+| `--self-test`, final build | SELF_TEST_PASSED 394 (368 before) in four runs, DESKTOP_CORE_PASSED 56, DESKTOP_REGRESSIONS 11 passed, 0 failed |
+| `--tray-tests`, final build | TRAY_CONTROLLER_PASSED 75 (73 before) in four runs |
+| `--browser-tests`, final build | BROWSER_TESTS_PASSED 55 in two runs (unchanged) |
+| Live check from a Claude Code shell, framework-dependent build, console server on port 0 with a new folder under `%LOCALAPPDATA%` (removed afterwards) | First run: "Windows redirects state_dir … into …\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Local\…", and the file was there. Killed, started again: "The previous CODEXish on this state_dir (pid …) ended without stopping; its heartbeat stopped at … It had been started by pwsh.exe … <- cmd.exe … <- claude.exe … <- claude.exe … <- explorer.exe …, inside a job object." |
+
+New checks: self-test 26 (the heartbeat, the previous-end classification, a record of this process, failed starts
+putting back what they found byte for byte, stop reasons in the file, `StopReason` and `server_stop`, unreadable files
+in the warnings, redirection cases, links, and a child server ended by closing the kill-on-close job it runs in);
+tray tests 2 (a start on a busy port keeps the earlier record, and the start that succeeds reports it once).
+
+Review: GPT-6 Astra (read-only, three rounds) and Gemini 4 Argon (three rounds) on the same patch. Fixed from their
+findings: the Linux expectation of the launch text, a failed or never-started host recorded as a clean stop, the
+stop reason differing between the file and `server_stop`, a reader blocking the replace, failed starts erasing the
+earlier record (also when it was unreadable), the unreadable file missing from the warnings, unverified parents in the
+launch chain, false redirections through junctions and 8.3 names, the disposed host read after `RunAsync`, and test
+cleanup and a test that assumed the temporary folder is not linked. Not adopted: normalizing `UNC\` in
+`Native.FinalPath` for every caller (it is shared with the path fence; noted for a separate change).
+
+Not run and not claimed: a real sign-out or shutdown (`SessionEnded`), a real unhandled exception (a crashing child
+could raise a Windows Error Reporting dialog on the owner's desktop), the tray UI, ChatGPT, CI, a Linux run. Nothing
+here touched the installed app, its state folder, the Startup folder, port 38451 or the running server.
