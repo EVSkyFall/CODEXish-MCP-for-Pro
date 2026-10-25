@@ -128,18 +128,27 @@ desktop app is required. You do not need them.
 
 ## Everyday control
 
-Right-click the tray icon:
+Right-click the tray icon. The first line of the menu, and the icon's tooltip, name every state that is not the
+default, for example "Server running · changes paused".
 
 | Item | What it does |
 | --- | --- |
 | Status / Connection log | Roots, processes, registered clients; every connection and failure with its cause |
 | Start / Stop server | Stop ends supervision until you start again |
-| Pause / Resume changes | Writes wait in their queue while paused; reads keep working |
+| Pause changes | A switch. On: writes wait in their queue; reads keep working. Off: they run again |
 | Stop session children | Ends the processes ChatGPT started |
 | Revoke all tokens | Signs ChatGPT out; it asks for the password again |
 | Remove registered clients | Forgets every registered app and its tokens |
 | Edit roots and grants | Folders and their Read / Write / Shell switches; saving restarts the server briefly |
-| Start with Windows | The Startup-folder shortcut |
+| Start with Windows | A switch for the Startup-folder shortcut |
+
+- **Switches show their state twice.** On is a filled switch with the word **On** beside it; off is an outline with
+  **Off**.
+- **Items grey out when they do not apply.** Examples are **Start server** while the server runs, and **Pause
+  changes** and the session, token and client items while it is stopped.
+- **Every action that changes something confirms what happened** with a notification, for example "Server started
+  on port 38451." Windows may hold notifications back, for example under Do Not Disturb; the menu always shows the
+  current state.
 
 **Updating.** Choose **Exit** in the tray, extract the new zip over `%LOCALAPPDATA%\Programs\Codexish`, then start it
 again. Your configuration and sign-ins stay in `%LOCALAPPDATA%\Codexish`.

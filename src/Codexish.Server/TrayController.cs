@@ -134,6 +134,21 @@ public sealed class TrayController(ServerConfig config) : IAsyncDisposable
         }
     }
 
+    // The server's own hold, so a pause from another local client shows too; a stopped server holds nothing.
+    public bool Paused => runtime?.Ledger.Paused == true;
+
+    // What the tray menu shows; read when it opens and while it stays open.
+    public TrayState State
+    {
+        get
+        {
+            Supervision? server, owned;
+            lock (sync) { server = serverWatch; owned = tunnelWatch; }
+            return new TrayState(true, server?.State ?? "stopped", owned?.State ?? "stopped", !string.IsNullOrWhiteSpace(config.Tunnel.Command),
+                Address?.Port, Paused);
+        }
+    }
+
     public void Note(string value) => Log(value);
 
     private void Log(string value)
@@ -592,12 +607,87 @@ public static class TrayTests
             Check(TrayOptions.SuggestRootId(Path.Combine(directory, "My App") + separator, []) == "My-App" &&
                   TrayOptions.SuggestRootId(Path.Combine(directory, "code"), ["code", "CODE-2"]) == "code-3" && TrayOptions.SuggestRootId(separator, []) == "root",
                 "a folder chosen in a roots row without an id offers its name as a unique id");
-            Check(TrayStatus.Look("server running") == TrayLook.Running && TrayStatus.Look("server running, tunnel stopped") == TrayLook.Running &&
-                  TrayStatus.Look("server stopped, tunnel stopped") == TrayLook.Stopped && TrayStatus.Look("server starting") == TrayLook.Stopped &&
-                  TrayStatus.Look("server retrying: IOException: busy") == TrayLook.Attention &&
-                  TrayStatus.Look("server running, tunnel retrying: exited with code 1") == TrayLook.Attention && TrayStatus.Look(null) == TrayLook.Attention &&
-                  TrayStatus.Line("server running, tunnel stopped") == "Server running, tunnel stopped" && TrayStatus.Line("server retrying: " + new string('x', 100)).Length == 64,
+            // The tray menu's state as a pure model: what applies, the switches and the header, with no menu or icon.
+            TrayState Server(string server, string tunnel = "stopped", bool configured = false, bool paused = false) =>
+                new(true, server, tunnel, configured, server == "running" ? 38451 : null, paused);
+            var running = Server("running");
+            var runningTunnel = Server("running", "running", configured: true);
+            var stoppedTunnel = Server("stopped", configured: true);
+            var startingBoth = Server("starting", "starting", configured: true);
+            var retryingServer = Server("retrying: IOException: busy", "waiting for the server", configured: true);
+            var retryingTunnel = Server("running", "retrying: exited with code 1", configured: true);
+            var paused = Server("running", configured: false, paused: true);
+            const TrayCommand serverOnly = TrayCommand.PauseChanges | TrayCommand.StopChildren | TrayCommand.RevokeTokens | TrayCommand.RemoveClients;
+            TrayCommand Disabled(TrayState state) => TrayMenuModel.From(state, false).Disabled;
+            Check(Disabled(running) == (TrayCommand.StartServer | TrayCommand.StartTunnel | TrayCommand.StopTunnel) &&
+                  Disabled(runningTunnel) == (TrayCommand.StartServer | TrayCommand.StartTunnel) &&
+                  Disabled(Server("running", configured: true)) == (TrayCommand.StartServer | TrayCommand.StopTunnel),
+                "while the server runs, Start server is greyed; Start configured tunnel applies only to a configured, stopped tunnel, and Stop owned tunnel only to one that is not stopped");
+            Check(Disabled(stoppedTunnel) == (TrayCommand.StopServer | TrayCommand.StartTunnel | TrayCommand.StopTunnel | serverOnly) &&
+                  Disabled(Server("stopped")) == (TrayCommand.StopServer | TrayCommand.StartTunnel | TrayCommand.StopTunnel | serverOnly),
+                "while the server is stopped, only Start server applies of the lifecycle items, and Pause changes and the session, token and client items are greyed");
+            Check(Disabled(startingBoth) == (TrayCommand.StartServer | TrayCommand.StartTunnel | serverOnly) &&
+                  Disabled(retryingServer) == (TrayCommand.StartServer | TrayCommand.StartTunnel | serverOnly) &&
+                  Disabled(retryingTunnel) == (TrayCommand.StartServer | TrayCommand.StartTunnel),
+                "a part that is starting, retrying or waiting can be stopped and not started again, and the server items wait until it runs");
+            Check(Disabled(TrayState.NotLoaded) == (TrayCommand.StartServer | TrayCommand.StopServer | TrayCommand.StartTunnel | TrayCommand.StopTunnel |
+                      serverOnly | TrayCommand.EditRoots) &&
+                  TrayMenuModel.From(TrayState.NotLoaded, true).Enabled(TrayCommand.StartWithWindows),
+                "without a loaded configuration only status, the log, the configuration folder, Start with Windows and Exit apply");
+            Check(Enum.GetValues<TrayCommand>().Where(c => c != TrayCommand.None).All(c => TrayMenuModel.From(stoppedTunnel, false).Hint(c) ==
+                      ((serverOnly & c) != 0 ? TrayMenuModel.ServerOnly : null)) &&
+                  Enum.GetValues<TrayCommand>().All(c => TrayMenuModel.From(running, false).Hint(c) is null),
+                "a greyed server item says it is available while the server runs; an item that applies carries no hint");
+            var on = TrayMenuModel.From(paused, true);
+            var off = TrayMenuModel.From(running, false);
+            Check(on.StartWithWindows is { On: true, Word: "On", Glyph: "switch-on", AccessibleName: "Start with Windows, on" } &&
+                  on.PauseChanges is { On: true, Word: "On", Glyph: "switch-on", AccessibleName: "Pause changes, on" } &&
+                  off.StartWithWindows is { On: false, Word: "Off", Glyph: "switch-off", AccessibleName: "Start with Windows, off" } &&
+                  off.PauseChanges is { On: false, Word: "Off", Glyph: "switch-off", AccessibleName: "Pause changes, off" } &&
+                  on.Toggle(TrayCommand.StartWithWindows) == on.StartWithWindows && on.Toggle(TrayCommand.PauseChanges) == on.PauseChanges &&
+                  on.Toggle(TrayCommand.StopServer) is null,
+                "the switches show on and off as a different glyph and word, and their accessible names say the state");
+            Check(TrayStatus.Look(running) == TrayLook.Running && TrayStatus.Look(runningTunnel) == TrayLook.Running &&
+                  TrayStatus.Look(stoppedTunnel) == TrayLook.Stopped && TrayStatus.Look(startingBoth) == TrayLook.Stopped &&
+                  TrayStatus.Look(retryingServer) == TrayLook.Attention && TrayStatus.Look(retryingTunnel) == TrayLook.Attention &&
+                  TrayStatus.Look(TrayState.NotLoaded) == TrayLook.Attention && TrayMenuModel.From(retryingTunnel, false).Look == TrayLook.Attention,
                 "the tray icon shows running, stopped, or attention while a part retries or the configuration is not loaded");
+            string longCause = "retrying: IOException: Failed to bind to address http://127.0.0.1:38451: address already in use.";
+            string cutServer = TrayStatus.Header(Server(longCause));
+            string cutHeader = TrayStatus.Header(Server(longCause, "waiting for the server", configured: true));
+            string cutTunnel = TrayStatus.Header(Server("running", "retrying: " + new string('x', 100), paused: true));
+            Check(TrayStatus.Header(running) == "Server running" && TrayStatus.Header(paused) == "Server running · changes paused" &&
+                  TrayStatus.Header(stoppedTunnel) == "Server stopped · tunnel stopped" &&
+                  TrayStatus.Header(runningTunnel with { Paused = true }) == "Server running · tunnel running · changes paused" &&
+                  TrayStatus.Header(TrayState.NotLoaded) == "Configuration error, retrying every minute" &&
+                  cutServer.Length == TrayStatus.HeaderLength && cutServer.StartsWith("Server retrying: IOException: Failed to bind", StringComparison.Ordinal) &&
+                  cutServer.EndsWith('…') &&
+                  cutHeader.Length <= TrayStatus.HeaderLength && cutHeader.StartsWith("Server retrying: IOException", StringComparison.Ordinal) &&
+                  cutHeader.EndsWith("… · tunnel waiting for the server", StringComparison.Ordinal) &&
+                  cutTunnel.Length == TrayStatus.HeaderLength && cutTunnel.StartsWith("Server running · tunnel retrying: xxx", StringComparison.Ordinal) &&
+                  cutTunnel.EndsWith("… · changes paused", StringComparison.Ordinal),
+                "the header names every state that is not the default, and a long retry cause is shortened without pushing out the other states");
+            Check(TrayNotice.ServerStarted(running) == "Server started on port 38451." &&
+                  TrayNotice.ServerStarted(Server("retrying: IOException: busy.")) == "The server did not start yet; CODEXish keeps retrying: IOException: busy." &&
+                  TrayNotice.ServerStopped(stoppedTunnel) == "Server stopped." &&
+                  TrayNotice.TunnelStarted(runningTunnel) == "Tunnel started." &&
+                  TrayNotice.TunnelStarted(retryingTunnel) == "The tunnel did not start yet; CODEXish keeps retrying: exited with code 1." &&
+                  TrayNotice.TunnelStopped(running) == "Tunnel stopped." &&
+                  TrayNotice.StartWithWindows(true) == "Start with Windows is on: CODEXish starts when you sign in." &&
+                  TrayNotice.StartWithWindows(false) == "Start with Windows is off." &&
+                  TrayNotice.RootsSaved(true, running) == "Roots saved; the server restarted." && TrayNotice.RootsSaved(false, stoppedTunnel) == "Roots saved." &&
+                  TrayNotice.RootsSaved(true, Server("retrying: IOException: busy")) == "Roots saved. The server did not start yet; CODEXish keeps retrying: IOException: busy.",
+                "each lifecycle and setting action ends with a notification of what actually happened");
+            Check(TrayNotice.Control("pause", """{"paused":true,"note":"x"}""") == "Changes paused: writes wait until you resume." &&
+                  TrayNotice.Control("resume", """{"paused":false}""") == "Changes resumed." &&
+                  TrayNotice.Control("kill-children", """{"killed":3}""") == "Stopped 3 processes ChatGPT started." &&
+                  TrayNotice.Control("kill-children", """{"killed":1}""") == "Stopped 1 process ChatGPT started." &&
+                  TrayNotice.Control("kill-children", """{"killed":0}""") == "No processes were running." &&
+                  TrayNotice.Control("revoke-tokens", """{"revoked":7}""") == "All tokens revoked: ChatGPT will ask for the password again." &&
+                  TrayNotice.Control("remove-clients", """{"removed":2,"revoked":4}""") == "Removed 2 registered clients." &&
+                  TrayNotice.Control("remove-clients", """{"removed":1,"revoked":1}""") == "Removed 1 registered client." &&
+                  TrayNotice.Control("remove-clients", "not json") == "Removed the registered clients.",
+                "each control action's notification comes from the endpoint's answer, and an answer without the expected field is still reported");
 
             var config = ServerConfig.Create("https://tray-test.invalid", "test-only-password", [("test", Path.Combine(directory, "root"))], [], 0, Path.Combine(directory, "state"));
             Check(config.OAuth.RefreshTokenDays == 0, "a new configuration keeps refresh tokens without expiry");
@@ -605,24 +695,45 @@ public static class TrayTests
             config.Tunnel = new TunnelConfig { Command = Path.Combine(directory, "tunnel-never-started" + (OperatingSystem.IsWindows() ? ".exe" : "")), Args = ["--url", "http://127.0.0.1:{port}"] };
             await using var controller = new TrayController(config);
             Check(!controller.Running && controller.Status == "server stopped, tunnel stopped", "controller starts stopped");
+            Check(controller.State == new TrayState(true, "stopped", "stopped", true, null, false) &&
+                  TrayMenuModel.From(controller.State, false).Disabled == (TrayCommand.StopServer | TrayCommand.StartTunnel | TrayCommand.StopTunnel | serverOnly),
+                "a stopped controller's menu offers Start server and greys what needs the running server");
             await controller.StartAsync();
             var address = controller.Address;
             Check(controller.Running && address?.IsLoopback == true, "server starts inside the controller process on loopback");
             Check(!controller.TunnelRunning && controller.Status == "server running, tunnel stopped", "server startup does not start the configured tunnel");
+            Check(controller.State == new TrayState(true, "running", "stopped", true, address!.Port, false) &&
+                  TrayNotice.ServerStarted(controller.State) == $"Server started on port {address.Port}." &&
+                  TrayStatus.Header(controller.State) == "Server running · tunnel stopped" &&
+                  TrayMenuModel.From(controller.State, false).Disabled == (TrayCommand.StartServer | TrayCommand.StopTunnel),
+                "the running controller's state gives the menu, the header and the notification with its real port");
             await controller.StartAsync();
             Check(controller.Address == address, "repeated start joins the existing host");
             var status = JsonDocument.Parse(await controller.ControlAsync("status"));
             Check(status.RootElement.GetProperty("roots").GetArrayLength() == 1, "tray status uses the authenticated local control endpoint");
-            await controller.ControlAsync("pause");
+            string pauseAnswer = await controller.ControlAsync("pause");
             Check(JsonDocument.Parse(await controller.ControlAsync("status")).RootElement.GetProperty("paused").GetBoolean(), "pause is reflected in local status");
-            await controller.ControlAsync("resume");
+            Check(controller.Paused && TrayNotice.Control("pause", pauseAnswer) == "Changes paused: writes wait until you resume." &&
+                  TrayMenuModel.From(controller.State, false).PauseChanges.On && TrayStatus.Header(controller.State) == "Server running · tunnel stopped · changes paused",
+                "a pause turns the Pause changes switch on, adds it to the header and is confirmed from the endpoint's answer");
+            string resumeAnswer = await controller.ControlAsync("resume");
             Check(!JsonDocument.Parse(await controller.ControlAsync("status")).RootElement.GetProperty("paused").GetBoolean(), "resume releases the hold");
-            Check(JsonDocument.Parse(await controller.ControlAsync("kill-children")).RootElement.TryGetProperty("killed", out _), "stopping session children reaches the existing controller");
-            Check(JsonDocument.Parse(await controller.ControlAsync("revoke-tokens")).RootElement.TryGetProperty("revoked", out _), "token revocation reaches the existing controller");
-            Check(JsonDocument.Parse(await controller.ControlAsync("remove-clients")).RootElement.TryGetProperty("removed", out _),
+            Check(!controller.Paused && TrayNotice.Control("resume", resumeAnswer) == "Changes resumed." && !TrayMenuModel.From(controller.State, false).PauseChanges.On,
+                "a resume turns the switch off and is confirmed");
+            string killAnswer = await controller.ControlAsync("kill-children");
+            Check(JsonDocument.Parse(killAnswer).RootElement.TryGetProperty("killed", out _), "stopping session children reaches the existing controller");
+            string revokeAnswer = await controller.ControlAsync("revoke-tokens");
+            Check(JsonDocument.Parse(revokeAnswer).RootElement.TryGetProperty("revoked", out _), "token revocation reaches the existing controller");
+            string removeAnswer = await controller.ControlAsync("remove-clients");
+            Check(JsonDocument.Parse(removeAnswer).RootElement.TryGetProperty("removed", out _),
                 "removing registered clients reaches the existing controller");
+            Check(TrayNotice.Control("kill-children", killAnswer) == "No processes were running." &&
+                  TrayNotice.Control("revoke-tokens", revokeAnswer) == "All tokens revoked: ChatGPT will ask for the password again." &&
+                  TrayNotice.Control("remove-clients", removeAnswer) == "Removed 0 registered clients.",
+                "the session, token and client notifications read the endpoint's real answers");
             await controller.StopAsync();
             Check(!controller.Running && !controller.TunnelRunning, "stop disposes the host and runtime");
+            Check(TrayNotice.ServerStopped(controller.State) == "Server stopped." && !controller.Paused, "a stopped server is confirmed and holds no pause");
             await controller.StartAsync();
             Check(controller.Running && !controller.TunnelRunning, "the same controller restarts with the existing local state and still no tunnel");
 
@@ -676,6 +787,10 @@ public static class TrayTests
                 await busy.StartAsync();
                 Check(!busy.Running && busy.Status.StartsWith("server retrying: IOException", StringComparison.Ordinal) && Count(busy, "Server start failed: IOException") >= 1,
                     "a server start on a busy port returns as retrying with its concrete cause instead of failing");
+                var retryingModel = TrayMenuModel.From(busy.State, false);
+                Check(TrayNotice.ServerStarted(busy.State).StartsWith("The server did not start yet; CODEXish keeps retrying: IOException", StringComparison.Ordinal) &&
+                      !retryingModel.Enabled(TrayCommand.StartServer) && retryingModel.Enabled(TrayCommand.StopServer) && retryingModel.Look == TrayLook.Attention,
+                    "a start that is retrying says so in its notification, and its menu offers Stop server but not Start server");
             }
             finally { blocker.Stop(); }
             // Running turns true when the host exists; the status says "running" only after the start attempt returns.
@@ -695,6 +810,9 @@ public static class TrayTests
             await busy.StartConfiguredAsync();
             Check(busy.Running && busy.TunnelRunning && busy.Status == "server running, tunnel running",
                 "starting the configuration starts the server and then the configured tunnel");
+            Check(TrayNotice.TunnelStarted(busy.State) == "Tunnel started." && TrayStatus.Header(busy.State) == "Server running · tunnel running" &&
+                  TrayMenuModel.From(busy.State, false).Disabled == (TrayCommand.StartServer | TrayCommand.StartTunnel),
+                "a running tunnel is confirmed, named in the header and offers only its stop");
             if (OperatingSystem.IsWindows())
                 Check(busy.TunnelInJob, "the owned tunnel runs inside a kill-on-close job, so it cannot outlive a killed tray");
             else Console.WriteLine("TRAY SKIP tunnel job object: Windows only");
@@ -856,23 +974,32 @@ public static class TrayTests
                       written.Target.Equals(executable, StringComparison.OrdinalIgnoreCase) && written.Arguments == autostart.Arguments &&
                       written.WorkingDirectory.Equals(Path.GetDirectoryName(executable), StringComparison.OrdinalIgnoreCase),
                     "Start with Windows writes CODEXish.lnk with this executable, --tray --start and the executable's folder");
-                Check(!autostart.Heal() && autostart.Read().Target.Equals(executable, StringComparison.OrdinalIgnoreCase),
+                Check(autostart.Heal() is null && autostart.Read().Target.Equals(executable, StringComparison.OrdinalIgnoreCase),
                     "a shortcut whose target exists is left as it is");
                 string moved = Path.Combine(directory, "old-install", "Codexish.Server.exe");
                 Directory.CreateDirectory(Path.GetDirectoryName(moved)!);
                 File.WriteAllText(moved, "placeholder");
                 new TrayAutostart(startup, moved, custom).Enable();
                 File.Delete(moved);
-                Check(autostart.Heal() && autostart.Read().Target.Equals(executable, StringComparison.OrdinalIgnoreCase),
-                    "a shortcut whose target file no longer exists is rewritten to the current executable");
+                string? missing = autostart.Heal();
+                Check(missing is not null && missing.StartsWith("its target ", StringComparison.Ordinal) && missing.Contains("old-install", StringComparison.OrdinalIgnoreCase) &&
+                      missing.EndsWith(" no longer exists", StringComparison.Ordinal) && autostart.Read().Target.Equals(executable, StringComparison.OrdinalIgnoreCase),
+                    "a shortcut whose target file no longer exists is rewritten to the current executable, and the reason names that target");
                 new TrayAutostart(startup, executable, ServerConfig.DefaultPath).Enable();
-                Check(autostart.Heal() && autostart.Read().Arguments == autostart.Arguments,
-                    "a shortcut that starts the tray with other arguments, such as one without --config, is rewritten");
+                string? other = autostart.Heal();
+                Check(other is not null && other.StartsWith("it started the tray with other arguments (", StringComparison.Ordinal) &&
+                      other.Contains(Path.GetFullPath(ServerConfig.DefaultPath), StringComparison.Ordinal) && autostart.Read().Arguments == autostart.Arguments,
+                    "a shortcut that starts the tray with other arguments, such as one with another --config, is rewritten, and the reason quotes them");
                 File.WriteAllText(autostart.ShortcutPath, "not a shell link");
-                Check(autostart.Heal() && autostart.Read().Target.Equals(executable, StringComparison.OrdinalIgnoreCase),
-                    "an unreadable shortcut is rewritten as well");
+                string? damaged = autostart.Heal();
+                Check(damaged is not null && damaged.StartsWith("it could not be read (", StringComparison.Ordinal) &&
+                      autostart.Read().Target.Equals(executable, StringComparison.OrdinalIgnoreCase),
+                    "an unreadable shortcut is rewritten as well, and the reason says so with its error");
+                Check(autostart.Rewritten("its target C:\\Old\\Codexish.Server.exe no longer exists") ==
+                      $"The autostart shortcut was rewritten to start {executable} --tray --start --config \"{custom}\" because its target C:\\Old\\Codexish.Server.exe no longer exists.",
+                    "the connection log says what the shortcut now starts and why it was rewritten");
                 autostart.Disable();
-                Check(!autostart.Enabled && !autostart.Heal() && !autostart.Enabled,
+                Check(!autostart.Enabled && autostart.Heal() is null && !autostart.Enabled,
                     "turning autostart off removes the shortcut, and self-heal never re-creates a removed one");
             }
             else Console.WriteLine("TRAY SKIP autostart shortcut: Windows only");

@@ -821,7 +821,58 @@ internal sealed class StatusHeader : ToolStripMenuItem
     }
 }
 
-internal sealed record MenuGlyph(string Name, bool Emphasized);
+internal sealed record MenuEntry(TrayCommand Command, string Glyph, bool Emphasized);
+
+// The menu's switches, drawn rather than taken from Lucide so on and off differ in color and in shape even at 16 px:
+// on is a pill filled with the accent and its knob on the right, off a muted outline with its knob on the left. A
+// disabled switch keeps its shape in the disabled tone.
+internal static class Switches
+{
+    private static readonly Dictionary<(bool, bool, int, int, int), Bitmap> Drawn = [];
+
+    public static bool Draws(string glyph) => glyph is "switch-on" or "switch-off";
+
+    public static Bitmap Get(Ui ui, bool on, bool enabled)
+    {
+        var colors = ui.Colors;
+        Color disabled = Palette.Layer(colors.Menu, colors.OnSurface, 0.38f);
+        Color track = !enabled ? disabled : on ? colors.Primary : colors.OnSurfaceVariant;
+        Color knob = on ? (enabled ? colors.OnPrimary : colors.Menu) : track;
+        int size = ui.Px(16);
+        lock (Drawn)
+        {
+            var key = (on, enabled, size, track.ToArgb(), knob.ToArgb());
+            if (Drawn.TryGetValue(key, out var cached)) return cached;
+            float s = ui.Dpi / 96f;
+            var image = new Bitmap(size, size, PixelFormat.Format32bppArgb);
+            using (var graphics = Graphics.FromImage(image))
+            {
+                graphics.SmoothingMode = SmoothingMode.AntiAlias;
+                graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                float height = 10 * s, top = (size - height) / 2;
+                if (on)
+                {
+                    using (var path = Shapes.Rounded(new RectangleF(0, top, size, height), height / 2))
+                    using (var fill = new SolidBrush(track)) graphics.FillPath(fill, path);
+                    float diameter = 6 * s;
+                    using var dot = new SolidBrush(knob);
+                    graphics.FillEllipse(dot, size - 2 * s - diameter, top + (height - diameter) / 2, diameter, diameter);
+                }
+                else
+                {
+                    float stroke = Math.Max(1, s);
+                    using (var path = Shapes.Rounded(new RectangleF(stroke / 2, top + stroke / 2, size - stroke, height - stroke), (height - stroke) / 2))
+                    using (var pen = new Pen(track, stroke)) graphics.DrawPath(pen, path);
+                    float diameter = 4 * s;
+                    using var dot = new SolidBrush(knob);
+                    graphics.FillEllipse(dot, 3 * s, top + (height - diameter) / 2, diameter, diameter);
+                }
+            }
+            Drawn[key] = image;
+            return image;
+        }
+    }
+}
 
 // Windows 11's context menu look on a ToolStrip: a flat surface with a hairline border, rounded hover highlights inset
 // from the edges, tinted Lucide icons and quiet separators.
@@ -861,13 +912,21 @@ internal sealed class MenuRenderer(Func<Ui> scale) : ToolStripRenderer
         graphics.FillPath(fill, path);
     }
 
-    // Text and icon are both centered on the item's full height, so they share one line whatever the padding.
+    // Text and icon are both centered on the item's full height, so they share one line whatever the padding. The
+    // right-hand column (where a shortcut would be) holds a switch's On or Off in the secondary color.
     protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e)
     {
         var colors = scale().Colors;
-        var color = e.Item.Enabled ? colors.OnSurface : Palette.Layer(colors.Menu, colors.OnSurface, 0.38f);
+        var flags = TextFormatFlags.SingleLine | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix;
+        Color disabled = Palette.Layer(colors.Menu, colors.OnSurface, 0.38f);
+        if (e.Item is ToolStripMenuItem { ShortcutKeyDisplayString: { } word } && e.Text == word)
+        {
+            TextRenderer.DrawText(e.Graphics, e.Text, e.TextFont, new Rectangle(e.TextRectangle.X, 0, e.TextRectangle.Width, e.Item.Height),
+                e.Item.Enabled ? colors.OnSurfaceVariant : disabled, flags | TextFormatFlags.Right);
+            return;
+        }
         TextRenderer.DrawText(e.Graphics, e.Text, e.TextFont, new Rectangle(e.TextRectangle.X, 0, e.Item.Width - e.TextRectangle.X, e.Item.Height),
-            color, TextFormatFlags.SingleLine | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis);
+            e.Item.Enabled ? colors.OnSurface : disabled, flags | TextFormatFlags.EndEllipsis);
     }
 
     protected override void OnRenderItemImage(ToolStripItemImageRenderEventArgs e)
@@ -877,7 +936,7 @@ internal sealed class MenuRenderer(Func<Ui> scale) : ToolStripRenderer
             (e.Item.Height - e.Image.Height) / 2, e.Image.Width, e.Image.Height);
     }
 
-    // A checkable item carries its state in its own icon (a toggle), so no check mark is drawn over it.
+    // A checked item is a switch that shows its state itself, so no check mark is drawn over it.
     protected override void OnRenderItemCheck(ToolStripItemImageRenderEventArgs e) { }
 
     protected override void OnRenderSeparator(ToolStripSeparatorRenderEventArgs e)
@@ -908,31 +967,47 @@ internal sealed class TrayMenu
     public ContextMenuStrip Strip { get; }
     public StatusHeader Header { get; }
     public Ui Ui => ui;
+    public Dictionary<TrayCommand, ToolStripMenuItem> Items { get; } = [];
 
-    public ToolStripMenuItem Add(string text, string glyph, bool emphasized = false)
+    public ToolStripMenuItem Add(TrayCommand command, string text, string glyph, bool emphasized = false)
     {
-        var item = new ToolStripMenuItem(text) { Tag = new MenuGlyph(glyph, emphasized), ImageScaling = ToolStripItemImageScaling.None };
+        var item = new ToolStripMenuItem(text) { Tag = new MenuEntry(command, glyph, emphasized), ImageScaling = ToolStripItemImageScaling.None };
         Strip.Items.Add(item);
+        Items[command] = item;
         return item;
     }
 
     public void Separator() => Strip.Items.Add(new ToolStripSeparator());
 
-    public void Apply(Ui scale, string status, TrayLook look)
+    // The whole model every time: which items apply, the switches' state, words and accessible names, and the header.
+    public void Apply(Ui scale, TrayMenuModel model)
     {
         ui = scale;
         Strip.SuspendLayout();
         Strip.Font = scale.Font(TypeRole.Body);
         Strip.Padding = scale.Pad(0, 4, 0, 4);
         Strip.ImageScalingSize = new Size(scale.Px(16), scale.Px(16));
-        Header.Update(scale, status, TrayIcons.Image(look, scale.Px(24)));
+        Header.Update(scale, model.Header, TrayIcons.Image(model.Look, scale.Px(24)));
+        Color disabled = Palette.Layer(scale.Colors.Menu, scale.Colors.OnSurface, 0.38f);
         foreach (ToolStripItem item in Strip.Items)
         {
             if (item is ToolStripSeparator separator) { separator.Margin = scale.Pad(0, 2, 0, 2); continue; }
-            if (item is not ToolStripMenuItem menuItem || item.Tag is not MenuGlyph glyph) continue;
-            menuItem.Font = scale.Font(glyph.Emphasized ? TypeRole.Strong : TypeRole.Body);
+            if (item is not ToolStripMenuItem menuItem || item.Tag is not MenuEntry entry) continue;
+            menuItem.Enabled = model.Enabled(entry.Command);
+            menuItem.AccessibleDescription = model.Hint(entry.Command);
+            menuItem.Font = scale.Font(entry.Emphasized ? TypeRole.Strong : TypeRole.Body);
             menuItem.Padding = scale.Pad(4, 5, 12, 5);
-            menuItem.Image = scale.Glyph(glyph.Name, scale.Colors.OnSurfaceVariant);
+            string glyph = entry.Glyph;
+            if (model.Toggle(entry.Command) is { } toggle)
+            {
+                // Checked stays in step for screen readers, which also hear the state in the name.
+                menuItem.Checked = toggle.On;
+                menuItem.ShortcutKeyDisplayString = toggle.Word;
+                menuItem.AccessibleName = toggle.AccessibleName;
+                glyph = toggle.Glyph;
+            }
+            menuItem.Image = Switches.Draws(glyph) ? Switches.Get(scale, glyph == "switch-on", menuItem.Enabled)
+                : scale.Glyph(glyph, menuItem.Enabled ? scale.Colors.OnSurfaceVariant : disabled);
         }
         Strip.ResumeLayout(true);
     }
