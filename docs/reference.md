@@ -254,7 +254,7 @@ CODEXish deletes its own old state, never your roots, files or Git history:
 
 About a minute after start and then every 6 hours, artifacts (command output and stored reads), finished ledger
 entries, events, exited processes with their output, expired or revoked tokens, older checkpoints of each task, client
-registrations that never completed a sign-in and the tray's log files older than `output_days` are deleted; pre-edit backups, quarantined ledgers and `codexish.json.broken-*` copies
+registrations that never completed a sign-in and the tray's and keeper's log files older than `output_days` are deleted; pre-edit backups, quarantined ledgers and `codexish.json.broken-*` copies
 older than `backup_days` are deleted. A missing section means these defaults, and `0` keeps that state forever.
 Running and reattachable processes, queued or running operations, the newest checkpoint of every task, live tokens and browser
 profiles are never deleted, and neither is an exited process whose job still holds a running descendant, nor its
@@ -262,11 +262,38 @@ output, until that descendant ends. A failed step is retried at the next sweep; 
 the settings and the last sweep.
 
 Only files carrying the names CODEXish gives them are deleted: `art_<id>.bin` in `artifacts`, `<id>.bak` in
-`backups`, `tray-<yyyyMMdd>.log` in `logs`, `ledger.corrupt-<utc>.db` (and its sidecars) in `state_dir`, and
+`backups`, `tray-<yyyyMMdd>.log` and `keeper-<yyyyMMdd>.log` in `logs`, `ledger.corrupt-<utc>.db` (and its sidecars) in `state_dir`, and
 `codexish.json.broken-<utc>` next to the configuration. Any other file in those folders, and every directory, is left
 alone, even when `state_dir` lies inside a root. An artifact's record goes only once its file is gone, so a file
 that cannot be deleted yet is tried again at the next sweep. Reading output that retention removed answers
 `ARTIFACT_EXPIRED` or `NOT_FOUND`; run the command again for fresh output.
+
+## Why a server stopped
+
+`alive.json` in `state_dir` is the running server's heartbeat: the process that holds `state_dir`, its version, how it
+was started (its parent processes by name and whether a job object holds it, never command lines), when it was last
+alive, rewritten every minute, and, once it stops on its own, why: `stopped by CODEXish`, `Windows signed the user out`,
+`Windows shut down or restarted` or `crashed: <exception>`. A process ended from outside runs no code and cannot record
+anything: when the program it was started from closes its job (Claude Desktop does this to everything its Claude Code
+sessions started when it restarts, updates or switches accounts), or through taskkill or Task Manager. The next start
+reads the file, and when the previous heartbeat simply stopped, or recorded a crash, `host_capabilities.warnings` and
+the tray's connection log say so with that process's pid, the last time it was alive and how it had been started. A
+start attempt that never served (for example while another program holds the port) puts the record back as it found
+it, so the attempt that succeeds still reports it. The ledger's `server_start` event carries the previous record
+whichever way it ended, and `server_stop` the reason. The file is replaced whole, so a process killed while writing
+leaves the previous one readable; one that cannot be read is reported in the warnings and replaced. A program that
+reads it should open it sharing delete access; while one holds it without, the next write is retried with backoff.
+None of this can stop or delay a start. With **Start with Windows** on, the keeper starts a tray that ended this way
+again, and it never runs as a child of the program that ended it; see [Tray](#tray).
+
+When CODEXish is started from inside a packaged (MSIX) app such as Claude Desktop, for example from a Claude Code
+terminal, Windows gives it that app's view of `AppData`: a `state_dir` under `%LOCALAPPDATA%` that did not exist yet is
+created in `%LOCALAPPDATA%\Packages\<app>\LocalCache\Local\…` instead, where programs outside the app (Explorer, the
+sign-in shortcut, Task Scheduler) never look. The server sees this in the final path of its own lock file and warns
+"Windows redirects state_dir … into …". Start CODEXish from the Start menu, Explorer or its sign-in task instead; to
+keep a configuration and ledger made that way, copy the folder the warning names to `state_dir` with Explorer while
+CODEXish is stopped. The sign-in task cannot start CODEXish with a configuration Windows redirects this way, so
+**Start with Windows** then says what to copy where instead of turning on.
 
 ## Browser mounts
 
@@ -332,7 +359,8 @@ tools directory, add this to `codexish.json`:
 `--tray` runs the same server behind a notification-area icon. It first starts itself again in the background with
 a hidden console and exits as soon as that copy holds the tray (or has found one already running), so the console
 window of a shortcut, a double-click or a terminal closes at once and closing a terminal no longer ends CODEXish; if
-that relaunch fails, or the copy exits before it takes over, the tray runs in the original process. One tray runs
+that relaunch fails, or the copy exits before it takes over, the tray runs in the original process. While **Start
+with Windows** is on, the start goes to its keeper instead (below). One tray runs
 per configuration file, however its path is spelled (a junction, symbolic link or short name leads to the same
 file): a second `--tray` for the same `codexish.json` says "CODEXish is already running; its icon is in the
 notification area" and exits.
@@ -350,14 +378,52 @@ configured tunnel. When the file exists but cannot be loaded even from
 status window, offers **Open configuration folder**, and tries again every minute; once the file loads, it starts
 the server and a configured tunnel.
 
-**Start with Windows**, a switch in the menu and the setup checkbox, writes `CODEXish.lnk` into your Startup folder.
-It runs this executable with `--tray --start --config "<full path of codexish.json>"` from the executable's folder,
-with the console window minimized; turning it off deletes the shortcut. When the tray starts and the shortcut names a
-file that no longer exists, for example after the install folder moved, starts the tray with other arguments (such
-as a shortcut written before v1.0.1 without `--config`), or cannot be read, it is rewritten, and the connection log
-says so once a configuration loads: `The autostart shortcut was rewritten to start <exe> --tray --start --config
-"<path>" because <reason>.` `--start` starts the server once the tray is up, then the tunnel if `tunnel.command` is
-configured. A plain `--tray` waits for **Start server**.
+**Start with Windows**, a switch in the menu and the setup checkbox, registers the Task Scheduler task `\CODEXish`
+for your Windows user. At sign-in, and right away when it is registered, the task runs `Codexish.Start.exe --keep
+--config "<full path of codexish.json>"` from the install folder, and then checks every minute; while that keeper
+runs, nothing new is started. `Codexish.Start.exe` is this program marked as a Windows program, so no console window
+opens. The keeper starts the tray with a hidden console and `--tray --start`, and starts it again whenever it ends
+without **Exit**, for example when it crashed, was ended in Task Manager, or was ended together with a program it had
+been started from: after 1 s, doubling to at most 60 s, without giving up, and five minutes of running reset the
+delay. The task runs as you, without administrator rights and only while you are signed in, with no run-time limit,
+at normal priority and without battery or idle conditions. Turning the switch off deletes the task; a keeper that
+runs goes on keeping its tray until **Exit**, and then ends as well.
+
+While the task exists, starting CODEXish any other way, from a shortcut, Explorer or `--tray` in a terminal, hands
+the start to the keeper and exits, so CODEXish never runs as a child of a terminal or app that may end it; when no
+tray appears within 30 s, the tray runs where it was started instead. The keeper's tray always starts the server, as
+`--start` does. Opening `Codexish.Start.exe` itself does the same; without the task, that process keeps CODEXish
+running itself. A first run without a configuration file opens its setup where it was started. **Exit** stops the
+tray and the keeper waits: starting CODEXish again, or the next sign-in, starts it. The keeper writes every tray it starts again, with the exit
+code and run time of the one that ended, and every failure to start one to `<state_dir>\logs\keeper-<yyyyMMdd>.log`,
+and a tray it started again says "Started again by the keeper: <why>." in its connection log.
+
+`Codexish.Server.exe --stop [--config <path>]` stops the tray as **Exit** does, ends the keeper and returns once
+both have let go, with no time limit. CODEXish then stays stopped for the rest of this sign-in, although the task
+still checks every minute, until it is started again; that is how an update replaces the files (see the README).
+The mark is `codexish.json.stopped` next to the configuration file, beside the file itself when the path leads
+through a link, and it holds for elevated and normal processes of the same sign-in alike; a mark from an earlier
+sign-in is ignored and removed. `--stop` holds its request, and repeats it every second, until the tray has let go,
+so a tray that is still starting, or still in its first-run setup, stops as soon as it is up. After ten seconds it
+says what it is waiting for: a tray from before `Codexish.Start.exe` does not hear `--stop` and stops with **Exit**.
+
+When the tray starts and the task names a program that no longer exists, for example after the install folder
+moved, or other arguments, it is rewritten, and a `CODEXish.lnk` from an earlier version in your Startup folder
+becomes the task. The connection log says so once a configuration loads: `The Task Scheduler task \CODEXish was
+written to start <starter> --keep --config "<path>" because <reason>.` A configuration that Windows redirects into a
+packaged app's folder (see [Why a server stopped](#why-a-server-stopped)) is left with what it has. One autostart
+exists per Windows user, for one configuration.
+
+Without `Codexish.Start.exe` next to the executable, as in a build run with `dotnet`, **Start with Windows** writes
+`CODEXish.lnk` into your Startup folder instead. It runs this executable with `--tray --start --config "<full path
+of codexish.json>"` from the executable's folder, with the console window minimized, starts CODEXish once at sign-in
+and does not start it again; turning it off deletes the shortcut. A shortcut that names a file that no longer exists,
+starts the tray with other arguments (such as one written before v1.0.1 without `--config`) or cannot be read is
+rewritten, and the connection log says so: `The autostart shortcut was rewritten to start <exe> --tray --start
+--config "<path>" because <reason>.`
+
+`--start` starts the server once the tray is up, then the tunnel if `tunnel.command` is configured. A plain `--tray`
+waits for **Start server**.
 
 With `--start` the first-run setup never opens. If the configuration file cannot be found at that moment, the tray
 treats it like one that cannot be loaded: the amber icon names the reason, it tries again every minute, and once the
@@ -437,13 +503,21 @@ measurement. Windows-only checks print `SKIP` elsewhere. `--browser-tests` runs 
 fixture behind the real HTTP host, including fixture modes that exit after a number of calls, never answer the
 handshake, or fail their first starts; `--tray-tests` drives the tray controller over the local control endpoint,
 including supervision (a busy port, a stopped host, short-lived test tunnels) and, on Windows, the autostart shortcut
-in a temporary Startup folder, without an icon or an external tunnel. All three run in CI on Windows and Ubuntu.
+in a temporary Startup folder, the sign-in task's definition, the windowless starter and the keeper with stand-in
+trays (start failures, restarts, Exit, hand-off requests, `--stop`), without an icon, an external tunnel or a
+registered task. All three run in CI on Windows and Ubuntu.
 
 Explicit local checks, never run in CI:
 
 - `--browser-live-test <node.exe> <@playwright/mcp cli.js> <chrome.exe>`: a headless browser with a dedicated
   profile against a loopback page served by the test itself.
 - `--tray-smoke-test`: creates and removes a notification icon.
+- `--keeper-live-test`: registers a temporary task of its own, `\CODEXish-live-test-<id>`, for a configuration in a
+  new temporary folder, lets Windows start the windowless keeper with a stand-in tray that opens no window or icon,
+  kills the stand-in to see it started again and the keeper to see the task's minute check start that again, then
+  deletes the task and stops both. The installed CODEXish, its task, state and port are never touched. Run it from a
+  self-contained build (`dotnet publish -r win-x64 --self-contained`): a program the Task Scheduler starts does not
+  see a `DOTNET_ROOT` set in a terminal.
 - `--design-preview <dir>`: renders the setup, connection details, roots and text windows, the tray menu (running
   with Start with Windows on, stopped with it off, running and paused, and configuration not loaded) and the tray
   icons to PNG at 100% and 150%, light and dark, writes every menu notification text to `tray-notifications.txt`, and

@@ -40,7 +40,7 @@ public static class TrayInstance
     // Set by the relaunched tray once it holds the mutex, or once it found another tray holding it.
     public static string ReadyEventName(string configPath) => @"Local\CODEXish-tray-ready-" + InstanceHash(configPath);
 
-    private static string InstanceHash(string configPath)
+    internal static string InstanceHash(string configPath)
     {
         string canonical = CanonicalPath(configPath);
         if (OperatingSystem.IsWindows()) canonical = canonical.ToUpperInvariant();
@@ -244,7 +244,10 @@ public static class TrayNotice
 
     public static string Paused(bool paused) => paused ? "Changes paused: writes wait until you resume." : "Changes resumed.";
 
-    public static string StartWithWindows(bool on) => on ? "Start with Windows is on: CODEXish starts when you sign in." : "Start with Windows is off.";
+    public static string StartWithWindows(bool on, bool restarts = false) =>
+        !on ? "Start with Windows is off."
+        : restarts ? "Start with Windows is on: CODEXish starts when you sign in, and again whenever it stops without Exit."
+        : "Start with Windows is on: CODEXish starts when you sign in.";
 
     // Saving stops the server and starts again whatever was running; the text says whether that start succeeded.
     public static string RootsSaved(bool restarted, TrayState after) =>
@@ -301,9 +304,21 @@ public static class TrayApplication
     {
 #if WINDOWS
         options ??= new TrayOptions();
-        // A relaunch that fails, or whose child exits before it took over, leaves the tray in this process.
-        if (!smoke && arguments is not null && !arguments.Contains(TrayInstance.DetachedMarker) && Relaunch(path, arguments))
-            return Task.FromResult(0);
+        bool kept = arguments?.Contains(TrayKeeper.KeptMarker) == true;
+        string? restarted = null;
+        try { restarted = arguments is null ? null : CommandLine.Values(arguments, TrayKeeper.RestartedOption).FirstOrDefault(); }
+        catch (ArgumentException) { /* a keeper note without its text is simply not logged */ }
+        if (!smoke && arguments is not null && !arguments.Contains(TrayInstance.DetachedMarker))
+        {
+            // A start by hand ends an earlier --stop.
+            TrayKeeper.ClearStopped(path);
+            IAutostart? autostart = null;
+            try { autostart = Autostart.ForThisProcess(path); }
+            catch (Exception error) { Console.Error.WriteLine("CODEXish: autostart could not be read: " + error.GetType().Name + ": " + error.Message); }
+            if (TrayKeeper.HandOff(path, autostart, Console.Out)) return Task.FromResult(0);
+            // A relaunch that fails, or whose child exits before it took over, leaves the tray in this process.
+            if (Relaunch(path, arguments)) return Task.FromResult(0);
+        }
         var completion = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
         var thread = new Thread(() =>
         {
@@ -317,11 +332,20 @@ public static class TrayApplication
                 catch (Exception error) { Console.Error.WriteLine("The tray keeps the light color mode: " + error.GetType().Name + ": " + error.Message); }
                 if (!smoke)
                 {
+                    // Read before the ready signal: the launcher waiting for it then exits, and its own parents can no
+                    // longer be named after that.
+                    _ = Vitals.Launch;
                     instance = TrayInstance.TryAcquire(path);
                     // Either way a tray runs for this configuration now, so a waiting launcher can close.
                     TrayInstance.SignalReady(path);
                     if (instance is null)
                     {
+                        // The keeper waits for that tray to end instead; nobody is there to read a message.
+                        if (kept)
+                        {
+                            completion.SetResult(TrayKeeper.AnotherTrayExitCode);
+                            return;
+                        }
                         Forms.MessageBox.Show("CODEXish is already running; its icon is in the notification area.", "CODEXish",
                             Forms.MessageBoxButtons.OK, Forms.MessageBoxIcon.Information);
                         completion.SetResult(0);
@@ -341,7 +365,7 @@ public static class TrayApplication
                     // First-run setup ends with the server, and a configured tunnel, running.
                     start = true;
                 }
-                using var context = new Context(config, loadError, path, smoke, start);
+                using var context = new Context(config, loadError, path, smoke, start, restarted);
                 Forms.Application.Run(context);
                 completion.SetResult(context.ExitCode);
             }
@@ -435,23 +459,36 @@ public static class TrayApplication
         private readonly Forms.Form dispatcher = new() { ShowInTaskbar = false };
         private readonly Forms.Timer timer = new() { Interval = 500 };
         private readonly Forms.Timer reload = new() { Interval = (int)ReloadInterval.TotalMilliseconds };
-        private readonly TrayAutostart? autostart;
+        private readonly IAutostart? autostart;
         private readonly string path;
+        private readonly bool smoke;
+        private readonly EventWaitHandle? stopRequest;
+        private readonly RegisteredWaitHandle? stopWait;
         private TrayController? controller;
         private ServerConfig? config;
         private string? loadError;
         private string? startupNote;
+        private string? keeperNote;
+        private bool autostartOn;
         private bool exiting;
         public int ExitCode { get; private set; }
 
-        public Context(ServerConfig? config, string? loadError, string path, bool smoke, bool start)
+        public Context(ServerConfig? config, string? loadError, string path, bool smoke, bool start, string? restarted = null)
         {
-            this.path = path; this.loadError = loadError;
+            this.path = path; this.loadError = loadError; this.smoke = smoke;
+            keeperNote = restarted;
             _ = dispatcher.Handle;
             // Without a known executable path there is nothing to autostart; the tray itself still runs.
             string? autostartProblem = null;
-            try { autostart = smoke ? null : TrayAutostart.ForThisProcess(path); }
+            try { autostart = smoke ? null : Autostart.ForThisProcess(path); }
             catch (Exception error) { autostartProblem = "Autostart is unavailable: " + error.GetType().Name + ": " + error.Message; }
+            if (!smoke)
+            {
+                // --stop ends the tray the way Exit does.
+                stopRequest = new EventWaitHandle(false, EventResetMode.AutoReset, TrayKeeper.StopEventName(path));
+                stopWait = ThreadPool.RegisterWaitForSingleObject(stopRequest,
+                    (_, _) => dispatcher.BeginInvoke(new Action(async () => await Exit())), null, Timeout.Infinite, executeOnlyOnce: true);
+            }
             async Task Control(string action) => Notify(TrayNotice.Control(action, await Controller().ControlAsync(action)));
             menu = BuildMenu(new MenuActions(
                 Status: ShowStatus,
@@ -485,8 +522,9 @@ public static class TrayApplication
                     if (autostart is null) throw new InvalidOperationException(autostartProblem ?? "Autostart is unavailable.");
                     if (autostart.Enabled) autostart.Disable();
                     else autostart.Enable();
-                    controller?.Note((autostart.Enabled ? "Autostart shortcut written: " : "Autostart shortcut removed: ") + autostart.ShortcutPath);
-                    Notify(TrayNotice.StartWithWindows(autostart.Enabled));
+                    bool on = autostartOn = autostart.Enabled;
+                    controller?.Note((on ? "Autostart written: " : "Autostart removed: ") + autostart.Location);
+                    Notify(TrayNotice.StartWithWindows(on, autostart.Restarts));
                     return Task.CompletedTask;
                 },
                 Exit: Exit), Guard);
@@ -494,6 +532,10 @@ public static class TrayApplication
             // below keeps it current while it stays open.
             menu.Strip.Opening += (_, _) =>
             {
+                // Read once per opening: for the task it is a Task Scheduler query, too slow for the 500 ms timer. A query
+                // that fails keeps the switch as it was last read, and the menu opens anyway.
+                try { autostartOn = autostart?.Enabled == true; }
+                catch (Exception error) { controller?.Note($"Reading the {autostart?.Location} failed: " + error.GetType().Name + ": " + error.Message); }
                 applied = Model();
                 menu.Apply(new Ui(DesignNative.DpiAt(Forms.Cursor.Position, menu.Strip.DeviceDpi), Palette.Current), applied);
             };
@@ -506,11 +548,12 @@ public static class TrayApplication
                 {
                     if (autostart.Heal() is { } reason) autostartProblem = autostart.Rewritten(reason);
                 }
-                catch (Exception error) { autostartProblem = "Repairing the autostart shortcut failed: " + error.GetType().Name + ": " + error.Message; }
+                catch (Exception error) { autostartProblem = $"Repairing the {autostart.Location} failed: " + error.GetType().Name + ": " + error.Message; }
             }
             reload.Tick += (_, _) => Reload();
             if (!smoke)
             {
+                Microsoft.Win32.SystemEvents.SessionEnded += SessionEnded;
                 startupNote = autostartProblem;
                 if (config is not null) Attach(config, start);
                 else ReportLoadError();
@@ -549,7 +592,7 @@ public static class TrayApplication
 
         private TrayState State() => controller?.State ?? TrayState.NotLoaded;
 
-        private TrayMenuModel Model(TrayState? state = null) => TrayMenuModel.From(state ?? State(), autostart?.Enabled == true);
+        private TrayMenuModel Model(TrayState? state = null) => TrayMenuModel.From(state ?? State(), autostartOn);
 
         // Windows may hold a balloon back, for example under Do Not Disturb; the menu and its header stay the record. A
         // balloon holds at most 255 characters, which a long retry cause could exceed.
@@ -569,9 +612,13 @@ public static class TrayApplication
             config = loaded;
             loadError = null;
             controller = new TrayController(loaded);
-            // The log lives in state_dir, so what happened to the autostart shortcut is written once a configuration loads.
+            // The log lives in state_dir, so how this tray was started and what happened to the autostart shortcut are
+            // written once a configuration loads.
+            controller.Note($"CODEXish {CodexishRuntime.ServerVersion} tray, pid {Environment.ProcessId}, started {Vitals.Launch}.");
             if (startupNote is not null) controller.Note(startupNote);
             startupNote = null;
+            if (keeperNote is not null) controller.Note("Started again by the keeper: " + keeperNote + ".");
+            keeperNote = null;
             // Posted to the message loop, so the server and tunnel start once the tray is up.
             if (start) dispatcher.BeginInvoke(new Action(async () => await Guard(controller.StartConfiguredAsync)));
         }
@@ -661,12 +708,44 @@ public static class TrayApplication
             timer.Stop();
             reload.Stop();
             try { if (controller is not null) await controller.DisposeAsync(); }
-            finally { icon.Visible = false; ExitThread(); }
+            finally
+            {
+                if (!smoke)
+                {
+                    // A keeper, if one started this tray, waits instead of starting it again.
+                    TrayKeeper.ChoseExit(path);
+                    if (!KeeperCanBeAsked()) TrayKeeper.EndKeeper(path);
+                }
+                icon.Visible = false;
+                ExitThread();
+            }
+        }
+
+        // Only the task for this configuration asks a waiting keeper for a start, by hand-off or at sign-in. When that
+        // cannot be read, the keeper waits, as it would with the task there.
+        private bool KeeperCanBeAsked()
+        {
+            try { return autostart is TrayTask task && task.RegisteredForThis(); }
+            catch (Exception) { return true; }
+        }
+
+        // Windows ends the process right after this event, so the reason has to be written now.
+        private void SessionEnded(object? sender, Microsoft.Win32.SessionEndedEventArgs e)
+        {
+            string reason = e.Reason == Microsoft.Win32.SessionEndReasons.Logoff ? "Windows signed the user out" : "Windows shut down or restarted";
+            Vitals.EndAll(reason);
+            controller?.Note(reason + "; CODEXish ends with the session.");
         }
 
         protected override void Dispose(bool disposing)
         {
-            if (disposing) { timer.Dispose(); reload.Dispose(); icon.Dispose(); menu.Strip.Dispose(); dispatcher.Dispose(); }
+            if (disposing)
+            {
+                Microsoft.Win32.SystemEvents.SessionEnded -= SessionEnded;
+                stopWait?.Unregister(null);
+                stopRequest?.Dispose();
+                timer.Dispose(); reload.Dispose(); icon.Dispose(); menu.Strip.Dispose(); dispatcher.Dispose();
+            }
             base.Dispose(disposing);
         }
     }
@@ -717,9 +796,9 @@ public static class TrayApplication
                 {
                     try
                     {
-                        var autostart = TrayAutostart.ForThisProcess(path);
+                        var autostart = Autostart.ForThisProcess(path);
                         autostart.Enable();
-                        signInResult = "Start at sign-in: on (" + autostart.ShortcutPath + ").";
+                        signInResult = "Start at sign-in: on (" + autostart.Location + ").";
                     }
                     catch (Exception error) { signInResult = "Start at sign-in could not be set up (" + error.Message + "). Use Start with Windows in the tray menu."; }
                 }

@@ -141,4 +141,85 @@ internal static class Native
     public static bool TerminateJob(nint job) => OperatingSystem.IsWindows() && job != 0 && TerminateJobObject(job, 1);
 
     public static void CloseJob(nint job) { if (OperatingSystem.IsWindows() && job != 0) CloseHandle(job); }
+
+    // A job's owner can end every process in it at once, without notice; that is how an app that started CODEXish
+    // takes it down when the app closes.
+    public static bool InAnyJob()
+    {
+        if (!OperatingSystem.IsWindows()) return false;
+        using var self = System.Diagnostics.Process.GetCurrentProcess();
+        return IsProcessInJob(self.Handle, 0, out bool result) && result;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct TokenStatistics
+    {
+        public long TokenId, AuthenticationId, ExpirationTime;
+        public int TokenType, ImpersonationLevel, DynamicCharged, DynamicAvailable, GroupCount, PrivilegeCount;
+        public long ModifiedId;
+    }
+
+    private const int TokenStatisticsClass = 10, TokenLinkedTokenClass = 19;
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern bool GetTokenInformation(nint token, int infoClass, out TokenStatistics info, int length, out int returned);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern bool GetTokenInformation(nint token, int infoClass, out nint linkedToken, int length, out int returned);
+
+    // The sign-in session this process runs in: the token's authentication id, which changes with every sign-in. An
+    // administrator's elevated and normal processes of one sign-in hold linked tokens with different ids, so the smaller
+    // of the two is used, which is the same from either side.
+    public static long? LogonSessionId()
+    {
+        if (!OperatingSystem.IsWindows()) return null;
+        using var identity = System.Security.Principal.WindowsIdentity.GetCurrent();
+        if (!GetTokenInformation(identity.Token, TokenStatisticsClass, out TokenStatistics own, Marshal.SizeOf<TokenStatistics>(), out _)) return null;
+        long id = own.AuthenticationId;
+        if (GetTokenInformation(identity.Token, TokenLinkedTokenClass, out nint linked, nint.Size, out _) && linked != 0)
+        {
+            try
+            {
+                if (GetTokenInformation(linked, TokenStatisticsClass, out TokenStatistics other, Marshal.SizeOf<TokenStatistics>(), out _))
+                    id = Math.Min(id, other.AuthenticationId);
+            }
+            finally { CloseHandle(linked); }
+        }
+        return id;
+    }
+
+    private const uint SnapProcess = 0x00000002;
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct ProcessEntry
+    {
+        public uint Size, Usage, ProcessId;
+        public nint DefaultHeapId;
+        public uint ModuleId, Threads, ParentProcessId;
+        public int PriorityClassBase;
+        public uint Flags;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string ExeFile;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern SafeFileHandle CreateToolhelp32Snapshot(uint flags, uint processId);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, EntryPoint = "Process32FirstW", SetLastError = true)]
+    private static extern bool Process32First(SafeFileHandle snapshot, ref ProcessEntry entry);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, EntryPoint = "Process32NextW", SetLastError = true)]
+    private static extern bool Process32Next(SafeFileHandle snapshot, ref ProcessEntry entry);
+
+    // Every process's parent id and executable name, or an empty map when no snapshot can be taken.
+    public static Dictionary<int, (int Parent, string Name)> Processes()
+    {
+        var map = new Dictionary<int, (int Parent, string Name)>();
+        if (!OperatingSystem.IsWindows()) return map;
+        using var snapshot = CreateToolhelp32Snapshot(SnapProcess, 0);
+        if (snapshot.IsInvalid) return map;
+        var entry = new ProcessEntry { Size = (uint)Marshal.SizeOf<ProcessEntry>() };
+        for (bool more = Process32First(snapshot, ref entry); more; more = Process32Next(snapshot, ref entry))
+            map[(int)entry.ProcessId] = ((int)entry.ParentProcessId, entry.ExeFile);
+        return map;
+    }
 }

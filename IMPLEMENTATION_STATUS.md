@@ -369,3 +369,120 @@ New checks:
 
 Not run and not claimed: the tray UI itself (`--tray`, `--tray-smoke-test`, a real balloon or a real open menu), a
 screen reader, ChatGPT, CI, a Linux run, `--self-test-desktop`, `--self-test-desktop-http` and `--browser-live-test`.
+
+## Stay-up pass 1: a server that stops leaves its reason (2026-10-26)
+
+Branch `feat/stay-up` on `feat/v1.0.2` (76e40d1). The installed server stopped serving on 2026-10-25 and left nothing
+in its log, the event log or WER. It had been started from a Claude Code session's shell (the install script ends with
+`Start-Process ... --tray --start`), so it ran inside Claude Desktop's job objects, one of them KILL_ON_JOB_CLOSE. At
+20:20:17 KST an account switch made Claude Desktop end every session's CLI job, and Windows terminated CODEXish with
+it; no managed code ran. The server running afterwards was shown, by duplicating the job handles Claude.exe holds and
+calling IsProcessInJob, to sit in the same three jobs. Separately, Claude Desktop is an MSIX package, so the
+`state_dir` created from that shell lives in `%LOCALAPPDATA%\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Local\Codexish`;
+a process started outside Claude (checked through WMI) sees no `%LOCALAPPDATA%\Codexish` at all, so the sign-in
+shortcut cannot find its `--config`. This pass makes such an end visible; restarting the server is the next pass and
+waits for the owner's decision (Task Scheduler task with a windowless starter, recommended, or Explorer hand-off).
+
+| Item | What changed |
+| --- | --- |
+| Heartbeat | `Vitals` (new): `state_dir\alive.json` with pid, version, launch, started, alive and stopped. Begun by `CodexishRuntime` once it holds the state lock (one writer per state_dir), rewritten every minute, replaced whole (`.tmp` + move); a failed write is retried with `Backoff`, the final one three times quickly. Never stops or delays a start. |
+| Launch | `Vitals.Launch`: the parent chain by executable name and pid from a Toolhelp snapshot, stopped at a parent that started after its child (a reused pid) or whose start time cannot be read ("unverified"), plus whether a job object holds the process. No command lines. The tray reads it before its ready signal, because the launcher that waits for that signal exits right after. |
+| Previous end | The next start reports a heartbeat without a stop ("ended without stopping; its heartbeat stopped at …", with how that server had been started) or a recorded crash in `Warnings`, so in `host_capabilities`, `workspace_info`, the console and the tray log. Clean stops, the end of the Windows session and failed starts are not warnings. A record of this very process is not reported, and an unreadable file is. |
+| Failed starts | `Vitals.Abandon`: a runtime whose start failed (in its constructor, the tray's `StartHost`, or the console host before it started) puts back the record it found, so a retry that succeeds still reports the earlier end. A console host that crashes after it started records `crashed: …`. |
+| Stop reasons | `stopped by CODEXish` on disposal; `crashed: <exception>` from `AppDomain.UnhandledException`; `Windows signed the user out` / `Windows shut down or restarted` from `SystemEvents.SessionEnded` in the tray, written before anything else. The first reason recorded wins and is also the ledger's `server_stop.reason`; `server_start` carries `launch` and `previous`. |
+| Redirection | `Vitals.Redirection`: the final path of the open `instance.lock` against the path asked for. Only the exact MSIX correspondence `<AppData>\<Local|Roaming|LocalLow>\<rest>` → `<AppData>\Local\Packages\<package>\LocalCache\<same>\<rest>` counts, so a junction, an 8.3 name or a path chosen inside a package folder is not taken for one. It becomes the warning "Windows redirects state_dir … into …, because this CODEXish was started from inside the packaged app …". |
+| Docs | reference "Why a server stopped"; README troubleshooting rows for the `Internal error` symptom and the redirect warning. |
+
+| Command | Result |
+| --- | --- |
+| Release build | 0 warnings, 0 errors |
+| `--self-test`, final build | SELF_TEST_PASSED 394 (368 before) in four runs, DESKTOP_CORE_PASSED 56, DESKTOP_REGRESSIONS 11 passed, 0 failed |
+| `--tray-tests`, final build | TRAY_CONTROLLER_PASSED 75 (73 before) in four runs |
+| `--browser-tests`, final build | BROWSER_TESTS_PASSED 55 in two runs (unchanged) |
+| Live check from a Claude Code shell, framework-dependent build, console server on port 0 with a new folder under `%LOCALAPPDATA%` (removed afterwards) | First run: "Windows redirects state_dir … into …\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Local\…", and the file was there. Killed, started again: "The previous CODEXish on this state_dir (pid …) ended without stopping; its heartbeat stopped at … It had been started by pwsh.exe … <- cmd.exe … <- claude.exe … <- claude.exe … <- explorer.exe …, inside a job object." |
+
+New checks: self-test 26 (the heartbeat, the previous-end classification, a record of this process, failed starts
+putting back what they found byte for byte, stop reasons in the file, `StopReason` and `server_stop`, unreadable files
+in the warnings, redirection cases, links, and a child server ended by closing the kill-on-close job it runs in);
+tray tests 2 (a start on a busy port keeps the earlier record, and the start that succeeds reports it once).
+
+Review: GPT-6 Astra (read-only, three rounds) and Gemini 4 Argon (three rounds) on the same patch. Fixed from their
+findings: the Linux expectation of the launch text, a failed or never-started host recorded as a clean stop, the
+stop reason differing between the file and `server_stop`, a reader blocking the replace, failed starts erasing the
+earlier record (also when it was unreadable), the unreadable file missing from the warnings, unverified parents in the
+launch chain, false redirections through junctions and 8.3 names, the disposed host read after `RunAsync`, and test
+cleanup and a test that assumed the temporary folder is not linked. Not adopted: normalizing `UNC\` in
+`Native.FinalPath` for every caller (it is shared with the path fence; noted for a separate change).
+
+Not run and not claimed: a real sign-out or shutdown (`SessionEnded`), a real unhandled exception (a crashing child
+could raise a Windows Error Reporting dialog on the owner's desktop), the tray UI, ChatGPT, CI, a Linux run. Nothing
+here touched the installed app, its state folder, the Startup folder, port 38451 or the running server.
+
+## Stay-up pass 2: CODEXish starts itself again, outside whatever started it (2026-10-26)
+
+Branch `feat/stay-up`, on pass 1 (bb0f193). The owner chose option A of the design note: a per-user Task Scheduler
+task with a windowless starter. Installing it was a separate owner decision (see the end of this section).
+The installed state had already been moved out of Claude Desktop's package folder by then: checked from a process
+outside the package at 04:11 KST, `%LOCALAPPDATA%\Codexish` held the configuration and the ledger and the package copy
+was gone, and the v1.0.1 tray started at 03:17 served on 38451.
+
+| Item | What changed |
+| --- | --- |
+| Windowless starter | `Codexish.Start.exe`: the build's own apphost with the PE subsystem byte changed from console (3) to Windows (2), written by an inline MSBuild task after build and after publish (a failure is a warning; without the file Start with Windows stays the Startup shortcut). A process with that name is the keeper. |
+| Sign-in task | `TrayTask` (new): `\CODEXish` registered through `Schedule.Service`, LogonTrigger and RegistrationTrigger each repeating every minute, IgnoreNew, no execution limit, priority 5, InteractiveToken, LeastPrivilege, no battery or idle conditions; action `Codexish.Start.exe --keep --config "<path>"`. `IAutostart` covers it and the shortcut; `Heal` turns a v1.0.x shortcut into the task and rewrites a task that names a missing program or another configuration, comparing paths canonically. |
+| Keeper | `TrayKeeper` (new): one per configuration and sign-in session (`Local\` mutex); starts the tray with a hidden console and `--tray --start`, starts it again with `Backoff` whenever it ends without Exit, waits for another tray that runs, and holds the tray's stop event so `--stop` reaches a tray that is still starting. Writes `state_dir\logs\keeper-<yyyyMMdd>.log`; retention removes those with the tray logs. |
+| Hand-off | A tray started any other way while the task exists for its configuration asks the keeper (start request, or running the task) and exits once the keeper's tray is ready; after 30 s without one it runs where it was started. Not for first-run setup or a configuration Windows redirects into a package folder. Opening `Codexish.Start.exe` by hand does the same. |
+| Exit and --stop | Exit tells the keeper to wait (with Start with Windows off, to end). `--stop` writes `<config>.stopped` with this sign-in's id (the smaller of the token's and its linked token's, so elevated and normal processes agree), holds the tray's stop request, set again every second, until the tray has let go, ends the keeper, and waits for both without a time limit (after ten seconds it says what it waits for); a keeper started while the mark names this sign-in ends at once. A start by hand, turning Start with Windows on, or the next sign-in ends it. |
+| Tray | Kept trays exit with code 3 when another tray runs, log "Started again by the keeper: …", and the Start with Windows notice says it also restarts. |
+| Docs | reference Tray (task, keeper, hand-off, Exit, `--stop`, the shortcut fallback), Why a server stopped, retention, Tests; README first run, Everyday control, Updating (`--stop`, then extract, then `Codexish.Start.exe`) and Uninstalling. |
+
+| Command | Result |
+| --- | --- |
+| Release build, a Linux-targeted copy of the project (net10.0, Windows-only items off), self-contained `win-x64` publish | 0 warnings, 0 errors each |
+| `--self-test`, final build | SELF_TEST_PASSED 394, DESKTOP_CORE_PASSED 56, DESKTOP_REGRESSIONS 11 passed, 0 failed, in two runs |
+| `--tray-tests`, final build | TRAY_CONTROLLER_PASSED 104 (75 before) in four runs; one SKIP: `--stop` through a file symbolic link (this session may not create one) |
+| `--browser-tests`, final build | BROWSER_TESTS_PASSED 55 in two runs (unchanged) |
+| `--keeper-live-test`, self-contained publish | KEEPER_LIVE_PASSED 10: the temporary task registered with its settings; Windows started the keeper on registration (`Codexish.Start.exe <- svchost.exe`, in the Task Scheduler's job); a killed stand-in tray started again; the keeper log names the ended pid and exit code; a killed keeper started again by the minute repetition after 59 to 60 s in every run, and the stand-in had outlived its keeper; after Exit the keeper stayed and started nothing; `Codexish.Start.exe` opened by hand woke it and the new stand-in was the keeper's child; the task deleted; `--stop` returned once both had let go. No task, process or folder was left. |
+| Token probe on this PC (normal process) | own authentication id 0x79074, linked elevated token 0x77123: an elevated `--stop` would have written another id before the fix |
+
+New checks: tray tests 29 (task definition in schema order, its action, location, rewrite text and path comparison
+including another case; the notice; the keeper's start arguments; the starter's subsystem byte; the keeper loop with
+stand-in children: start failures with backoff, a second keeper, restarts with their reason, Exit, start requests,
+another tray, `--stop` reaching a tray that opens its stop request late, the stop mark in this and an earlier
+sign-in, a start racing the end after Exit, Exit with Start with Windows off, `--stop` reaching a tray started by hand
+that opens its stop request late, `--stop` with nothing running; logging
+with a configuration that is JSON but no object). The framework-dependent build cannot run the live test: a task
+does not see a terminal's `DOTNET_ROOT` (one attempt at 03:19 KST ended with event 1023, ".NET must be installed").
+
+Review: GPT-6 Astra (read-only) and Gemini 4 Argon on the same patch, four rounds each. Fixed from their findings: the
+starter opened by hand not waking a waiting keeper and becoming a keeper inside its launcher; `--stop` missing a
+tray or keeper that was still starting; a start request lost when it raced the end after Exit; path spellings
+(case, links) skipping the hand-off or rewriting the task; the stop mark beside a link instead of the file; an
+elevated `--stop` writing another sign-in id; hand-off swallowing first-run setup; Linux path assumptions in the
+tray tests; a Task Scheduler failure escaping the menu; logging that could end the keeper; event handles outliving
+the keeper mutex; a keeper's start erasing an Exit made at that moment; `--stop` losing its request when the keeper
+was waiting for a tray started by hand; a start by hand counted as done before a tray was ready; option case in the
+task match; schema order in the logon trigger; the live test's process ownership and cleanup. Not adopted: ownership semantics for
+`TrayInstance.TryAcquire` (its tests need a second acquisition on the same thread to fail, and the window it closes
+is a few instructions long).
+
+CI on the pushed commit 076c475: all four checks passed, Windows and Ubuntu.
+
+Installed on the owner's PC at 19:47 KST with the owner's approval, from 076c475 (`1.0.2+076c475`), by
+`G:\Antigravity\ToolDev\codexish-install.ps1`, changed the same day: an install with `Codexish.Start.exe` is stopped
+with its own `--stop` inside the copy process that runs outside the Claude package (so the stop mark lands in the real
+folder), robocopy retries 60 times, the script waits for that process to end instead of a five-minute deadline, and
+CODEXish is started by opening `Codexish.Start.exe --config` through Explorer. Before it ran: no CODEXish call since
+19:01 KST, no process running for one, and the only ChatGPT Pro request then running was a web search that does not
+use CODEXish. What the installed copy then did, on the real task, configuration and port 38451:
+
+| Check | Result |
+| --- | --- |
+| First start (from v1.0.1, through Explorer) | Keeper `Codexish.Start.exe <- explorer.exe`, tray its child, serving on 38451; the tray turned the Startup shortcut into `\CODEXish` ("written … because Start with Windows was the Startup-folder shortcut …") and the shortcut is gone. Task: action `Codexish.Start.exe --keep --config "…\codexish.json"`, LogonTrigger and RegistrationTrigger every PT1M, no time limit, priority 5, IgnoreNew, Interactive, Limited. |
+| `--stop` from outside the package | Returned in 2.5 s ("CODEXish stopped; …"), no CODEXish process left. The task then ran at 19:49:15 and 19:50:15 (result 0) and nothing stayed running, so the mark held. |
+| `Codexish.Start.exe` opened through Explorer | Handed the start to the task: keeper `--keep` under `svchost.exe <- services.exe`, tray its child, serving after 2.6 s, stop mark gone. |
+| Tray killed with `Stop-Process` | Serving again after 4.3 s from a new tray started by the same keeper. Keeper log: "The tray (pid 98136) exited with code -1 after 00:00:21 without Exit. It starts again in 1 s"; tray log: "Started again by the keeper: …" and the pass-1 warning "The previous CODEXish … ended without stopping". |
+
+Not run and not claimed: a real sign-out and sign-in (the LogonTrigger), an elevated `--stop`, the tray UI with the
+task (Exit, the switch, the menu), ChatGPT through the tunnel after the restart, a Claude restart or account switch
+with this install.

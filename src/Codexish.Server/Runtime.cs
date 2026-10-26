@@ -31,6 +31,7 @@ public sealed class CodexishRuntime : IDisposable
     public IReadOnlyList<object> RecoveredProcesses { get; }
     public (int Cancelled, int Unknown) RecoveredInvocations { get; }
     public Retention Retention { get; }
+    public Vitals Heartbeat { get; }
 
     private readonly FileStream instanceLock;
     private readonly CancellationTokenSource sweeps = new();
@@ -50,6 +51,9 @@ public sealed class CodexishRuntime : IDisposable
             warnings.AddRange(Store.MigrationErrors);
             if (Store.MalformedRowsSkipped > 0)
                 warnings.Add($"{Store.MalformedRowsSkipped} ledger row(s) could not be read and were skipped.");
+            if (Heartbeat.PreviousEnd is { } ended) warnings.Add(ended);
+            if (Heartbeat.PreviousUnreadable is { } unreadable) warnings.Add(unreadable);
+            if (Heartbeat.Redirect is { } redirect) warnings.Add(redirect);
             return warnings;
         }
     }
@@ -66,6 +70,7 @@ public sealed class CodexishRuntime : IDisposable
         Directory.CreateDirectory(Path.Combine(config.StateDir, "artifacts"));
         Directory.CreateDirectory(Path.Combine(config.StateDir, "backups"));
         instanceLock = StateLockedException.Open(config.StateDir);
+        Vitals? heartbeat = null;
         try
         {
             Store = new Store(Path.Combine(config.StateDir, "codexish.db"));
@@ -81,15 +86,24 @@ public sealed class CodexishRuntime : IDisposable
             Browsers = new BrowserMounts(this);
             RecoveredInvocations = Store.RecoverInvocations();
             RecoveredProcesses = Processes.Recover();
-            Store.Event("server_start", null, new { version = ServerVersion, auth = authDisabled ? "disabled" : "oauth" });
+            // Only the holder of the state lock writes the heartbeat, so the previous record is read before it is replaced.
+            Heartbeat = heartbeat = Vitals.Begin(config.StateDir, instanceLock.SafeFileHandle);
+            Store.Event("server_start", null, new
+            {
+                version = ServerVersion, auth = authDisabled ? "disabled" : "oauth", launch = Vitals.Launch, previous = heartbeat.PreviousSummary()
+            });
             Retention = new Retention(this);
             sweepLoop = Task.Run(() => Retention.RunAsync(sweeps.Token));
         }
-        catch
+        catch (Exception error)
         {
             // A start that fails here releases the state directory, so the next attempt in this process is not
             // refused by a lock this one still holds.
-            try { Store?.Dispose(); }
+            try
+            {
+                heartbeat?.Abandon("the start failed: " + error.GetType().Name);
+                Store?.Dispose();
+            }
             finally { instanceLock.Dispose(); }
             throw;
         }
@@ -264,7 +278,8 @@ public sealed class CodexishRuntime : IDisposable
             // The thread pool keeps a caller's UI synchronization context from deadlocking the asynchronous disposal.
             Step(() => Task.Run(() => Browsers.DisposeAsync().AsTask()).GetAwaiter().GetResult());
             Step(() => { if (desktop.IsValueCreated) desktop.Value.Dispose(); });
-            Step(() => Store.Event("server_stop", null, new { }));
+            Step(Heartbeat.Dispose);
+            Step(() => Store.Event("server_stop", null, new { reason = Heartbeat.StopReason }));
         }
         finally
         {

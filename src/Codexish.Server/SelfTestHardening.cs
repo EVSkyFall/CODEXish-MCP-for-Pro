@@ -20,6 +20,8 @@ internal static class HardeningTests
         ConcurrentConfiguration(temp, password);
         InitWithoutRoot(temp, password);
         StateLock(temp, password);
+        await Heartbeat(temp);
+        await EndedWithItsJob(temp, password);
         await MalformedEntries(temp, password);
         DriveRoot(temp, password);
         await Secrets(temp, password);
@@ -233,6 +235,245 @@ internal static class HardeningTests
               !StateLockedException.IsSharingViolation(new FileNotFoundException("missing")) &&
               !StateLockedException.IsSharingViolation(new IOException("access", unchecked((int)0x80070005))),
             "only a sharing violation on the lock file counts as another CODEXish; other IO errors are left as they are");
+    }
+
+    // Opened the way any reader should open it, sharing delete, so the server's replace of the file never fails on it.
+    private static Vitals.Record? Alive(string file)
+    {
+        for (int attempt = 0; ; attempt++)
+        {
+            try
+            {
+                using var stream = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                return JsonSerializer.Deserialize<Vitals.Record>(stream);
+            }
+            catch (FileNotFoundException) { return null; }
+            catch (Exception error) when (error is IOException or JsonException && attempt < 20) { Thread.Sleep(10); }
+            catch (Exception error) when (error is IOException or JsonException) { return null; }
+        }
+    }
+
+    private static string Local(DateTimeOffset at) => at.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss zzz", System.Globalization.CultureInfo.InvariantCulture);
+
+    // On 2026-10-25 a server started from a Claude Code shell was ended together with that app's job and left no trace.
+    // The heartbeat in state_dir is what the next start reads.
+    private static async Task Heartbeat(string temp)
+    {
+        string directory = Path.Combine(temp, "heartbeat");
+        Directory.CreateDirectory(directory);
+        string file = Path.Combine(directory, Vitals.FileName);
+        using (var first = Vitals.Begin(directory, interval: TimeSpan.FromMilliseconds(50)))
+        {
+            var written = Alive(file)!;
+            Check(first.Previous is null && first.PreviousEnd is null && first.PreviousUnreadable is null && written.Pid == Environment.ProcessId &&
+                  written.Version == CodexishRuntime.ServerVersion && written.Launch == Vitals.Launch && written.Stopped is null && written.Alive >= written.Started,
+                "a first start finds no heartbeat and writes its own: pid, version, how it was started, when it was alive, not stopped");
+            var before = written.Alive;
+            bool advanced = false;
+            for (int attempt = 0; attempt < 1500 && !advanced; attempt++)
+            {
+                advanced = Alive(file)?.Alive > before;
+                if (!advanced) await Task.Delay(20);
+            }
+            Check(advanced, "the heartbeat advances while the server runs");
+        }
+        Check(Alive(file)?.Stopped == Vitals.CleanStop, "a disposal records a clean stop");
+        using (var second = Vitals.Begin(directory))
+            Check(second.Previous?.Stopped == Vitals.CleanStop && second.PreviousEnd is null, "a clean previous stop is not a warning");
+
+        var at = new DateTimeOffset(2026, 10, 25, 11, 20, 17, TimeSpan.Zero);
+        void Previous(string? stopped) => File.WriteAllText(file, JsonSerializer.Serialize(new Vitals.Record
+        {
+            Pid = 4242, Version = "1.0.1", Started = at.AddHours(-16), Alive = at, Launch = "by pwsh.exe 11 <- claude.exe 12, inside a job object", Stopped = stopped
+        }));
+        Previous(null);
+        using (var third = Vitals.Begin(directory))
+        {
+            string? warning = third.PreviousEnd;
+            Check(warning is not null && warning.Contains("pid 4242, version 1.0.1", StringComparison.Ordinal) &&
+                  warning.Contains("ended without stopping; its heartbeat stopped at " + Local(at), StringComparison.Ordinal) &&
+                  warning.EndsWith("It had been started by pwsh.exe 11 <- claude.exe 12, inside a job object.", StringComparison.Ordinal),
+                "a heartbeat that stopped without a stop is reported with the pid, the last time it was alive and how that server had been started");
+        }
+        Previous("crashed: InvalidOperationException: boom");
+        using (var fourth = Vitals.Begin(directory))
+            Check(fourth.PreviousEnd?.Contains("crashed: InvalidOperationException: boom at " + Local(at), StringComparison.Ordinal) == true,
+                "a recorded crash is reported with its exception and time");
+        Previous("Windows signed the user out");
+        using (var fifth = Vitals.Begin(directory))
+            Check(fifth.PreviousEnd is null && fifth.Previous?.Stopped == "Windows signed the user out", "the end of the Windows session is a stop, not a warning");
+        File.WriteAllText(file, "{ not json");
+        using (var sixth = Vitals.Begin(directory))
+            Check(sixth.Previous is null && sixth.PreviousUnreadable?.StartsWith("alive.json in state_dir could not be read (JsonException", StringComparison.Ordinal) == true &&
+                  Alive(file)?.Pid == Environment.ProcessId,
+                "an unreadable heartbeat is reported and replaced, never fatal");
+        File.WriteAllText(file, "{ not json");
+        using (var unreadableFailed = Vitals.Begin(directory))
+        {
+            unreadableFailed.Abandon("the start failed: IOException");
+            Check(File.ReadAllText(file) == "{ not json", "a failed start puts back an unreadable heartbeat byte for byte, so the start that succeeds reports it");
+        }
+        File.WriteAllText(file, """{"pid":7,"stopped":null,"written_by_a_later_version":{"x":[1,2]}}""");
+        using (var seventh = Vitals.Begin(directory))
+            Check(seventh.Previous?.Pid == 7 && seventh.PreviousEnd?.Contains("version unknown", StringComparison.Ordinal) == true &&
+                  seventh.PreviousEnd.Contains("an unknown time", StringComparison.Ordinal),
+                "fields a later version adds are ignored and missing ones are reported as unknown");
+        var eighth = Vitals.Begin(directory);
+        eighth.End("crashed: test");
+        eighth.Dispose();
+        Check(Alive(file)?.Stopped == "crashed: test" && eighth.StopReason == "crashed: test",
+            "the first recorded reason is kept, in the file and in StopReason; the disposal that may still follow does not overwrite it");
+        using (var ninth = Vitals.Begin(directory))
+        {
+            Vitals.EndAll("Windows shut down or restarted");
+            Check(Alive(file)?.Stopped == "Windows shut down or restarted" && ninth.StopReason == "Windows shut down or restarted",
+                "the end of the Windows session is written at once for every running server");
+        }
+        File.WriteAllText(file, JsonSerializer.Serialize(new Vitals.Record { Pid = Environment.ProcessId, Started = DateTimeOffset.UtcNow, Alive = DateTimeOffset.UtcNow }));
+        using (var tenth = Vitals.Begin(directory))
+            Check(tenth.Previous?.Pid == Environment.ProcessId && tenth.PreviousEnd is null,
+                "an earlier server in this very process whose stop was not written is not reported as ended from outside");
+
+        Previous(null);
+        using (var failed = Vitals.Begin(directory))
+        {
+            failed.Abandon("the start failed: IOException");
+            Check(Alive(file) is { Pid: 4242, Stopped: null } && failed.StopReason == "the start failed: IOException",
+                "a start that never completed puts back the record it found");
+        }
+        using (var retried = Vitals.Begin(directory))
+            Check(retried.PreviousEnd?.Contains("pid 4242", StringComparison.Ordinal) == true, "so the start that succeeds still reports the earlier server's end");
+        File.Delete(file);
+        using (var firstEver = Vitals.Begin(directory))
+        {
+            firstEver.Abandon("the start failed: IOException");
+            Check(Alive(file) is { Stopped: "the start failed: IOException" } own && own.Pid == Environment.ProcessId && firstEver.PreviousEnd is null,
+                "with nothing to put back, a failed start records itself as failed, which is no warning");
+        }
+
+        const string asked = @"C:\Users\u\AppData\Local\Codexish\instance.lock";
+        const string cached = @"C:\Users\u\AppData\Local\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Local\Codexish\instance.lock";
+        Check(Vitals.Redirection(asked, cached) == ("Claude_pzs8sxrjxfjjc", @"C:\Users\u\AppData\Local\Packages\Claude_pzs8sxrjxfjjc\LocalCache\Local\Codexish") &&
+              Vitals.Redirection(asked.ToUpperInvariant(), @"\\?\" + cached)?.Package == "Claude_pzs8sxrjxfjjc" &&
+              Vitals.Redirection(@"C:\Users\u\AppData\Roaming\Codexish\instance.lock",
+                  @"C:\Users\u\AppData\Local\Packages\Some.App_1\LocalCache\Roaming\Codexish\instance.lock")?.Package == "Some.App_1",
+            "a state file under AppData that opens at the matching place in a package's LocalCache is recognized as redirected by that package");
+        Check(Vitals.Redirection(asked, asked) is null && Vitals.Redirection(cached, cached) is null &&
+              Vitals.Redirection(@"C:\Users\u\AppData\Local\Packages\CLAUDE~1\LocalCache\Local\Codexish\instance.lock", cached) is null &&
+              Vitals.Redirection(@"D:\CodexishState\instance.lock", cached) is null &&
+              Vitals.Redirection(asked, @"D:\Elsewhere\Codexish\instance.lock") is null &&
+              Vitals.Redirection(asked, @"C:\Users\u\AppData\Local\Packages\Some.App\Codexish\instance.lock") is null &&
+              Vitals.Redirection(asked, @"C:\Users\u\AppData\Local\Packages\Some.App\LocalCache\Local\Other\instance.lock") is null,
+            "the same path, a package folder named directly or by its 8.3 name, a junction elsewhere, a package folder outside LocalCache " +
+            "and a LocalCache path that does not match are not redirections");
+
+        // A junction placed exactly where the package's view would be explains the final path itself, so it is not one.
+        string real = Path.Combine(directory, "real"), linked = Path.Combine(directory, "linked");
+        Directory.CreateDirectory(real);
+        // The temporary folder may itself sit below a junction on some machines; then everything in it rightly is linked.
+        Check(Vitals.ThroughLink(Path.Combine(real, "state")) == Vitals.ThroughLink(directory),
+            "a plain folder is reached through a link only when the folder it sits in is");
+        if (OperatingSystem.IsWindows())
+        {
+            var link = new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "cmd.exe"))
+            {
+                UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true
+            };
+            foreach (string argument in new[] { "/c", "mklink", "/J", linked, real }) link.ArgumentList.Add(argument);
+            using (var mklink = Process.Start(link)!)
+            {
+                mklink.StandardOutput.ReadToEnd();
+                mklink.StandardError.ReadToEnd();
+                mklink.WaitForExit();
+            }
+            if (Directory.Exists(linked))
+            {
+                Check(Vitals.ThroughLink(Path.Combine(linked, "state")) && Vitals.ThroughLink(linked),
+                    "a state_dir reached through a junction is recognized as linked, so its final path is never taken for a package's view");
+                Directory.Delete(linked);
+            }
+            else Skip("junction: mklink /J could not create a junction here");
+        }
+    }
+
+    // The 2026-10-25 failure itself: a server inside a kill-on-close job that its starter closes. Nothing in the server
+    // runs; the next start on the same state_dir reports it.
+    private static async Task EndedWithItsJob(string temp, string password)
+    {
+        string directory = Path.Combine(temp, "ended-with-job");
+        Directory.CreateDirectory(directory);
+        string path = Path.Combine(directory, "codexish.json");
+        ServerConfig.Create("https://ended.test", password, [], [], 0, Path.Combine(directory, "state")).Save(path);
+        var config = ServerConfig.Load(path);
+        string file = Path.Combine(config.StateDir, Vitals.FileName);
+        using (var clean = new CodexishRuntime(config))
+            Check(Alive(file)?.Pid == Environment.ProcessId && !clean.Warnings.Any(w => w.Contains("previous CODEXish", StringComparison.Ordinal)) &&
+                  clean.Store.Events("server_start").Last().Json!.Contains("\"launch\":", StringComparison.Ordinal),
+                "a runtime writes the heartbeat once it holds the state, and its server_start event records how it was started");
+        using (var again = new CodexishRuntime(config))
+            Check(!again.Warnings.Any(w => w.Contains("previous CODEXish", StringComparison.Ordinal)) &&
+                  again.Store.Events("server_stop").Last().Json!.Contains(Vitals.CleanStop, StringComparison.Ordinal),
+                "a server that stopped cleanly gives the next one nothing to report, and its server_stop event says how it stopped");
+
+        string exe = Environment.ProcessPath!;
+        var start = new ProcessStartInfo(exe) { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
+        if (Path.GetFileNameWithoutExtension(exe).Equals("dotnet", StringComparison.OrdinalIgnoreCase))
+            start.ArgumentList.Add(typeof(HardeningTests).Assembly.Location);
+        foreach (string argument in new[] { "--config", path }) start.ArgumentList.Add(argument);
+        nint job = Native.CreateKillOnCloseJob();
+        Process? child = null;
+        Task<string> output = Task.FromResult(""), error = Task.FromResult("");
+        bool inJob = false;
+        string? childLaunch;
+        int childId;
+        try
+        {
+            child = Process.Start(start)!;
+            childId = child.Id;
+            output = child.StandardOutput.ReadToEndAsync();
+            error = child.StandardError.ReadToEndAsync();
+            inJob = Native.AssignProcess(job, child.Handle);
+            // Until its heartbeat names it or it exits on its own, within the same generous bound the other child checks use.
+            for (int attempt = 0; attempt < 1200 && Alive(file)?.Pid != childId && !child.HasExited; attempt++) await Task.Delay(50);
+            if (child.HasExited) throw new InvalidOperationException($"the child server exited with code {child.ExitCode} before it held the state: {await error}");
+            childLaunch = Alive(file)?.Launch;
+            Check(Alive(file)?.Pid == childId && childLaunch is { Length: > 0 }, "the child server runs and its heartbeat names it and how it was started");
+        }
+        finally
+        {
+            // The job's last handle ends the child with it, the way Claude Desktop ended its sessions' jobs; where there is
+            // no job the child is killed, and on a failed check it is ended all the same.
+            Native.CloseJob(job);
+            if (child is not null)
+            {
+                if (!(OperatingSystem.IsWindows() && inJob))
+                    try { child.Kill(entireProcessTree: true); }
+                    catch (Exception gone) when (gone is InvalidOperationException or System.ComponentModel.Win32Exception) { }
+                await child.WaitForExitAsync();
+                await Task.WhenAll(output, error);
+                child.Dispose();
+            }
+        }
+        using (var after = new CodexishRuntime(config))
+        {
+            string? warning = after.Warnings.FirstOrDefault(w => w.Contains("previous CODEXish", StringComparison.Ordinal));
+            Check(warning is not null && warning.Contains($"(pid {childId}, version {CodexishRuntime.ServerVersion}", StringComparison.Ordinal) &&
+                  warning.Contains("ended without stopping; its heartbeat stopped at ", StringComparison.Ordinal) &&
+                  warning.EndsWith($"It had been started {childLaunch}.", StringComparison.Ordinal) &&
+                  after.Store.Events("server_start").Last().Json!.Contains($"\"pid\":{childId}", StringComparison.Ordinal),
+                OperatingSystem.IsWindows() && inJob
+                    ? "a server ended by closing the kill-on-close job it ran in is reported by the next start with its pid, its last heartbeat and how it had been started"
+                    : "a server killed from outside is reported by the next start with its pid, its last heartbeat and how it had been started");
+            Vitals.EndAll("Windows signed the user out");
+        }
+        using (var next = new CodexishRuntime(config))
+            Check(next.Store.Events("server_stop").Last().Json!.Contains("Windows signed the user out", StringComparison.Ordinal) &&
+                  !next.Warnings.Any(w => w.Contains("previous CODEXish", StringComparison.Ordinal)),
+                "the end of the Windows session reaches the ledger's server_stop event too, and is no warning at the next start");
+        File.WriteAllText(file, "{ not json");
+        using (var unreadable = new CodexishRuntime(config))
+            Check(unreadable.Warnings.Any(w => w.StartsWith("alive.json in state_dir could not be read (JsonException", StringComparison.Ordinal)),
+                "an unreadable heartbeat reaches the runtime's warnings, so host_capabilities and the connection log show it");
     }
 
     // C1 and C2: recovery never overwrites a file another writer saved in between, and an unreadable copy never
@@ -716,6 +957,8 @@ internal static class HardeningTests
         string keptBackup = Aged(Path.Combine(state, "backups", Guid.NewGuid().ToString("N") + ".bak"), 40);
         string oldLog = Aged(Path.Combine(state, "logs", $"tray-{Day(40)}.log"), 40);
         string todayLog = Aged(Path.Combine(state, "logs", $"tray-{Day(0)}.log"), 0);
+        string oldKeeperLog = Aged(Path.Combine(state, "logs", $"keeper-{Day(40)}.log"), 40);
+        string todayKeeperLog = Aged(Path.Combine(state, "logs", $"keeper-{Day(0)}.log"), 0);
         string profile = Aged(Path.Combine(state, "browser-profiles", "pw", "Preferences"), 400);
         string quarantine = Touch(Path.Combine(state, "ledger.corrupt-" + ServerConfig.UtcStamp(now.AddDays(-100)) + ".db"));
         string brokenOld = Touch(config.SourcePath + ".broken-" + ServerConfig.UtcStamp(now.AddDays(-100)));
@@ -734,6 +977,7 @@ internal static class HardeningTests
             (runtime.Artifacts.Directory, "art_" + hex + ".bin.txt"), (runtime.Artifacts.Directory, "ART_" + hex.ToUpperInvariant() + ".bin"),
             (runtime.Artifacts.Directory, "art_notes.bin"), (Path.Combine(state, "backups"), "notes-" + hex + ".bak"),
             (Path.Combine(state, "logs"), "tray-2020.log"), (Path.Combine(state, "logs"), "tray-20200101.log.txt"),
+            (Path.Combine(state, "logs"), "keeper-2020.log"), (Path.Combine(state, "logs"), "keepers-20200101.log"),
             (state, "ledger.corrupt-notes.db"), (state, "ledger.corrupt-" + ancient + ".db.txt"),
             (configDirectory, "codexish.json.broken-notes"), (configDirectory, "other.json.broken-" + ancient)
         })
@@ -764,13 +1008,14 @@ internal static class HardeningTests
             "old unreferenced artifacts and orphaned artifact files are removed, recent ones stay");
         Check(store.Artifact(absentId) is null, "an old artifact row whose file is already gone is removed");
         Check(!File.Exists(oldBackup) && File.Exists(keptBackup) && !File.Exists(oldLog) && File.Exists(todayLog) && File.Exists(profile) &&
+              !File.Exists(oldKeeperLog) && File.Exists(todayKeeperLog) &&
               !File.Exists(quarantine) && !File.Exists(brokenOld) && File.Exists(brokenNew),
-            "backups, quarantined ledgers and unreadable configuration copies go after backup_days, tray logs after output_days, and browser profiles stay");
+            "backups, quarantined ledgers and unreadable configuration copies go after backup_days, tray and keeper logs after output_days, and browser profiles stay");
         Check(foreign.All(File.Exists) && Directory.Exists(lookalike) && store.Artifact("x") is not null,
             "files CODEXish did not name survive in every folder the sweep reads, as do a directory named like a tray log and a row whose id CODEXish never issues");
         var described = Data(tools.HostCapabilities()).GetProperty("retention");
         Check(described.GetProperty("output_days").GetInt32() == 30 && described.GetProperty("backup_days").GetInt32() == 90 &&
-              described.GetProperty("last_sweep").GetProperty("files").GetInt32() == report.Files && report.Files == 7 && report.Bytes > 0,
+              described.GetProperty("last_sweep").GetProperty("files").GetInt32() == report.Files && report.Files == 8 && report.Bytes > 0,
             "host_capabilities reports the retention settings and the last sweep, which removed exactly the seven expired CODEXish files");
 
         // R2: a file that cannot be removed keeps its row, so the next sweep tries again. Only Windows refuses to delete

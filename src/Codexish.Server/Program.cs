@@ -38,16 +38,24 @@ if (args.Contains("--self-test"))
     result = await DesktopTests.Run();
     return result == 0 ? await DesktopRegressionTests.Run() : result;
 }
+// Explicit live acceptance: it registers, runs and deletes a temporary Task Scheduler task of its own.
+if (args.Contains("--keeper-live-test")) return await KeeperLiveTests.Run();
 
 string? Option(string name) => CommandLine.Values(args, name).FirstOrDefault();
 bool noAuth = args.Contains("--no-auth");
 string configPath;
 TrayOptions? tray = null;
 ServerConfig? loaded = null;
+// The windowless starter has no console to run anything else in, so started at all it is the keeper.
+bool starter = string.Equals(Path.GetFileName(Environment.ProcessPath), TrayKeeper.StarterName, StringComparison.OrdinalIgnoreCase);
 // Only parsing, --init and loading are covered: the tray and the running server keep their own error handling.
 try
 {
     configPath = Option("--config") ?? ServerConfig.DefaultPath;
+    if (args.Contains("--stop")) return TrayKeeper.Stop(configPath, Console.Out);
+    if (starter && !args.Contains(TrayKeeper.KeepMarker)) return TrayKeeper.StartByHand(configPath, stub: args.Contains("--keeper-stub"));
+    if (starter || args.Contains(TrayKeeper.KeepMarker)) return TrayKeeper.Run(configPath, stub: args.Contains("--keeper-stub"));
+    if (args.Contains("--keeper-stub-child")) return TrayKeeper.StubChild(configPath);
     if (args.Contains("--tray")) tray = TrayOptions.Parse(args);
     else if (args.Contains("--init")) return CommandLine.Init(args, configPath, Console.Out);
     else
@@ -65,8 +73,20 @@ CodexishRuntime opened;
 try { opened = new CodexishRuntime(config, noAuth); }
 catch (StateLockedException error) { return CommandLine.Refuse(error, Console.Error); }
 using var runtime = opened;
-// Browser mounts connect in the background once the listener is up, so none of them can delay or stop the server.
-var app = CodexishHost.Build(runtime, config.Port, instructions: !args.Contains("--no-instructions"));
+WebApplication app;
+CancellationToken started;
+try
+{
+    // Browser mounts connect in the background once the listener is up, so none of them can delay or stop the server.
+    app = CodexishHost.Build(runtime, config.Port, instructions: !args.Contains("--no-instructions"));
+    // Read now: RunAsync disposes the host before a failure reaches the handler below.
+    started = app.Lifetime.ApplicationStarted;
+}
+catch (Exception error)
+{
+    runtime.Heartbeat.Abandon("the start failed: " + error.GetType().Name);
+    throw;
+}
 Console.WriteLine($"""
     CODEXish v1 (coding core, desktop, browser mounts)
       MCP           http://127.0.0.1:{config.Port}/mcp  (published as {config.PublicUrl}/mcp)
@@ -79,7 +99,14 @@ Console.WriteLine($"""
     Commands run as this Windows user: there is no sandbox. Ctrl+C stops the server.
     """);
 foreach (string warning in runtime.Warnings) Console.WriteLine("WARNING: " + warning);
-await app.RunAsync();
+try { await app.RunAsync(); }
+catch (Exception error)
+{
+    // A host that never started leaves the heartbeat as it found it for the next start; one that ran records the crash.
+    if (started.IsCancellationRequested) runtime.Heartbeat.End(Vitals.Crashed(error));
+    else runtime.Heartbeat.Abandon("the start failed: " + error.GetType().Name);
+    throw;
+}
 return 0;
 
 namespace Codexish.Server

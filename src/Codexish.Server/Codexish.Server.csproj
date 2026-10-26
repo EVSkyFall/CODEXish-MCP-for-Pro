@@ -32,4 +32,48 @@
   <ItemGroup Condition="$([MSBuild]::IsOSPlatform('Windows'))">
     <EmbeddedResource Include="..\..\assets\generated\*.ico;..\..\assets\generated\glyphs-*.png;..\..\assets\generated\glyphs.txt" LogicalName="Codexish.Assets.%(Filename)%(Extension)" />
   </ItemGroup>
+
+  <!-- Codexish.Start.exe is this program's own executable marked as a Windows (GUI) program, which is all the SDK changes
+       for WinExe: Task Scheduler starts it without opening a console window. It is written next to Codexish.Server.exe
+       after the build copies its output and after publish. A copy that cannot be written is a warning, never a failed
+       build; without it, Start with Windows falls back to the Startup-folder shortcut. -->
+  <UsingTask TaskName="CodexishWindowsSubsystemCopy" TaskFactory="RoslynCodeTaskFactory" AssemblyFile="$(MSBuildToolsPath)\Microsoft.Build.Tasks.Core.dll">
+    <ParameterGroup>
+      <Source ParameterType="System.String" Required="true" />
+      <Destination ParameterType="System.String" Required="true" />
+    </ParameterGroup>
+    <Task>
+      <Code Type="Fragment" Language="cs"><![CDATA[
+        try
+        {
+            byte[] image = System.IO.File.ReadAllBytes(Source);
+            int header = image.Length > 0x40 ? System.BitConverter.ToInt32(image, 0x3C) : -1;
+            // PE signature, 20-byte COFF header, then the optional header, whose Subsystem field is at offset 68 in PE32 and PE32+.
+            int subsystem = header + 4 + 20 + 68;
+            if (header < 0 || subsystem + 2 > image.Length || image[header] != (byte)'P' || image[header + 1] != (byte)'E' || image[header + 2] != 0 || image[header + 3] != 0)
+                Log.LogWarning("CODEXish: " + Source + " is not a PE executable; " + Destination + " was not written.");
+            else
+            {
+                image[subsystem] = 2;
+                image[subsystem + 1] = 0;
+                System.IO.File.WriteAllBytes(Destination, image);
+            }
+        }
+        catch (System.Exception error)
+        {
+            Log.LogWarning("CODEXish: " + Destination + " was not written: " + error.GetType().Name + ": " + error.Message);
+        }
+      ]]></Code>
+    </Task>
+  </UsingTask>
+  <Target Name="CodexishStarter" AfterTargets="CopyFilesToOutputDirectory" Condition="$([MSBuild]::IsOSPlatform('Windows')) and Exists('$(TargetDir)$(AssemblyName).exe')"
+          Inputs="$(TargetDir)$(AssemblyName).exe" Outputs="$(TargetDir)Codexish.Start.exe">
+    <CodexishWindowsSubsystemCopy Source="$(TargetDir)$(AssemblyName).exe" Destination="$(TargetDir)Codexish.Start.exe" />
+    <ItemGroup>
+      <FileWrites Include="$(TargetDir)Codexish.Start.exe" />
+    </ItemGroup>
+  </Target>
+  <Target Name="CodexishStarterPublish" AfterTargets="Publish" Condition="$([MSBuild]::IsOSPlatform('Windows')) and Exists('$(PublishDir)$(AssemblyName).exe')">
+    <CodexishWindowsSubsystemCopy Source="$(PublishDir)$(AssemblyName).exe" Destination="$(PublishDir)Codexish.Start.exe" />
+  </Target>
 </Project>
