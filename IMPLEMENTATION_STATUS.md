@@ -421,7 +421,7 @@ here touched the installed app, its state folder, the Startup folder, port 38451
 ## Stay-up pass 2: CODEXish starts itself again, outside whatever started it (2026-10-26)
 
 Branch `feat/stay-up`, on pass 1 (bb0f193). The owner chose option A of the design note: a per-user Task Scheduler
-task with a windowless starter. Installing it is a separate owner decision; nothing here touched the installed app.
+task with a windowless starter. Installing it was a separate owner decision (see the end of this section).
 The installed state had already been moved out of Claude Desktop's package folder by then: checked from a process
 outside the package at 04:11 KST, `%LOCALAPPDATA%\Codexish` held the configuration and the ledger and the package copy
 was gone, and the v1.0.1 tray started at 03:17 served on 38451.
@@ -466,6 +466,23 @@ task match; schema order in the logon trigger; the live test's process ownership
 `TrayInstance.TryAcquire` (its tests need a second acquisition on the same thread to fail, and the window it closes
 is a few instructions long).
 
+CI on the pushed commit 076c475: all four checks passed, Windows and Ubuntu.
+
+Installed on the owner's PC at 19:47 KST with the owner's approval, from 076c475 (`1.0.2+076c475`), by
+`G:\Antigravity\ToolDev\codexish-install.ps1`, changed the same day: an install with `Codexish.Start.exe` is stopped
+with its own `--stop` inside the copy process that runs outside the Claude package (so the stop mark lands in the real
+folder), robocopy retries 60 times, the script waits for that process to end instead of a five-minute deadline, and
+CODEXish is started by opening `Codexish.Start.exe --config` through Explorer. Before it ran: no CODEXish call since
+19:01 KST, no process running for one, and the only ChatGPT Pro request then running was a web search that does not
+use CODEXish. What the installed copy then did, on the real task, configuration and port 38451:
+
+| Check | Result |
+| --- | --- |
+| First start (from v1.0.1, through Explorer) | Keeper `Codexish.Start.exe <- explorer.exe`, tray its child, serving on 38451; the tray turned the Startup shortcut into `\CODEXish` ("written … because Start with Windows was the Startup-folder shortcut …") and the shortcut is gone. Task: action `Codexish.Start.exe --keep --config "…\codexish.json"`, LogonTrigger and RegistrationTrigger every PT1M, no time limit, priority 5, IgnoreNew, Interactive, Limited. |
+| `--stop` from outside the package | Returned in 2.5 s ("CODEXish stopped; …"), no CODEXish process left. The task then ran at 19:49:15 and 19:50:15 (result 0) and nothing stayed running, so the mark held. |
+| `Codexish.Start.exe` opened through Explorer | Handed the start to the task: keeper `--keep` under `svchost.exe <- services.exe`, tray its child, serving after 2.6 s, stop mark gone. |
+| Tray killed with `Stop-Process` | Serving again after 4.3 s from a new tray started by the same keeper. Keeper log: "The tray (pid 98136) exited with code -1 after 00:00:21 without Exit. It starts again in 1 s"; tray log: "Started again by the keeper: …" and the pass-1 warning "The previous CODEXish … ended without stopping". |
+
 Not run and not claimed: a real sign-out and sign-in (the LogonTrigger), an elevated `--stop`, the tray UI with the
-task (Exit, the switch, the menu), the install script, ChatGPT, CI, a Linux run. Nothing here touched the installed
-app, its task (none exists), its state folder, the Startup folder, port 38451 or the running server.
+task (Exit, the switch, the menu), ChatGPT through the tunnel after the restart, a Claude restart or account switch
+with this install.
