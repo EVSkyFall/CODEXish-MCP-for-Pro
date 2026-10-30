@@ -277,7 +277,7 @@ public sealed class ServerConfig
         }
         if (copied) stream.WriteByte((byte)',');
         stream.Write("\n  \"roots\": "u8);
-        string formattedRoots = JsonSerializer.Serialize(roots, Format).Replace("\n", "\n  ", StringComparison.Ordinal);
+        string formattedRoots = JsonSerializer.Serialize(roots, new JsonSerializerOptions(Format) { NewLine = "\n" }).Replace("\n", "\n  ", StringComparison.Ordinal);
         stream.Write(Encoding.UTF8.GetBytes(formattedRoots));
         stream.Write("\n}\n"u8);
         return stream.ToArray();
