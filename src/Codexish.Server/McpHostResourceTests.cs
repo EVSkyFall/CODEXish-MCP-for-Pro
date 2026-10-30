@@ -105,6 +105,9 @@ public static class McpHostResourceTests
                 var malformed = await Call("mcp_resource_read", new { server = "mcp:browser:foo", uri = "fixture:malformed" });
                 var unknown = await Call("mcp_resource_read", new { server = "mcp:browser:foo", uri = "fixture:unknown" });
                 check(Reply.CodeOf(malformed) == "MCP_BACKEND_ERROR" && target.State == "connected" && target.ProcessId == pid, "malformed resource result is backend error without session restart");
+                var malformedError = malformed.StructuredContent!.Value.GetProperty("error");
+                check(malformedError.GetProperty("message").GetString() == "MCP server 'browser:foo' sent an answer CODEXish could not read; check the state the tool acts on before another action." && malformedError.GetProperty("side_effects").GetString() == "none" && malformedError.GetProperty("details").GetProperty("provider_error").GetString() == "Resource result contents must be an array." && !malformedError.GetProperty("details").TryGetProperty("protocol_error", out _),
+                    "unreadable resource answer uses exact A.7 message and provider_error, not protocol_error");
                 check(Reply.CodeOf(unknown) is null && unknown.Content.OfType<TextContentBlock>().Any(t => t.Text.Contains("future-resource") && !t.Text.Contains(Secret)) && unknown.Content.OfType<EmbeddedResourceBlock>().Any(b => b.Resource is TextResourceContents t && t.Text == "still present"), "unknown resource block degrades to redacted text while valid blocks survive");
                 await Until(() => runtime.Mounts.ResourceTargets.OfType<McpMount>().Any(m => m.Identity == "reconnect" && m.State == "connected"));
                 var reconnect = runtime.Mounts.ResourceTargets.OfType<McpMount>().Single(m => m.Identity == "reconnect");

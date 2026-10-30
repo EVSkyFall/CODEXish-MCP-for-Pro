@@ -42,6 +42,7 @@ public static class McpHttpTests
             })
             .WithCallToolHandler(async (request, cancellation) =>
             {
+                if (request.Params!.Name == "ping_change") File.WriteAllText(Path.Combine(directory, "changing-ping-received"), "yes");
                 if (request.Params!.Name == "remove_queued")
                 {
                     vanished = true;
@@ -80,7 +81,7 @@ public static class McpHttpTests
                         if (name is "malformed" or "malformed_change" or "unknown")
                         {
                             context.Response.ContentType = "application/json";
-                            object result = name == "unknown" ? new { content = (object)new object[] { new { type = "text", text = "known" }, new { type = "future-block", value = "fixture-raw-future" } } }
+                            object result = name == "unknown" ? new { content = (object)new object[] { new { type = "text", text = "known" }, new { type = "future-block", value = "fixture-bearer-value" } } }
                                 : new { content = (object)"not-an-array" };
                             await context.Response.WriteAsJsonAsync(new { jsonrpc = "2.0", id = body.RootElement.GetProperty("id").Clone(), result });
                             return;
@@ -157,7 +158,7 @@ public static class McpHttpTests
             check(headers.GetProperty("configured").GetBoolean() && headers.GetProperty("environment").GetBoolean() && headers.GetProperty("bearer").GetBoolean(), mode + " configured, environment and bearer headers reach fixture");
             Environment.SetEnvironmentVariable("CODEXISH_HTTP_FIXTURE_BEARER", null);
             Redaction.RefreshEnvironment();
-            File.WriteAllText(Path.Combine(directory, "redaction.txt"), "false 1 application/json Bearer fixture-bearer-value");
+            File.WriteAllText(Path.Combine(directory, "redaction.txt"), "false 1 application/json fixture-bearer-value");
             var read = await client.CallToolAsync(new CallToolRequestParams { Name = "fs_read", Arguments = new Dictionary<string,JsonElement> {
                 ["root_id"] = JsonSerializer.SerializeToElement("test"), ["path"] = JsonSerializer.SerializeToElement("redaction.txt") } });
             string readJson = read.StructuredContent!.Value.GetRawText();
@@ -165,6 +166,34 @@ public static class McpHttpTests
             Environment.SetEnvironmentVariable("CODEXISH_HTTP_FIXTURE_BEARER", "fixture-bearer-value");
             check(listed.Single(t => t.Name == "mcp_httpfixture_dup_schema").Description!.StartsWith("dup_schema") &&
                 Reply.CodeOf(await Call("dup_schema", true)) is null, mode + " duplicate-key backend schema publishes and calls with any-object fallback; empty description uses backend name");
+            // A real SDK client is ended independently, then installed under the mount lock so
+            // supervision cannot race the actual dispatch method's completed-session check.
+            // Reflection is confined to this regression; production has no test gate.
+            await using var endedTransport = new HttpClientTransport(new() { Endpoint = new Uri(address + "/mcp") });
+            var endedClient = await McpClient.CreateAsync(endedTransport,
+                new McpClientOptions { ProtocolVersion = "2025-11-25", InitializationTimeout = Timeout.InfiniteTimeSpan });
+            await endedClient.DisposeAsync();
+            var sync = typeof(McpMount).GetField("sync", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(target)!;
+            lock (sync)
+            {
+                var session = typeof(McpMount).GetField("session", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(target)!;
+                var field = session.GetType().GetField("Client")!;
+                var original = field.GetValue(session);
+                try
+                {
+                    field.SetValue(session, endedClient);
+                    var tool = runtime.Mounts.Find("mcp_httpfixture_ping_change")!;
+                    var execute = tool.GetType().GetMethod("Execute", BindingFlags.Instance | BindingFlags.NonPublic)!;
+                    var completedResult = ((Task<CallToolResult>)execute.Invoke(tool, [JsonSerializer.SerializeToElement(new { }), CancellationToken.None])!).GetAwaiter().GetResult();
+                    check(endedClient.Completion.IsCompleted && Reply.CodeOf(completedResult) == "MCP_UNAVAILABLE" && Effects(completedResult) == "none" && target.State == "retrying" &&
+                        !File.Exists(Path.Combine(directory, "changing-ping-received")), mode + " completed client before changing dispatch returns unavailable none, sends nothing and requests reconnect");
+                    check(McpResultDecoder.IsTransportLoss(new InvalidOperationException("synthetic not-connected failure"), endedClient.Completion.IsCompleted),
+                        mode + " completed session makes a non-transport exception transport loss by state, not message");
+                }
+                finally { field.SetValue(session, original); }
+            }
+            await Until(() => target.State == "connected", "completed-client reconnect");
+            check(Reply.CodeOf(await Call("ping")) is null, mode + " completed client reconnect restores calls");
             int attempts = target.Attempts;
             using (var lease = target.AcquireResourceLease())
             {
@@ -174,9 +203,15 @@ public static class McpHttpTests
                 check(Reply.CodeOf(malformed) == "MCP_BACKEND_ERROR" && Effects(malformed) == "none" && Reply.CodeOf(malformedChange) == "MCP_BACKEND_ERROR" && Effects(malformedChange) == "unknown" &&
                     ReferenceEquals(lease.Client, after.Client) && target.State == "connected" && target.Attempts == attempts && !fixture.HasExited,
                     mode + " malformed result is per-call backend error with unchanged session and fixture pid");
+                const string unreadable = "MCP server 'httpfixture' sent an answer CODEXish could not read; check the state the tool acts on before another action.";
+                check(new[] { malformed, malformedChange }.All(result => result.StructuredContent!.Value.GetProperty("error").GetProperty("message").GetString() == unreadable &&
+                    result.StructuredContent.Value.GetProperty("error").GetProperty("details").TryGetProperty("provider_error", out _)),
+                    mode + " unreadable answers use exact A.7 text and provider_error for read and changing calls");
             }
             var unknownBlock = await Call("unknown");
-            check(Reply.CodeOf(unknownBlock) is null && unknownBlock.StructuredContent!.Value.GetRawText().Contains("future-block") && unknownBlock.StructuredContent.Value.GetRawText().Contains("known"),
+            var texts = unknownBlock.StructuredContent!.Value.GetProperty("data").GetProperty("text").EnumerateArray().Select(x => x.GetString()).ToArray();
+            check(Reply.CodeOf(unknownBlock) is null && texts.Length == 2 && texts[0] == "known" && texts[1]!.Contains("future-block") &&
+                texts[1]!.Contains("[REDACTED:environment_value]") && !unknownBlock.StructuredContent.Value.GetRawText().Contains("fixture-bearer-value"),
                 mode + " unknown content block degrades to redacted raw text while known blocks survive");
             if (mode == "stateful")
             {

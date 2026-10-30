@@ -99,6 +99,11 @@ public sealed class McpResources(Func<IReadOnlyList<IMcpResourceTarget>> targets
             using var listingLease = lease;
             if (lease.Client is not { } client)
                 return Clean(new { server = Address(target), identity = target.Identity, state = lease.State, next_retry = lease.NextRetry, reason = target.Unavailable().StructuredContent?.GetProperty("error") });
+            if (client.Completion.IsCompleted)
+            {
+                lease.TransportFailed(new InvalidOperationException("The MCP session completed before resource listing."));
+                return Clean(new { server = Address(target), identity = target.Identity, state = "error", reason = target.Unavailable().StructuredContent?.GetProperty("error") });
+            }
             if (client.ServerCapabilities.Resources is null) return Clean(new { server = Address(target), identity = target.Identity, state = "none", reason = "The server has no resources capability." });
             try
             {
@@ -120,7 +125,7 @@ public sealed class McpResources(Func<IReadOnlyList<IMcpResourceTarget>> targets
             }
             catch (Exception error)
             {
-                if (IsTransportFailure(error) && !lease.SessionCancellation.IsCancellationRequested) lease.TransportFailed(error);
+                if (IsTransportFailure(error, lease.Client) && !lease.SessionCancellation.IsCancellationRequested) lease.TransportFailed(error);
                 return Clean(new { server = Address(target), identity = target.Identity, state = "error", error = error.Message });
             }
         }
@@ -145,6 +150,11 @@ public sealed class McpResources(Func<IReadOnlyList<IMcpResourceTarget>> targets
         {
             lease = target.AcquireResourceLease();
             if (lease.Client is not { } client) return target.Unavailable();
+            if (client.Completion.IsCompleted)
+            {
+                lease.TransportFailed(new InvalidOperationException("The MCP session completed before resource dispatch."));
+                return target.Unavailable();
+            }
             var result = await client.SendRequestAsync<ReadResourceRequestParams, JsonElement>(RequestMethods.ResourcesRead,
                 new ReadResourceRequestParams { Uri = uri }, cancellationToken: cancellation).ConfigureAwait(false);
             if (result.ValueKind != JsonValueKind.Object || !result.TryGetProperty("contents", out var contents) || contents.ValueKind != JsonValueKind.Array)
@@ -171,12 +181,12 @@ public sealed class McpResources(Func<IReadOnlyList<IMcpResourceTarget>> targets
             return new CallToolResult { StructuredContent = envelope.StructuredContent, Content = [.. envelope.Content, .. blocks] };
         }
         catch (CodexishFault fault) { return Reply.Fault(fault); }
-        catch (McpProtocolException error)
+        catch (McpProtocolException error) when (lease?.Client?.Completion.IsCompleted != true)
         {
             return Reply.Error("MCP_BACKEND_ERROR", $"MCP server '{target.Identity}' answered the resource read with an error; read protocol_error and check the uri with mcp_resource_list.",
                 details: Clean(new { server = target.Identity, uri, protocol_error = error.Message }));
         }
-        catch (HttpRequestException error) when (error.StatusCode is { } status && status != HttpStatusCode.NotFound)
+        catch (HttpRequestException error) when (lease?.Client?.Completion.IsCompleted != true && error.StatusCode is { } status && status != HttpStatusCode.NotFound)
         {
             return Reply.Error("MCP_BACKEND_ERROR", $"MCP server '{target.Identity}' answered with HTTP status {(int)status}; check the state the tool acts on before another action.",
                 details: Clean(new { server = target.Identity, uri, http_status = (int)status }));
@@ -189,9 +199,9 @@ public sealed class McpResources(Func<IReadOnlyList<IMcpResourceTarget>> targets
         catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { return Reply.Error("CANCELLED", "Cancelled after the backend received the call; check the state the tool acts on before another action."); }
         catch (Exception error)
         {
-            if (!IsTransportFailure(error))
-                return Reply.Error("MCP_BACKEND_ERROR", $"MCP server '{target.Identity}' answered the resource read with an error; read protocol_error and check the uri with mcp_resource_list.",
-                    details: Clean(new { server = target.Identity, uri, protocol_error = error.Message }));
+            if (!IsTransportFailure(error, lease?.Client))
+                return Reply.Error("MCP_BACKEND_ERROR", $"MCP server '{target.Identity}' sent an answer CODEXish could not read; check the state the tool acts on before another action.",
+                    details: Clean(new { server = target.Identity, uri, provider_error = error.Message }));
             lease?.TransportFailed(error);
             return Reply.Error("MCP_UNAVAILABLE", "The MCP transport did not produce a confirmed result; do not replay an uncertain action.",
                 details: Clean(new { server = target.Identity, state = lease?.State, next_retry = lease?.NextRetry, provider_error = error.GetType().Name }),
@@ -200,8 +210,8 @@ public sealed class McpResources(Func<IReadOnlyList<IMcpResourceTarget>> targets
         finally { lease?.Dispose(); }
     }
 
-    private static bool IsTransportFailure(Exception error) => error is IOException or ObjectDisposedException or OperationCanceledException ||
-        error is HttpRequestException { StatusCode: null or HttpStatusCode.NotFound };
+    private static bool IsTransportFailure(Exception error, McpClient? client) =>
+        McpResultDecoder.IsTransportLoss(error, client?.Completion.IsCompleted == true);
     private static CallToolResult NotFound(string server) => Reply.Error("NOT_FOUND", $"No mounted server has identity '{Redaction.Apply(server).Text}'; see host_capabilities.");
     internal static JsonElement Clean(object value)
     {

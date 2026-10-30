@@ -54,6 +54,19 @@ internal static class LocalMcpEnvironmentTests
         Check(Redaction.Apply("false 1 8080 application/json ordinary-value").Text == "false 1 8080 application/json ordinary-value", "MCP short and ordinary environment header and query values remain unchanged");
         Check(Redaction.DisplayArguments(["--api-key", "ordinary-key-value", "--token=ordinary-token-value", "--name", "safe"]).SequenceEqual(["--api-key", "[REDACTED]", "--token=[REDACTED]", "--name", "safe"]), "MCP argument display masks secret-pattern flag values");
         Check(Redaction.DisplayUrl("https://user:password@example.com:4321/private-token/path?q=secret#fragment") == "https://example.com:4321/…", "MCP URL display reveals authority only, never path credentials or query");
+        Check(Redaction.DisplayUrl("https://example.com:443") == "https://example.com:443" && Redaction.DisplayUrl("http://example.com:80") == "http://example.com:80", "MCP URL display retains explicit default ports without inventing a path");
+        Check(Redaction.DisplayUrl("https://user:password@example.com?token=hidden#secret") == "https://example.com" && Redaction.DisplayUrl("https://example.com/#secret") == "https://example.com/…", "MCP URL display distinguishes written root path from query or fragment alone");
+        Check(Redaction.DisplayUrl("http://[::1]:80/mcp") == "http://[::1]:80/…" && Redaction.DisplayUrl("https://[::1]:443") == "https://[::1]:443", "MCP URL display preserves IPv6 authorities and explicit ports");
+        BrowserMountConfig[] invalidBrowsers = [
+            new() { Id = "bad id" }, new() { Id = "duplicate", Command = "node", RootId = "r" },
+            new() { Id = "missing-command", RootId = "r" }, new() { Id = "missing-root", Command = "node" },
+            new() { Id = "kind", Command = "node", RootId = "r", Kind = "unknown" },
+            new() { Id = "profile", Command = "node", RootId = "r", ProfileMode = "unknown" },
+            new() { Id = "args", Command = "node", RootId = "r", Args = [null!] },
+            new() { Id = "tools", Command = "node", RootId = "r", ReadOnlyTools = [null!] },
+            new() { ParseError = "synthetic parse error." }
+        ];
+        Check(invalidBrowsers.All(m => BrowserMounts.Invalid(m, new HashSet<string>(StringComparer.OrdinalIgnoreCase) { "duplicate" }) is { Length: > 0 } reason && !reason.EndsWith('.')), "Browser invalid reasons are clauses without a final period inside A.6 parentheses");
         string dir = Path.Combine(temp, "mcp-command-env"); Directory.CreateDirectory(dir);
         string first = Path.Combine(dir, "first"), second = Path.Combine(dir, "second"); Directory.CreateDirectory(first); Directory.CreateDirectory(second);
         string suffix = OperatingSystem.IsWindows() ? ".cmd" : "";

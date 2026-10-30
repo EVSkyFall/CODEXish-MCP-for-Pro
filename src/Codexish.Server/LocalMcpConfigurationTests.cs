@@ -94,6 +94,32 @@ public static class LocalMcpConfigurationTests
             var rootsReload = ServerConfig.Load(configPath);
             Check(rootsReload.Roots.Single().Id == root.Id && McpConfiguration.ParseTopLevel(rootsReload)[0].State == "invalid_config" &&
                   rootsReload.BrowserMounts[0].ParseError is not null, "roots edit preserves malformed optional definitions without decoding or blocking the save");
+            File.WriteAllText(configPath, """{"future":"\uD800","roots":[],"mcp_servers":{"ok":{"command":"works","disabled":true}},"\uD800":{"unused":"\uD800"}}""");
+            byte[] unknownUnicodeBytes = File.ReadAllBytes(configPath);
+            var unknownUnicode = ServerConfig.Load(configPath);
+            Check(McpConfiguration.ParseTopLevel(unknownUnicode).Single().Command == "works" &&
+                  File.ReadAllBytes(configPath).SequenceEqual(unknownUnicodeBytes) && Directory.GetFiles(directory, "*.broken-*").Length == 0,
+                  "unknown lone-surrogate values and unreadable top-level names never stop startup or cause backup recovery");
+            unknownUnicode.StateDir = Path.Combine(directory, "unknown-unicode-runtime");
+            using (var unicodeRuntime = new CodexishRuntime(unknownUnicode))
+            {
+                unicodeRuntime.Mounts.Start();
+                unicodeRuntime.Mounts.PrepareAsync().GetAwaiter().GetResult();
+                using var capabilities = JsonDocument.Parse(JsonSerializer.Serialize(unicodeRuntime.Mounts.Describe()));
+                var mounted = capabilities.RootElement.GetProperty("mounted");
+                Check(mounted.GetArrayLength() == 1 && mounted[0].GetProperty("identity").GetString() == "ok" &&
+                      mounted[0].GetProperty("state").GetString() == "disabled", "runtime startup rereads a file with unknown surrogate content without losing valid mounts");
+            }
+            ServerConfig.SaveRoots(configPath, [root]);
+            using (var rawSaved = McpConfiguration.ParseDocument(File.ReadAllBytes(configPath)))
+                Check(rawSaved.RootElement.GetProperty("future").GetRawText() == "\"\\uD800\"" &&
+                      rawSaved.RootElement.EnumerateObject().Count() == 3 && ServerConfig.Load(configPath).Roots.Single().Id == root.Id,
+                      "tray raw copy preserves unreadable unused values and skips only unreadable names");
+            File.WriteAllText(configPath, """{"browser_mounts":[{"id":"earlier","command":"x"}],"\uD800":null,"browser_mounts":42,"mcp_servers":{"earlier":{"command":"x"}},"mcp_servers":{"last":{"command":"y"}}}""");
+            var duplicateTop = ServerConfig.Load(configPath);
+            Check(duplicateTop.BrowserMounts.Length == 0 && duplicateTop.BrowserMountParseWarning is not null &&
+                  McpConfiguration.ParseTopLevel(duplicateTop).Single().Name == "last",
+                  "safe property lookup preserves last-occurrence semantics even beside an unreadable property name");
             using var first = JsonDocument.Parse("""{"b":1,"a":2,"a":3}"""); using var second = JsonDocument.Parse("""{"a":2,"a":3,"b":1}""");
             Check(McpConfiguration.Canonical(first.RootElement) == McpConfiguration.Canonical(second.RootElement), "canonical definitions preserve duplicate keys and ignore property order");
         }

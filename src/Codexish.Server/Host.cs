@@ -11,6 +11,7 @@ public static class CodexishHost
     public static WebApplication Build(CodexishRuntime runtime, int port, Action<string>? rejectionLog = null,
         bool instructions = true)
     {
+        runtime.Mounts.PrepareManifests();
         var config = runtime.Config;
         var access = new AccessPolicy(config.AllowHosts, config.AllowOrigins);
         var log = rejectionLog ?? Console.WriteLine;

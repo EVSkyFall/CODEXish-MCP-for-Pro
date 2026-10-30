@@ -17,12 +17,13 @@ public static class McpResourceTests
         public bool IsBrowser => isBrowser;
         public int Acquired;
         public int Active;
+        public int TransportFailures;
         public McpResourceLease AcquireResourceLease(bool listing = false)
         {
             if (denied) throw new CodexishFault("PERMISSION_DENIED", "fixture grant missing");
             Interlocked.Increment(ref Acquired);
             if (!listing) Interlocked.Increment(ref Active);
-            return new(client, state, null, listing ? null : () => Interlocked.Decrement(ref Active));
+            return new(client, state, null, listing ? null : () => Interlocked.Decrement(ref Active), _ => Interlocked.Increment(ref TransportFailures));
         }
         public CallToolResult Unavailable() => Reply.Error("MCP_UNAVAILABLE", $"MCP server '{identity}' is {state}; nothing was sent to it. CODEXish keeps restarting it.", details: new { server = identity, state, next_retry = (string?)null });
     }
@@ -138,6 +139,16 @@ public static class McpResourceTests
             check(Reply.CodeOf(lost) == "MCP_UNAVAILABLE", "resource read session disposal is transport unavailable, never caller-cancelled");
             check(lost.StructuredContent!.Value.GetProperty("error").GetProperty("details").GetProperty("provider_error").GetString() is "OperationCanceledException" or "TaskCanceledException",
                 "resource fixture proves non-caller SDK OperationCanceledException follows transport-failure path");
+            int priorFailures = connected.TransportFailures;
+            var completed = await mounted.Read("browser:fixture", "fixture:text");
+            var completedError = completed.StructuredContent!.Value.GetProperty("error");
+            check(client.Completion.IsCompleted && Reply.CodeOf(completed) == "MCP_UNAVAILABLE" && completedError.GetProperty("side_effects").GetString() == "none" && completedError.GetProperty("message").GetString() == "MCP server 'browser:fixture' is connected; nothing was sent to it. CODEXish keeps restarting it.",
+                "resource read of a completed SDK session returns unavailable before dispatch with effects none");
+            check(connected.TransportFailures == priorFailures + 1 && connected.Active == 0,
+                "completed resource session requests reconnect and releases its read lease");
+            var completedList = await mounted.List("browser:fixture");
+            check(completedList.StructuredContent!.Value.GetProperty("data").GetProperty("servers")[0].GetProperty("state").GetString() == "error" && connected.TransportFailures == priorFailures + 2,
+                "completed session resource listing reports failure and reconnects instead of claiming connected");
         }
         finally
         {

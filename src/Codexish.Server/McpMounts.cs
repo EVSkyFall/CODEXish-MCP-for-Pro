@@ -19,6 +19,7 @@ public sealed class McpMounts : IAsyncDisposable
     private Published snapshot = new([], [], [], [], [], 0, []);
     private readonly object prepareSync = new();
     private Task? preparation;
+    private bool manifestsPrepared;
     private McpDefinition[] topDefinitions = [];
     private string[] topWarnings = [];
     private HashSet<string> changedPaths = new(StringComparer.Ordinal);
@@ -34,23 +35,42 @@ public sealed class McpMounts : IAsyncDisposable
     {
         owner = runtime;
     }
-    public Task PrepareAsync()
+    // Only the local top-level configuration and state manifests are touched here. Slow project
+    // shares, environment refresh and executable resolution remain background preparation work.
+    public void PrepareManifests()
     {
-        lock (prepareSync) return preparation ??= Task.Run(() =>
+        lock (prepareSync)
         {
+            if (manifestsPrepared || preparation is not null) return;
+            manifestsPrepared = true;
             lock (reloadSync)
             {
-                // Stamp before reading; a save during this work is detected by the next poll.
-                try { Changed(); ReadDefinitionsAndApply(); }
-                catch (Exception error)
-                {
-                    // Initial optional discovery has the same recovery boundary as subsequent polls.
-                    // Do not retain a faulted preparation task that could later short-circuit disposal.
-                    stamps.Clear();
-                    Warn("Mount configuration reload failed: " + error.Message);
-                }
+                try { ApplyDefinitions([], force: true, manifestsOnly: true); }
+                catch (Exception error) { Warn("Mount manifest preparation failed: " + error.Message); }
             }
-        });
+        }
+    }
+    public Task PrepareAsync()
+    {
+        lock (prepareSync)
+        {
+            PrepareManifests();
+            return preparation ??= Task.Run(() =>
+            {
+                lock (reloadSync)
+                {
+                    // Stamp before reading; a save during this work is detected by the next poll.
+                    try { Changed(); ReadDefinitionsAndApply(); }
+                    catch (Exception error)
+                    {
+                        // Initial optional discovery has the same recovery boundary as subsequent polls.
+                        // Do not retain a faulted preparation task that could later short-circuit disposal.
+                        stamps.Clear();
+                        Warn("Mount configuration reload failed: " + error.Message);
+                    }
+                }
+            });
+        }
     }
     public IReadOnlyList<McpServerTool> Tools => Volatile.Read(ref snapshot).Tools;
     public IReadOnlyList<McpServerTool> BrowserTools => Volatile.Read(ref snapshot).BrowserTools;
@@ -201,7 +221,8 @@ public sealed class McpMounts : IAsyncDisposable
             ApplyDefinitions(changed, force);
         }
     }
-    private void ApplyDefinitions(HashSet<string> changed, bool force)
+    internal Func<string, byte[]> ReadConfigurationFile { get; set; } = File.ReadAllBytes;
+    private void ApplyDefinitions(HashSet<string> changed, bool force, bool manifestsOnly = false)
     {
         var config = owner.Config;
         bool mainChanged = force || config.SourcePath is { } source && changed.Contains(source);
@@ -210,20 +231,24 @@ public sealed class McpMounts : IAsyncDisposable
         {
             try
             {
-                using var doc = McpConfiguration.ParseDocument(File.ReadAllBytes(path));
+                using var doc = McpConfiguration.ParseDocument(ReadConfigurationFile(path));
                 if (doc.RootElement.ValueKind != JsonValueKind.Object) throw new JsonException("codexish.json is not an object.");
-                config.McpServers = doc.RootElement.TryGetProperty("mcp_servers", out var primary) ? primary.Clone() : null;
-                config.McpServersAlias = doc.RootElement.TryGetProperty("mcpServers", out var alias) ? alias.Clone() : null;
+                config.McpServers = ServerConfig.TryGetReadableProperty(doc.RootElement, "mcp_servers", out var primary) ? primary.Clone() : null;
+                config.McpServersAlias = ServerConfig.TryGetReadableProperty(doc.RootElement, "mcpServers", out var alias) ? alias.Clone() : null;
                 reloadError = null;
                 try
                 {
-                    config.BrowserMounts = doc.RootElement.TryGetProperty("browser_mounts", out var browsers)
+                    config.BrowserMounts = ServerConfig.TryGetReadableProperty(doc.RootElement, "browser_mounts", out var browsers)
                         ? ServerConfig.ParseBrowserMounts(browsers) : [];
                 }
                 catch (Exception error) { browserReadFailed = true; Warn("browser_mounts keeps its previous definitions: " + error.Message); }
             }
             catch (Exception error)
-            { mainReadFailed = true; Warn("codexish.json keeps its previous definitions: " + error.Message); }
+            {
+                mainReadFailed = true;
+                if (error is IOException or UnauthorizedAccessException or System.Security.SecurityException) stamps.Remove(path);
+                Warn("codexish.json keeps its previous definitions: " + error.Message);
+            }
         }
         if (mainChanged && !mainReadFailed)
         {
@@ -231,17 +256,20 @@ public sealed class McpMounts : IAsyncDisposable
             topDefinitions = McpConfiguration.ParseTopLevel(config, warnings);
             topWarnings = warnings.Distinct(StringComparer.Ordinal).Select(w => Redaction.Apply(w).Text).ToArray();
         }
-        projects = config.Roots.Select(r =>
+        if (!manifestsOnly) projects = config.Roots.Select(r =>
         {
             var previous = projects.FirstOrDefault(p => p.RootId.Equals(r.Id, StringComparison.OrdinalIgnoreCase));
-            return force || previous is null || changed.Contains(Path.Combine(r.Path, ".mcp.json"))
-                ? McpConfiguration.ReadProject(r, previous) : previous;
+            string projectPath = Path.Combine(r.Path, ".mcp.json");
+            var result = force || previous is null || changed.Contains(projectPath)
+                ? McpConfiguration.ReadProject(r, previous, ReadConfigurationFile) : previous;
+            if (result.State == "unreadable") stamps.Remove(projectPath);
+            return result;
         }).ToArray();
-        AfterReloadRead?.Invoke();
+        if (!manifestsOnly) AfterReloadRead?.Invoke();
         var definitions = McpConfiguration.ApplyOverrides(topDefinitions, projects.SelectMany(p => p.Definitions));
         var prior = Volatile.Read(ref snapshot).Entries.ToDictionary(e => e.Key, StringComparer.OrdinalIgnoreCase);
         string Effective(string key, McpDefinition definition, bool sourceChanged)
-            => !sourceChanged && prior.TryGetValue(key, out var old) ? old.Signature : McpEffectiveConfiguration.Fingerprint(config, definition);
+            => manifestsOnly ? "manifest-only" : !sourceChanged && prior.TryGetValue(key, out var old) ? old.Signature : McpEffectiveConfiguration.Fingerprint(config, definition);
         var desired = new List<(string Key, string Signature, McpDefinition Definition, BrowserMountConfig? Browser, string? Profile)>();
         var ids = BrowserMounts.NewIdSet();
         int ordinal = 0;

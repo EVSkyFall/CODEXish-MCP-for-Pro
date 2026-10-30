@@ -7,7 +7,7 @@ namespace Codexish.Server;
 // protocol result until each block has been decoded independently, preserving future extensions as text.
 public static class McpResultDecoder
 {
-    public static bool IsTransportLoss(Exception error) => error switch
+    public static bool IsTransportLoss(Exception error, bool sessionCompleted = false) => sessionCompleted || error switch
     {
         HttpRequestException http => http.StatusCode is null or System.Net.HttpStatusCode.NotFound,
         IOException or ObjectDisposedException or OperationCanceledException => true,

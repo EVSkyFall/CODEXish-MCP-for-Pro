@@ -126,13 +126,13 @@ public sealed class ServerConfig
         {
             writer.WriteStartObject();
             foreach (var property in document.RootElement.EnumerateObject())
-                if (!property.NameEquals("browser_mounts") && !property.NameEquals("mcp_servers") && !property.NameEquals("mcpServers")) property.WriteTo(writer);
+                if (ReadableName(property) is { } name && name is not ("browser_mounts" or "mcp_servers" or "mcpServers")) CopyRawProperty(writer, property, name);
             writer.WriteEndObject();
         }
-        var config = JsonSerializer.Deserialize<ServerConfig>(stream.ToArray())!;
-        if (document.RootElement.TryGetProperty("mcp_servers", out var mcp)) config.McpServers = mcp.Clone();
-        if (document.RootElement.TryGetProperty("mcpServers", out var alias)) config.McpServersAlias = alias.Clone();
-        if (document.RootElement.TryGetProperty("browser_mounts", out var browser))
+        var config = JsonSerializer.Deserialize<ServerConfig>(stream.ToArray(), MountReadOptions)!;
+        if (TryGetReadableProperty(document.RootElement, "mcp_servers", out var mcp)) config.McpServers = mcp.Clone();
+        if (TryGetReadableProperty(document.RootElement, "mcpServers", out var alias)) config.McpServersAlias = alias.Clone();
+        if (TryGetReadableProperty(document.RootElement, "browser_mounts", out var browser))
             try { config.BrowserMounts = ParseBrowserMounts(browser); }
             catch (Exception error) { config.BrowserMountParseWarning = "browser_mounts: " + McpConfiguration.Reason(error); }
         return config;
@@ -244,9 +244,11 @@ public sealed class ServerConfig
     }
 
     // Prepare while the host is still running. JsonDocument preserves duplicate properties, unlike JsonNode.
-    public static byte[] PrepareRoots(string path, RootConfig[] roots)
+    public static byte[] PrepareRoots(string path, RootConfig[] roots) => PrepareRoots(File.ReadAllBytes(path), roots);
+
+    internal static byte[] PrepareRoots(byte[] source, RootConfig[] roots)
     {
-        using var current = McpConfiguration.ParseDocument(File.ReadAllBytes(path));
+        using var current = McpConfiguration.ParseDocument(source);
         if (current.RootElement.ValueKind != JsonValueKind.Object)
             throw new InvalidDataException("The configuration is not a JSON object; roots were not saved.");
         using var stream = new MemoryStream();
@@ -254,12 +256,32 @@ public sealed class ServerConfig
         {
             writer.WriteStartObject();
             foreach (var property in current.RootElement.EnumerateObject())
-                if (!property.NameEquals("roots"))
-                { writer.WritePropertyName(property.Name); writer.WriteRawValue(property.Value.GetRawText(), skipInputValidation: true); }
+                if (ReadableName(property) is { } name && name != "roots")
+                    CopyRawProperty(writer, property, name);
             writer.WritePropertyName("roots"); JsonSerializer.Serialize(writer, roots);
             writer.WriteEndObject();
         }
         return stream.ToArray();
+    }
+
+    internal static bool TryGetReadableProperty(JsonElement document, string name, out JsonElement value)
+    {
+        bool found = false; value = default;
+        foreach (var property in document.EnumerateObject())
+            if (ReadableName(property) == name) { value = property.Value; found = true; }
+        return found;
+    }
+
+    private static string? ReadableName(JsonProperty property)
+    {
+        try { return property.Name; }
+        catch (InvalidOperationException) { return null; } // An unreadable Unicode name cannot name a setting we use.
+    }
+
+    private static void CopyRawProperty(Utf8JsonWriter writer, JsonProperty property, string name)
+    {
+        writer.WritePropertyName(name);
+        writer.WriteRawValue(property.Value.GetRawText(), skipInputValidation: true);
     }
 
     public static void SavePrepared(string path, byte[] bytes)

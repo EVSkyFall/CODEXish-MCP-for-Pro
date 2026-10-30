@@ -86,7 +86,17 @@ public static partial class Redaction
     {
         if (value is null) return null;
         if (Uri.TryCreate(value, UriKind.Absolute, out var uri) && uri.Scheme is "http" or "https")
-            return Apply(uri.GetComponents(UriComponents.SchemeAndServer, UriFormat.UriEscaped)).Text + "/…";
+        {
+            // Uri canonicalization drops an explicitly written default port and invents a root path.
+            // Inspect only the original authority/path boundary after validation; never include user info.
+            var written = Regex.Match(value.Trim(), @"^https?://(?<authority>[^/\\?#]*)(?<path>[/\\]?)", RegexOptions.IgnoreCase);
+            if (written.Success)
+            {
+                string authority = written.Groups["authority"].Value;
+                authority = authority[(authority.LastIndexOf('@') + 1)..];
+                return Apply(uri.Scheme + "://" + authority).Text + (written.Groups["path"].Length > 0 ? "/…" : "");
+            }
+        }
         // An unexpanded or malformed URL can still contain credentials in every component: do not echo it.
         return "[unresolved URL]/…";
     }

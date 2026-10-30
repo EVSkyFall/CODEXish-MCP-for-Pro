@@ -59,9 +59,23 @@ public sealed class TrayController(ServerConfig config) : IAsyncDisposable
 {
     internal static async Task SaveRootsAndRestart(string path, RootConfig[] roots, Func<Task> stop, Action<byte[]> save, Func<Task> restart)
     {
-        byte[] prepared = ServerConfig.PrepareRoots(path, roots);
-        try { await stop(); save(prepared); }
+        byte[] source = File.ReadAllBytes(path);
+        byte[] prepared = ServerConfig.PrepareRoots(source, roots);
+        try
+        {
+            await stop();
+            byte[] current = File.ReadAllBytes(path);
+            if (!current.AsSpan().SequenceEqual(source)) prepared = ServerConfig.PrepareRoots(current, roots);
+            save(prepared);
+        }
         finally { await restart(); }
+    }
+
+    internal static async Task LogPreparedStart(Task preparation, Func<string> summary, Action<string> log, CancellationToken token)
+    {
+        try { await preparation.WaitAsync(token); log(summary()); }
+        catch (OperationCanceledException) when (token.IsCancellationRequested) { }
+        catch (Exception error) { log("Mount preparation failed: " + Redaction.Apply(error.Message).Text); }
     }
 
     public static readonly TimeSpan HealthyRun = Backoff.HealthyRun;
@@ -391,7 +405,8 @@ public sealed class TrayController(ServerConfig config) : IAsyncDisposable
                 host.Lifetime.ApplicationStopping.Register(() => stopping.TrySetResult());
                 runtime = candidate; app = host;
                 ServerChanged(address);
-                Log("Server started at " + address + "; browser mounts: " + candidate.Browsers.Summary() + "; MCP servers: " + candidate.Mounts.Summary());
+                _ = LogPreparedStart(candidate.Mounts.PrepareAsync(),
+                    () => "Server started at " + address + "; browser mounts: " + candidate.Browsers.Summary() + "; MCP servers: " + candidate.Mounts.Summary(), Log, token);
                 foreach (string warning in candidate.Warnings) Log("Warning: " + warning);
                 return stopping.Task;
             }
@@ -745,6 +760,8 @@ public static class TrayTests
             Check(controller.Running && !controller.TunnelRunning, "the same controller restarts with the existing local state and still no tunnel");
 
             int Count(TrayController target, string text) => target.Diagnostics.Count(x => x.Contains(text, StringComparison.Ordinal));
+            Check(await Eventually(() => Count(controller, "Server started at") == 2, 30),
+                "both explicit host starts publish their prepared mount summary before the restart-count baseline");
             int starts = Count(controller, "Server started at");
             controller.HostLifetime!.StopApplication();
             Check(await Eventually(() => Count(controller, "Server stopped without a user stop") == 1 && Count(controller, "Server started at") == starts + 1 && controller.Running, 30),
@@ -1005,6 +1022,38 @@ public static class TrayTests
             catch (IOException) { rootsWriteFailed = true; }
             Check(rootsWriteFailed && rootsStops == 1 && rootsRestarts == 1,
                 "failed atomic roots write restarts the previously running components in finally");
+
+            File.WriteAllText(configPath, """{"future":"before","roots":[]}""");
+            await TrayController.SaveRootsAndRestart(configPath, [new RootConfig { Id = "edited", Path = directory }], () =>
+            {
+                File.WriteAllText(configPath, """{"future":"during stop","roots":[],"added":{"preserve":true}}""");
+                return Task.CompletedTask;
+            }, bytes => ServerConfig.SavePrepared(configPath, bytes), () => Task.CompletedTask);
+            using (var changedDuringStop = JsonDocument.Parse(File.ReadAllBytes(configPath)))
+                Check(changedDuringStop.RootElement.GetProperty("future").GetString() == "during stop" &&
+                      changedDuringStop.RootElement.GetProperty("added").GetProperty("preserve").GetBoolean() &&
+                      changedDuringStop.RootElement.GetProperty("roots")[0].GetProperty("id").GetString() == "edited",
+                      "roots save rereads after stop and preserves a concurrent configuration update");
+            File.WriteAllText(configPath, "{}");
+            int failedReprepareWrites = 0, failedReprepareRestarts = 0;
+            bool failedReprepare = false;
+            try
+            {
+                await TrayController.SaveRootsAndRestart(configPath, [], () =>
+                { File.WriteAllText(configPath, "{ changed but incomplete"); return Task.CompletedTask; },
+                    _ => failedReprepareWrites++, () => { failedReprepareRestarts++; return Task.CompletedTask; });
+            }
+            catch (JsonException) { failedReprepare = true; }
+            Check(failedReprepare && failedReprepareWrites == 0 && failedReprepareRestarts == 1 && File.ReadAllText(configPath) == "{ changed but incomplete",
+                "a concurrent half-written file after stop restarts without overwriting any bytes");
+            var preparedBanner = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            List<string> bannerLines = [];
+            bool bannerSummaryRead = false;
+            var pendingBanner = TrayController.LogPreparedStart(preparedBanner.Task, () => { bannerSummaryRead = true; return "prepared mounts"; }, bannerLines.Add, CancellationToken.None);
+            Check(!pendingBanner.IsCompleted && !bannerSummaryRead && bannerLines.Count == 0,
+                "tray start returns while mount preparation is pending without reading a premature summary");
+            preparedBanner.SetResult(); await pendingBanner;
+            Check(bannerSummaryRead && bannerLines.SequenceEqual(["prepared mounts"]), "tray start log reads its mount summary only after preparation");
 
             if (OperatingSystem.IsWindows())
             {

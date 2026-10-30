@@ -72,7 +72,11 @@ catch (StateLockedException error) { return CommandLine.Refuse(error, Console.Er
 using var runtime = opened;
 // Browser mounts connect in the background once the listener is up, so none of them can delay or stop the server.
 var app = CodexishHost.Build(runtime, config.Port, instructions: !args.Contains("--no-instructions"));
-Console.WriteLine($"""
+// Log mount summaries after optional preparation, without delaying the listener on that work.
+async Task PrintBanner()
+{
+    await runtime.Mounts.PrepareAsync();
+    Console.WriteLine($"""
     CODEXish v1 (coding core, desktop, browser mounts)
       MCP           http://127.0.0.1:{config.Port}/mcp  (published as {config.PublicUrl}/mcp)
       Roots         {string.Join(", ", config.Roots.Select(r => $"{r.Id}:{(r.Read ? "r" : "")}{(r.Write ? "w" : "")}{(r.Shell ? "x" : "")}{(Directory.Exists(r.Path) ? "" : " (missing)")}"))}
@@ -83,7 +87,9 @@ Console.WriteLine($"""
     The listener is loopback only; expose it with a tunnel. Host and Origin checks are not authentication.
     Commands run as this Windows user: there is no sandbox. Ctrl+C stops the server.
     """);
-foreach (string warning in runtime.Warnings) Console.WriteLine("WARNING: " + warning);
+    foreach (string warning in runtime.Warnings) Console.WriteLine("WARNING: " + warning);
+}
+app.Lifetime.ApplicationStarted.Register(() => _ = PrintBanner());
 await app.RunAsync();
 return 0;
 

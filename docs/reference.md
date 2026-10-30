@@ -270,8 +270,9 @@ that cannot be deleted yet is tried again at the next sweep. Reading output that
 
 ## Local MCP servers
 
-The revision-5 implementation at `61ac42d` passed Ubuntu and Windows CI. Revision-6 local Linux suites passed
-on the frozen working tree based on `5e85d0a` (2026-10-30 07:04:46 UTC); its CI remains pending.
+Revision-6 implementation head `726188d` passed Ubuntu and Windows CI (the CI merge tree was identical).
+Revision-7 local Linux suites passed on the working tree based on `1411b9f`, source frozen 2026-10-30
+08:13:55 UTC; revision-7 CI remains pending.
 Live owner-PC Unity/ChatGPT acceptance remains unrun.
 [Implementation status](../IMPLEMENTATION_STATUS.md) separates actual verification from this behavior reference. CODEXish mounts stdio and HTTP MCP servers alongside its native tools.
 Put definitions under `mcp_servers` (or the compatible `mcpServers` spelling) in `codexish.json`, or under
@@ -386,9 +387,11 @@ cancellation or server shutdown is transport loss: changing calls answer `EXECUT
 
 Tool-call and resource-read results are decoded as raw JSON block by block. An unknown or malformed content
 block becomes text naming its type with redacted raw JSON; remaining blocks pass normally. Only transport loss
-(IO/disposed exceptions, unrequested cancellation, HTTP exceptions without status or with 404) reconnects. Other
-exceptions, including JSON errors, are call-local `MCP_BACKEND_ERROR` with unknown effects for changes and none
-for reads. A queued tool that vanished returns `MCP_UNAVAILABLE`, effects none. Unwrappable input schemas
+(IO/disposed exceptions, unrequested cancellation, HTTP exceptions without status or with 404, or failure after
+the session Completion has completed) reconnects. A completed-session failure detected before dispatch sent
+nothing. Other exceptions, including JSON errors, are call-local `MCP_BACKEND_ERROR` with unknown effects for
+changes and none for reads; the answer says CODEXish could not read the backend answer, rather than claiming
+it received a protocol error. A queued tool that vanished returns `MCP_UNAVAILABLE`, effects none. Unwrappable input schemas
 still publish the tool with any-object `arguments` and a warning rather than blocking all publication.
 
 - `mcp_resource_list` lists all resources/templates, or one case-insensitive `server`; address browser mounts as
@@ -430,11 +433,16 @@ secret-pattern flags such as `--token` are `[REDACTED]`. Parse warnings are dedu
 entries/tools snapshot is published atomically; capability readers never wait for reload, and initial
 fingerprinting does not delay listening. Redacted stderr/backend logs keep a
 20-line diagnostic tail. MCP manifests live in `<state_dir>/mcp-mounts`; cached tools remain discoverable during
-outages. Removed manifests are left on disk but not loaded.
+outages. Before the host listens, global definitions from `codexish.json` and their MCP/browser manifests
+are parsed and published without environment reads, PATH probing or root I/O. Project files, effective
+fingerprints and actual starts follow in the background, publishing as they finish. Thus global cached tools
+and instructions are available immediately after restart, without waiting for backend connection or slow PATH.
+Removed manifests are left on disk but not loaded.
 
 Mount startup reads current files even if the in-memory configuration is stale. Every three seconds, file length
 and last-write time are checked and recorded before reading, never after applying, so a concurrent save is
-seen next pass. Only definitions from changed files are re-read/re-fingerprinted; unchanged files retain their
+seen next pass. An I/O read failure (such as a sharing violation) drops that file's stamp so the next pass
+retries the unchanged file; it does not require another save. Only definitions from changed files are re-read/re-fingerprinted; unchanged files retain their
 signatures. Saved MCP and browser definition changes reload without restarting CODEXish:
 servers with unchanged effective configuration keep running; changed/removed instances stop accepting new calls and drain dispatched calls
 without a deadline before stopping; a changed replacement starts only after the old instance stops. Pause does not
@@ -448,7 +456,10 @@ excluded. Thus only servers affected by a changed expansion or resolved command 
 their processes. Tray roots saves read the latest file and replace only `roots`, preserving mount and
 unknown fields, including duplicate top-level keys, with the existing atomic save and backup. New bytes are
 prepared before stopping anything; parse/read failure leaves the server running. After stopping, a finally path
-restarts whatever was running even if saving fails.
+restarts whatever was running even if saving fails. After stop, the file is read again; if it changed since
+preparation, the bytes are rebuilt from that newer content. If rereading/rebuilding fails, the server restarts
+without writing. Top-level values other than `roots` are copied as raw JSON, not decoded, both here and in
+tolerant configuration loading; unused unknown values such as a lone surrogate escape cannot block load/save.
 
 ### Parity limits
 
@@ -482,7 +493,7 @@ tools directory, add this to `codexish.json`:
 
 - `command` resolves on the child PATH with the root as its working directory. Bare `npx` works, including
   Windows `.cmd` shims; system cmd quotes batch arguments and passes `%` literally. Direct `node` plus `cli.js`
-  remains supported. `${VAR}` and `${VAR:-default}` also expand in browser args. See [Environment and command execution](#environment-and-command-execution).
+  remains supported. `${VAR}` and `${VAR:-default}` also expand in browser `command` and args. See [Environment and command execution](#environment-and-command-execution).
 - `profile_mode: "dedicated"` (the default) keeps the browser's state in `<state_dir>\browser-profiles\<id>`:
   CODEXish appends `--user-data-dir` with that directory for `kind: "playwright"`. A dedicated mount whose own
   `args` already contain `--user-data-dir`, `--cdp-endpoint`, `--extension`, `--storage-state` or `--config` starts

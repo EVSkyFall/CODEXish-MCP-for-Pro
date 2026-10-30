@@ -3,15 +3,47 @@
 Updated 2026-10-30. Local MCP parity is under review in Draft PR #16. Historical sections retain their own dates
 and source revisions; they are not current whole-product completion claims. No merge or deployment is reported.
 
-## Local MCP parity — revision-6 local verification; CI pending (2026-10-30)
+## Local MCP parity — revision-7 local verification; CI pending (2026-10-30)
+
+Current specification: `docs/local-mcp-parity-plan.md` revision 7, source `f27278e`.
+Revision-7 local results are from the final working tree on merge
+`1411b9fd5446207bda7751da32d3ef31c733e4e0` (parents `726188d` and `f27278e`), source frozen
+2026-10-30 08:13:55 UTC. The implementation commit will be assigned after this documentation update.
+The integration lead verified all 68 tracked C# hashes unchanged since that freeze and all 62 server C# files
+byte-identical in the isolated Windows cross-compilation tree.
+
+| Revision-7 verification / environment / source | Observed result |
+| --- | --- |
+| Local Linux Release build, frozen working tree on `1411b9f` | Exit 0; 0 errors, 4 existing MCP9005 roots warnings |
+| Local Linux `--self-test`, same frozen source | Exit 0; 432, desktop core 57, regressions 11 passed / 0 failed; fake desktop platform |
+| Local Linux `--browser-tests`, same frozen source | Exit 0; 284; fixture transports and HTTP host, not a real browser/ChatGPT trial |
+| Local Linux `--tray-tests`, same frozen source | Exit 0; 67; Windows-only checks skipped with reasons |
+| Linux-hosted Windows/WPF cross-compilation, same frozen source | Exit 0; 0 errors, 4 existing MCP9005 warnings; compile only, not Windows execution |
+| Revision-7 Ubuntu/Windows CI | Pending; revision-6 CI below does not validate these changes |
+| Live owner-PC Windows/Unity/ChatGPT acceptance | Not run |
+
+Workspace evidence: `/workspace/shared/local-mcp-parity-rev7-delivery/rev7-{build,self,browser,tray,windows}.log`.
+These are local logs, not committed artifacts. Earlier local Linux revision-7 failures remain recorded:
+- Self-test 335 exposed a lone-surrogate failure in `NameEquals`; property lookup was corrected.
+- Tray check 34 observed the summary before its deferred preparation; the test now observes the prepared state.
+- Browser check 281 captured the startup manifest-only predecessor rather than its live replacement. All three
+  live handshake setups now await preparation before capturing the mount; assertions and bounds are unchanged,
+  and dedicated held-reader startup-manifest checks remain intact.
+- An intermediate rerun was stopped for a final compatibility correction preserving last-property behavior for
+  duplicate configuration keys; an explicit regression was added. Only the final frozen-source counts above
+  establish local verification.
+
+Earlier successful runs below are retained as historical evidence, not substituted for revision-7 acceptance.
+
+### Revision-6 verification (2026-10-30)
 
 Work branch `dot/local-mcp-parity`, originally created from `claude/stoic-ptolemy-t6updn` at
 `7979744f8a923daa21e43e449b411ff49f082f3d`, then advanced to the approved source update `086cd2b`;
-current specification: `docs/local-mcp-parity-plan.md` revision 6 (`1bb8f24`), merged locally as `5e85d0a`.
+revision-6 specification: `docs/local-mcp-parity-plan.md` revision 6 (`1bb8f24`), merged locally as `5e85d0a`.
 Revision-6 results below are from the local working tree on merge `5e85d0a` (implementation base `61ac42d`
 plus approved plan `1bb8f24`), C# source frozen 2026-10-30 07:04:46 UTC before the documentation-only update.
-The resulting implementation commit is not yet assigned at this writing. The local Linux Release suites ran
-sequentially; they do not establish revision-6 CI, Windows runtime or ChatGPT acceptance.
+The source was published in revision-6 implementation head `726188d`. The local Linux Release suites ran
+sequentially. CI results below are separate from local checks; neither establishes live owner-PC/ChatGPT acceptance.
 
 | Revision-6 verification / environment / source | Observed result |
 | --- | --- |
@@ -20,7 +52,9 @@ sequentially; they do not establish revision-6 CI, Windows runtime or ChatGPT ac
 | Local Linux `--browser-tests`, same frozen source | Exit 0; 263; real fixture transports/HTTP host, not a real browser or ChatGPT trial |
 | Local Linux `--tray-tests`, same frozen source | Exit 0; 62; Windows-only checks skipped with reasons |
 | Linux-hosted Windows/WPF cross-compilation, same frozen source | Exit 0; 0 errors, 4 MCP9005 warnings; 62 C# files byte-identical to tested Linux source; compile only |
-| Revision-6 Ubuntu/Windows CI | Pending; the successful `61ac42d` run below predates these fixes |
+| Ubuntu server CI, head `726188d`, synthetic merge `d3d1c554` (tree-identical) | Passed; self 424, desktop core 57, regressions 11, browser 263, tray 62; [run 41020539179](https://github.com/EVSkyFall/CODEXish-MCP-for-Pro/actions/runs/41020539179) |
+| Windows server CI, same head/merge | Passed; self 443, desktop core 56, regressions 11, browser 268, tray 77; [run 41020539179](https://github.com/EVSkyFall/CODEXish-MCP-for-Pro/actions/runs/41020539179) |
+| Ubuntu / Windows probe CI, same revision-6 head | Both passed; 93 / 97 respectively; [run 41020539162](https://github.com/EVSkyFall/CODEXish-MCP-for-Pro/actions/runs/41020539162) |
 | Live owner-PC Windows/Unity/ChatGPT acceptance | Not run |
 
 Workspace logs: `/tmp/rev6-final4-build.log`, `/tmp/rev6-final4-self.log`,

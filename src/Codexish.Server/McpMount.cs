@@ -124,7 +124,7 @@ public sealed class McpMount : IMcpResourceTarget, IAsyncDisposable
     private void Release(Session old) { lock (sync) { if (--old.Active == 0) old.Idle.TrySetResult(); } }
     private void TransportFailed(Session old, Exception error)
     {
-        if (!McpResultDecoder.IsTransportLoss(error)) return;
+        if (!McpResultDecoder.IsTransportLoss(error, old.Client?.Completion.IsCompleted == true)) return;
         lock (sync)
         {
             if (ReferenceEquals(session, old) && !retiring)
@@ -559,6 +559,11 @@ public sealed class McpMount : IMcpResourceTarget, IAsyncDisposable
                 if (lease is null) return mount.Unavailable(isBrowser);
                 using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellation, mount.stopping.Token);
                 linked.Token.ThrowIfCancellationRequested();
+                if (lease.Client!.Completion.IsCompleted)
+                {
+                    mount.TransportFailed(lease, new InvalidOperationException("The MCP client session has ended."));
+                    return mount.Unavailable(isBrowser);
+                }
                 dispatched = true;
                 var raw = await lease.Client!.SendRequestAsync<CallToolRequestParams, JsonElement>(RequestMethods.ToolsCall,
                     new CallToolRequestParams { Name = backend, Arguments = arguments.EnumerateObject().ToDictionary(p => p.Name, p => p.Value.Clone()) },
@@ -582,13 +587,13 @@ public sealed class McpMount : IMcpResourceTarget, IAsyncDisposable
                 return Reply.Error("CANCELLED", dispatched ? isBrowser ? "Cancelled after the backend received the call; inspect the browser before another action." :
                     "Cancelled after the backend received the call; check the state the tool acts on before another action." : "Cancelled before the backend received the call.", dispatched ? uncertain : "none");
             }
-            catch (McpProtocolException error)
+            catch (McpProtocolException error) when (lease?.Client?.Completion.IsCompleted != true)
             {
                 return Reply.Error(backendError, isBrowser ? "The backend answered with a protocol error; inspect the browser before another action." :
                     "The backend answered with a protocol error; check the state the tool acts on before another action.", uncertain,
                     details: new Dictionary<string, object?> { [isBrowser ? "mount" : "server"] = isBrowser ? mount.browser!.Id : mount.Identity, ["backend_tool"] = backend, ["protocol_error"] = Redaction.Apply(error.Message).Text });
             }
-            catch (HttpRequestException error) when (error.StatusCode is { } status && status != HttpStatusCode.NotFound)
+            catch (HttpRequestException error) when (error.StatusCode is { } status && status != HttpStatusCode.NotFound && lease?.Client?.Completion.IsCompleted != true)
             {
                 return Reply.Error(backendError, $"MCP server '{mount.Identity}' answered with HTTP status {(int)status}; check the state the tool acts on before another action.", uncertain,
                     details: new { server = mount.Identity, backend_tool = backend, http_status = (int)status });
@@ -598,9 +603,9 @@ public sealed class McpMount : IMcpResourceTarget, IAsyncDisposable
                 if (lease is not null) mount.TransportFailed(lease, error);
                 return mount.Unavailable(isBrowser);
             }
-            catch (Exception error) when (!McpResultDecoder.IsTransportLoss(error))
+            catch (Exception error) when (!McpResultDecoder.IsTransportLoss(error, lease?.Client?.Completion.IsCompleted == true))
             {
-                return Reply.Error(backendError, "The backend returned a tool error; read its text before another action.", uncertain,
+                return Reply.Error(backendError, $"MCP server '{mount.Identity}' sent an answer CODEXish could not read; check the state the tool acts on before another action.", uncertain,
                     details: new Dictionary<string, object?> { [isBrowser ? "mount" : "server"] = isBrowser ? mount.browser!.Id : mount.Identity, ["backend_tool"] = backend, ["provider_error"] = Redaction.Apply(error.Message).Text });
             }
             catch (Exception error)

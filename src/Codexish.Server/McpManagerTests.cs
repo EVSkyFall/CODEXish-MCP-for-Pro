@@ -143,6 +143,7 @@ public static class McpManagerTests
         await StopBeforeStart(check);
         await ConfigurationWarningsRefresh(check);
         await InitialPreparationFailureRecovers(check);
+        await ConfigurationIoFailureRetries(check);
     }
     private static async Task RapidReplacement(Action<bool, string> check)
     {
@@ -487,8 +488,8 @@ public static class McpManagerTests
             {
                 check(await Observe(() => entered.IsSet), "manager: configuration reader is observably blocked before replacement publication");
                 var capabilities = Task.Run(() => JsonSerializer.SerializeToElement(runtime.Capabilities()));
-                bool returned = await Task.WhenAny(capabilities, Task.Delay(TimeSpan.FromSeconds(2))) == capabilities;
-                check(returned, "manager: host_capabilities returns the previous snapshot without waiting for a blocked configuration reader");
+                bool returned = await Observe(() => capabilities.IsCompleted);
+                check(returned && !release.IsSet, "manager: host_capabilities returns while the reload reader lock remains held, without waiting for release");
                 if (returned) check((await capabilities).GetProperty("mcp").GetProperty("mounted").EnumerateArray().Single().GetProperty("identity").GetString() == "initial",
                     "manager: nonblocking capabilities retains the complete prior generation while reload is blocked");
             }
@@ -506,22 +507,47 @@ public static class McpManagerTests
         using var entered = new ManualResetEventSlim(); using var release = new ManualResetEventSlim();
         try
         {
-            using var runtime = new CodexishRuntime(new ServerConfig { StateDir = Path.Combine(directory, "state"),
-                McpServers = JsonSerializer.SerializeToElement(new { pending = new { command = "unused-fixture", disabled = true } }) }, true);
+            string state = Path.Combine(directory, "state"), configPath = Path.Combine(directory, "codexish.json");
+            var config = new ServerConfig { StateDir = state, Roots = [new RootConfig { Id = "root", Path = directory }],
+                McpServers = JsonSerializer.SerializeToElement(new { cached = new { command = "unused-fixture", read_only_tools = new[] { "inspect" } } }),
+                BrowserMounts = [new BrowserMountConfig { Id = "cached", RootId = "root", Kind = "custom", Command = "unused-fixture", ReadOnlyTools = ["inspect"] }] };
+            config.Save(configPath);
+            string hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes("cached")))[..10].ToLowerInvariant();
+            foreach (string manifest in new[] { Path.Combine(state, "mcp-mounts", "cached-" + hash + ".manifest.json"), Path.Combine(state, "browser-profiles", "cached.manifest.json") })
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(manifest)!);
+                File.WriteAllBytes(manifest, JsonSerializer.SerializeToUtf8Bytes(new { tools = new[] { new Tool { Name = "inspect", InputSchema = JsonSerializer.SerializeToElement(new { type = "object" }) } } }, McpJsonUtilities.DefaultOptions));
+            }
+            using var runtime = new CodexishRuntime(config, true);
             runtime.Mounts.BeforeReloadRead = () => { entered.Set(); release.Wait(); };
             await using var host = CodexishHost.Build(runtime, 0);
             Task start = host.StartAsync();
             try
             {
                 check(await Observe(() => entered.IsSet), "manager: first mount preparation is observably blocked on its reader");
-                check(await Task.WhenAny(start, Task.Delay(TimeSpan.FromSeconds(2))) == start,
+                check(await Observe(() => start.IsCompleted) && !release.IsSet,
                     "manager: host starts listening without waiting for first mount fingerprint preparation");
                 await start;
                 string address = host.Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>()!.Addresses.Single();
                 using var http = new HttpClient();
                 var response = http.GetAsync(address + "/healthz");
-                check(await Task.WhenAny(response, Task.Delay(TimeSpan.FromSeconds(2))) == response && (await response).IsSuccessStatusCode,
+                check(await Observe(() => response.IsCompleted) && !release.IsSet && (await response).IsSuccessStatusCode,
                     "manager: listening host answers health requests while initial mount configuration remains blocked");
+                await using var client = await McpClient.CreateAsync(new HttpClientTransport(new() { Endpoint = new Uri(address + "/mcp") }), new() { ProtocolVersion = CodexishRuntime.ProtocolVersion });
+                var listed = (await client.ListToolsAsync()).Select(t => t.Name).ToArray();
+                check(!release.IsSet && listed.Contains("mcp_cached_inspect") && listed.Contains("browser_cached_inspect"),
+                    "manager: MCP and browser manifests are both listed immediately after host start while background preparation is held");
+                var unavailable = await client.CallToolAsync(new CallToolRequestParams { Name = "mcp_cached_inspect", Arguments = new Dictionary<string, JsonElement>
+                    { ["arguments"] = JsonSerializer.SerializeToElement(new { }) } });
+                var error = unavailable.StructuredContent!.Value.GetProperty("error");
+                check(!release.IsSet && Reply.CodeOf(unavailable) == "MCP_UNAVAILABLE" && error.GetProperty("side_effects").GetString() == "none" &&
+                      error.GetProperty("message").GetString() == "MCP server 'cached' is not_started; nothing was sent to it. CODEXish keeps restarting it.",
+                    "manager: cached MCP tool immediately returns verbatim A.6 unavailable with effects none, never unknown tool");
+                var browserUnavailable = await client.CallToolAsync(new CallToolRequestParams { Name = "browser_cached_inspect", Arguments = new Dictionary<string, JsonElement>
+                    { ["arguments"] = JsonSerializer.SerializeToElement(new { }) } });
+                check(!release.IsSet && Reply.CodeOf(browserUnavailable) == "BROWSER_UNAVAILABLE" &&
+                      browserUnavailable.StructuredContent!.Value.GetProperty("error").GetProperty("side_effects").GetString() == "none",
+                    "manager: cached browser tool also dispatches immediately to its unavailable response before background starts");
             }
             finally { release.Set(); await start; await host.StopAsync(); }
         }
@@ -617,16 +643,62 @@ public static class McpManagerTests
             Task preparation = runtime.Mounts.PrepareAsync();
             await preparation;
             string? error = JsonSerializer.SerializeToElement(runtime.Mounts.Describe()).GetProperty("reload_error").GetString();
-            check(preparation.IsCompletedSuccessfully && error?.Contains("initial injected reader failure", StringComparison.Ordinal) == true && runtime.Mounts.ResourceTargets.Count == 0,
+            check(preparation.IsCompletedSuccessfully && error?.Contains("initial injected reader failure", StringComparison.Ordinal) == true && runtime.Mounts.ResourceTargets.Any(t => t.Identity == "recovered"),
                 "manager: initial reader exception produces a warning without faulting the cached preparation task");
             runtime.Mounts.Start();
-            check(await Observe(() => runtime.Mounts.ResourceTargets.Any(t => t.Identity == "recovered")) && reads >= 2,
+            check(await Observe(() => reads >= 2 && runtime.Mounts.ResourceTargets.Any(t => t.Identity == "recovered")),
                 "manager: normal polling retries the initial preparation failure and applies the unchanged file");
             Task disposal = runtime.Mounts.DisposeAsync().AsTask(); await disposal;
             check(disposal.IsCompletedSuccessfully,
                 "manager: disposal completes after initial preparation failure and successful polling recovery");
         }
         finally { TestCleanup.RemoveDirectory(directory); }
+    }
+
+    private static async Task ConfigurationIoFailureRetries(Action<bool, string> check)
+    {
+        foreach (bool projectFailure in new[] { false, true })
+        {
+            string directory = Path.Combine(Path.GetTempPath(), "codexish-mcp-io-retry-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(directory);
+            string mainPath = Path.Combine(directory, "codexish.json"), projectPath = Path.Combine(directory, ".mcp.json");
+            string Json(string field, string name, string generation) => JsonSerializer.Serialize(new Dictionary<string, object>
+                { [field] = new Dictionary<string, object> { [name] = new { command = "unused-fixture", disabled = true, args = new[] { generation } } } });
+            File.WriteAllText(mainPath, Json("mcp_servers", "main", "before"));
+            File.WriteAllText(projectPath, Json("mcpServers", "project", "before"));
+            string targetPath = projectFailure ? projectPath : mainPath, identity = projectFailure ? "root/project" : "main";
+            try
+            {
+                using var runtime = new CodexishRuntime(new ServerConfig { StateDir = Path.Combine(directory, "state"), SourcePath = mainPath,
+                    Roots = [new RootConfig { Id = "root", Path = directory }] }, true);
+                await runtime.Mounts.PrepareAsync();
+                var before = runtime.Mounts.ResourceTargets.Single(t => t.Identity == identity);
+                int attempts = 0;
+                runtime.Mounts.ReadConfigurationFile = path =>
+                {
+                    if (path == targetPath && Interlocked.Increment(ref attempts) == 1)
+                        throw new IOException("injected transient configuration sharing violation");
+                    return File.ReadAllBytes(path);
+                };
+                File.WriteAllText(targetPath, Json(projectFailure ? "mcpServers" : "mcp_servers", projectFailure ? "project" : "main", "after-transient-io"));
+                byte[] unchanged = File.ReadAllBytes(targetPath); DateTime modified = File.GetLastWriteTimeUtc(targetPath);
+                runtime.Mounts.Start();
+                bool Reported()
+                {
+                    var status = JsonSerializer.SerializeToElement(runtime.Mounts.Describe());
+                    return projectFailure
+                        ? status.GetProperty("project_files").EnumerateArray().Any(p => p.GetProperty("root_id").GetString() == "root" && p.GetProperty("state").GetString() == "unreadable")
+                        : status.GetProperty("reload_error").ValueKind == JsonValueKind.String && status.GetProperty("reload_error").GetString()!.Contains("injected transient", StringComparison.Ordinal);
+                }
+                check(await Observe(Reported) && ReferenceEquals(before, runtime.Mounts.ResourceTargets.Single(t => t.Identity == identity)),
+                    "manager: " + (projectFailure ? "project" : "main") + " transient I/O failure reports the cause and retains the previous instance");
+                check(await Observe(() => attempts >= 2 && !ReferenceEquals(before, runtime.Mounts.ResourceTargets.Single(t => t.Identity == identity))),
+                    "manager: " + (projectFailure ? "project" : "main") + " failed-read stamp is dropped and the unchanged saved file is retried");
+                check(File.ReadAllBytes(targetPath).SequenceEqual(unchanged) && File.GetLastWriteTimeUtc(targetPath) == modified,
+                    "manager: " + (projectFailure ? "project" : "main") + " I/O retry applies without a second file save or timestamp change");
+            }
+            finally { TestCleanup.RemoveDirectory(directory); }
+        }
     }
 
 }

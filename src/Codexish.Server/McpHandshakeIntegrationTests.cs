@@ -76,6 +76,9 @@ public static class McpHandshakeIntegrationTests
                 await app.StartAsync();
                 try
                 {
+                    // Cached definitions are intentionally visible before background preparation.
+                    // This supervision test observes the effective instance, not its warm manifest predecessor.
+                    await runtime.Mounts.PrepareAsync();
                     await Until(() => runtime.Mounts.ResourceTargets.Any(t => t.Identity == "legacy"), "legacy entry prepared");
                     var mount = (McpMount)runtime.Mounts.ResourceTargets.Single(t => t.Identity == "legacy");
                     await Until(() => mount.State == "connected", "initialize-first fallback connects");
@@ -96,6 +99,9 @@ public static class McpHandshakeIntegrationTests
                 await app.StartAsync();
                 try
                 {
+                    // Cached definitions are intentionally visible before background preparation.
+                    // This supervision test observes the effective instance, not its warm manifest predecessor.
+                    await runtime.Mounts.PrepareAsync();
                     await Until(() => runtime.Mounts.ResourceTargets.Any(t => t.Identity == "legacy"), "legacy entry prepared");
                     var mount = (McpMount)runtime.Mounts.ResourceTargets.Single(t => t.Identity == "legacy");
                     await Until(() => mount.State == "connected", "remembered mode reconnects");
@@ -111,6 +117,9 @@ public static class McpHandshakeIntegrationTests
                 await app.StartAsync();
                 try
                 {
+                    // Cached definitions are intentionally visible before background preparation.
+                    // This supervision test observes the effective instance, not its warm manifest predecessor.
+                    await runtime.Mounts.PrepareAsync();
                     await Until(() => runtime.Mounts.ResourceTargets.Any(t => t.Identity == "legacy"), "legacy entry prepared");
                     var mount = (McpMount)runtime.Mounts.ResourceTargets.Single(t => t.Identity == "legacy");
                     await Until(() => mount.State == "retrying", "offline backend retries");

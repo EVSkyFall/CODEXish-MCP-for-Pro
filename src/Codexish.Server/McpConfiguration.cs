@@ -72,18 +72,18 @@ public static class McpConfiguration
     {
         if (document.ValueKind != JsonValueKind.Object)
             throw new JsonException("The project MCP configuration is not an object.");
-        JsonElement? value = document.TryGetProperty("mcpServers", out var servers) ? servers : null;
+        JsonElement? value = ServerConfig.TryGetReadableProperty(document, "mcpServers", out var servers) ? servers : null;
         return ParseObject(value, new ServerConfig { Roots = [root] }, root, "mcpServers");
     }
 
-    public static McpProjectFile ReadProject(RootConfig root, McpProjectFile? previous = null)
+    public static McpProjectFile ReadProject(RootConfig root, McpProjectFile? previous = null, Func<string, byte[]>? read = null)
     {
         try
         {
-            using var document = ParseDocument(File.ReadAllBytes(Path.Combine(root.Path, ".mcp.json")));
+            using var document = ParseDocument((read ?? File.ReadAllBytes)(Path.Combine(root.Path, ".mcp.json")));
             if (document.RootElement.ValueKind != JsonValueKind.Object) throw new JsonException("The project MCP configuration is not an object.");
             var context = new ServerConfig { Roots = [root] };
-            JsonElement? raw = document.RootElement.TryGetProperty("mcpServers", out var servers) ? servers : null;
+            JsonElement? raw = ServerConfig.TryGetReadableProperty(document.RootElement, "mcpServers", out var servers) ? servers : null;
             List<string> warnings = [];
             var definitions = ParseObject(raw, context, root, "mcpServers", warnings);
             return new(root.Id, "read", null, definitions) { Warnings = warnings.Distinct(StringComparer.Ordinal).ToArray() };

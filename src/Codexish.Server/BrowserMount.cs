@@ -98,15 +98,15 @@ public sealed class BrowserMounts(CodexishRuntime owner) : IAsyncDisposable
 
     internal static string? Invalid(BrowserMountConfig mount, ISet<string> ids)
     {
-        if (mount.ParseError is not null) return mount.ParseError;
-        if (!Regex.IsMatch(mount.Id, "^[A-Za-z0-9_-]{1,24}$")) return "id must be 1-24 ASCII letters, digits, underscores or hyphens.";
-        if (ids.Contains(mount.Id)) return $"id '{mount.Id}' is already used by an earlier mount (ids are compared without case).";
-        if (string.IsNullOrWhiteSpace(mount.Command)) return "command is required.";
-        if (string.IsNullOrWhiteSpace(mount.RootId)) return "root_id is required.";
-        if (mount.Kind is not ("playwright" or "custom")) return "kind must be playwright or custom.";
-        if (mount.ProfileMode is not ("dedicated" or "existing")) return "profile_mode must be dedicated or existing.";
-        if (mount.Args.Any(a => a is null)) return "args must not contain null.";
-        if (mount.ReadOnlyTools.Any(t => t is null)) return "read_only_tools must not contain null.";
+        if (mount.ParseError is not null) return mount.ParseError.TrimEnd('.');
+        if (!Regex.IsMatch(mount.Id, "^[A-Za-z0-9_-]{1,24}$")) return "id must be 1-24 ASCII letters, digits, underscores or hyphens";
+        if (ids.Contains(mount.Id)) return $"id '{mount.Id}' is already used by an earlier mount (ids are compared without case)";
+        if (string.IsNullOrWhiteSpace(mount.Command)) return "command is required";
+        if (string.IsNullOrWhiteSpace(mount.RootId)) return "root_id is required";
+        if (mount.Kind is not ("playwright" or "custom")) return "kind must be playwright or custom";
+        if (mount.ProfileMode is not ("dedicated" or "existing")) return "profile_mode must be dedicated or existing";
+        if (mount.Args.Any(a => a is null)) return "args must not contain null";
+        if (mount.ReadOnlyTools.Any(t => t is null)) return "read_only_tools must not contain null";
         // Only a valid entry takes its id, so an invalid entry cannot block a valid one that follows it.
         ids.Add(mount.Id);
         return null;
