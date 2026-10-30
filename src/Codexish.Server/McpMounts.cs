@@ -28,6 +28,8 @@ public sealed class McpMounts : IAsyncDisposable
     public McpMounts(CodexishRuntime runtime)
     {
         owner = runtime;
+        // Remember the pre-read generation. A save during parsing/applying must remain visible next tick.
+        Changed();
         ReadDefinitionsAndApply();
     }
     public IReadOnlyList<McpServerTool> Tools => Volatile.Read(ref snapshot).Tools;
@@ -153,6 +155,7 @@ public sealed class McpMounts : IAsyncDisposable
         return changed;
     }
     internal Action? BeforeReloadRead { get; set; }
+    internal Action? AfterReloadRead { get; set; }
     private void ReadDefinitionsAndApply()
     {
         lock (reloadSync)
@@ -185,6 +188,7 @@ public sealed class McpMounts : IAsyncDisposable
             { mainReadFailed = true; Warn("codexish.json keeps its previous definitions: " + error.Message); }
         }
         projects = config.Roots.Select(r => McpConfiguration.ReadProject(r, projects.FirstOrDefault(p => p.RootId == r.Id))).ToArray();
+        AfterReloadRead?.Invoke();
         var definitions = McpConfiguration.ApplyOverrides(McpConfiguration.ParseTopLevel(config), projects.SelectMany(p => p.Definitions));
         var desired = new List<(string Key, string Signature, McpDefinition Definition, BrowserMountConfig? Browser, string? Profile)>();
         var ids = BrowserMounts.NewIdSet();
@@ -250,7 +254,6 @@ public sealed class McpMounts : IAsyncDisposable
             var predecessor = lifetimes.GetValueOrDefault(old.Key, Task.CompletedTask);
             Track(old.Key, StartAfter(Task.WhenAll(predecessor, drain), fresh?.Mount));
         }
-        Changed();
     }
     private async Task StartAfter(Task predecessor, McpMount? fresh)
     {

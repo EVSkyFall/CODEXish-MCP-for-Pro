@@ -51,6 +51,19 @@ Time bounds and workflow/scripts are unchanged. Follow-up Linux Release validati
 desktop core 57, regressions 11, browser-tests 183, and tray-tests 59; Windows-target/WPF cross-compilation again has
 0 errors and 4 MCP9005 warnings. Windows CI rerun remains required; cross-compilation is not execution.
 
+Second CI follow-up on `3774ea1`: [Windows job 123924765897](https://github.com/EVSkyFall/CODEXish-MCP-for-Pro/actions/runs/41013599138/job/123924765897)
+passed the shim connection, literal argument round-trip, supervisor PID and invalid batch argument checks,
+then failed after browser check 110 waiting for server removal/project override restoration. An injected
+save-during-reload regression reproduced the lost-save defect on Linux: the old code read generation A,
+a newer generation B was saved while A was being applied, and trailing stamp resampling consumed B's
+stamp without ever reading B. B then failed to apply within the existing 30-second test bound.
+Stamp capture now occurs before reading (including construction), never after applying; a concurrent save
+therefore remains visible to the next tick. Integration wait failures now print redacted mount states,
+errors, reload errors and published tool names before failing. No assertion or timeout was relaxed.
+The same three-check injected interleaving passed after the fix. Final Linux Release validation passed
+self-test 412, desktop core 57, regressions 11, browser-tests 186 and tray-tests 59. Windows-target/WPF
+cross-compilation passed with 0 errors and the same 4 MCP9005 warnings; Windows execution awaits CI.
+
 Known limitations remain: one backend is shared across conversations; ChatGPT refreshes tools/instructions only
 on a new list/initialization; stateless HTTP tool changes are learned on reconnect; no remote OAuth, MCP prompts,
 sampling, elicitation, other agents' user configuration or above-root instruction discovery. Windows batch

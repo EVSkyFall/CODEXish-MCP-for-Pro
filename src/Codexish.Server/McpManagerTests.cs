@@ -123,6 +123,7 @@ public static class McpManagerTests
         await PausedReplacement(check);
         RetainedBrowser(check);
         await ReloadRecoversUnexpectedFailure(check);
+        await SaveDuringReload(check);
     }
     private static async Task RapidReplacement(Action<bool, string> check)
     {
@@ -317,6 +318,49 @@ public static class McpManagerTests
             Save("subsequent-save");
             check(await Until(() => runtime.Mounts.ResourceTargets.Single().Identity == "subsequent-save") && Warning() is null,
                 "manager: later saves still apply normally after unexpected reload recovery");
+        }
+        finally { TestCleanup.RemoveDirectory(directory); }
+    }
+
+    private static async Task SaveDuringReload(Action<bool, string> check)
+    {
+        string directory = Path.Combine(Path.GetTempPath(), "codexish-mcp-save-during-read-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        string path = Path.Combine(directory, "codexish.json");
+        void Save(string identity)
+        {
+            File.WriteAllText(path + ".next", JsonSerializer.Serialize(new { mcp_servers = new Dictionary<string, object>
+            { [identity] = new { command = "unused-fixture", disabled = true } } }));
+            File.Move(path + ".next", path, overwrite: true);
+        }
+        static async Task<bool> Until(Func<bool> condition)
+        {
+            var clock = Stopwatch.StartNew();
+            while (!condition()) { if (clock.Elapsed > TimeSpan.FromSeconds(30)) return false; await Task.Delay(20); }
+            return true;
+        }
+        Save("initial");
+        try
+        {
+            using var runtime = new CodexishRuntime(new ServerConfig { StateDir = Path.Combine(directory, "state"), SourcePath = path }, true);
+            int saves = 0;
+            byte[]? savedBytes = null;
+            DateTime savedAt = default;
+            runtime.Mounts.AfterReloadRead = () =>
+            {
+                if (Interlocked.Increment(ref saves) != 1) return;
+                Save("generation-B-saved-during-read");
+                savedBytes = File.ReadAllBytes(path);
+                savedAt = File.GetLastWriteTimeUtc(path);
+            };
+            Save("generation-A");
+            runtime.Mounts.Start();
+            check(await Until(() => Volatile.Read(ref saves) > 0 && runtime.Mounts.ResourceTargets.Single().Identity == "generation-A"),
+                "manager: newer save lands after generation A was read but before A was published");
+            check(await Until(() => runtime.Mounts.ResourceTargets.Single().Identity == "generation-B-saved-during-read"),
+                "manager: save during reload is not consumed by trailing stamp bookkeeping and is applied on the next tick");
+            check(savedBytes is not null && File.ReadAllBytes(path).SequenceEqual(savedBytes) && File.GetLastWriteTimeUtc(path) == savedAt,
+                "manager: newer generation is applied without another file write or timestamp change");
         }
         finally { TestCleanup.RemoveDirectory(directory); }
     }
