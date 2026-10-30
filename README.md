@@ -18,7 +18,7 @@ and rebuilt, and old output is cleaned up.
 
 ## What ChatGPT gets
 
-24 tools. Paths are relative to the folders you share ("roots"), and each root has its own Read, Write and Shell
+26 native tools, plus configured MCP and browser tools. Paths are relative to the folders you share ("roots"), and each root has its own Read, Write and Shell
 switches.
 
 | Area | Tools |
@@ -28,11 +28,18 @@ switches.
 | Commands | `shell_run` (pwsh, Windows PowerShell or cmd), `process_start`, `process_poll`, `process_write`, `process_stop` |
 | Git (read-only) | `git_status`, `git_diff`, `git_log` |
 | Long output and retries | `artifact_read`, `artifact_search`, `operation_inspect`, `operation_cancel`, `session_checkpoint` |
+| MCP resources | `mcp_resource_list`, `mcp_resource_read` (local MCP and browser mounts) |
 | Desktop | `computer_observe` (screenshot plus UI Automation tree), `computer_query_ui`, `computer_act` (click, type, keys, scroll, drag, window focus) |
 
 Writes need the hash from the last read, so ChatGPT never overwrites a file that changed under it. A long command
 returns a handle instead of being killed, and a retried request never runs twice. Optional browser tools can be
 mounted from an existing browser MCP server such as Playwright MCP (see [Browser mounts](docs/reference.md#browser-mounts)).
+[Local MCP servers](docs/reference.md#local-mcp-servers) can also be copied into `mcp_servers` or `mcpServers` in
+`codexish.json`, or loaded from each root's `.mcp.json`, over stdio or HTTP. Saved mount changes reload without
+restarting CODEXish; only servers whose effective configuration changed restart. Mounted resources and server instructions reach ChatGPT alongside the tools. On Windows,
+child commands use current user-environment changes, including newly installed `npx`/`uvx` on PATH.
+Local Linux suites pass; CI and live Windows/Unity use from ChatGPT remain pending. See
+[verification status](IMPLEMENTATION_STATUS.md) for actual results.
 
 ## What you need
 
@@ -100,7 +107,7 @@ server. The tray icon shows the state with a dot: green running, grey stopped, a
    Tick **I understand and want to continue**, then choose **Create**.
 3. ChatGPT registers itself and opens the CODEXish sign-in page. Check that it says you will return to
    **chatgpt.com**, then enter your CODEXish password.
-4. ChatGPT lists the 24 tools. In a new chat, open **+**, choose **Developer mode**, and turn on CODEXish.
+4. ChatGPT lists the 26 native tools, plus configured MCP and browser tools. In a new chat, open **+**, choose **Developer mode**, and turn on CODEXish.
 
 The client ID and secret in the connection details are only for apps that ask for them; ChatGPT does not.
 **Create plugin** and **Upload plugin archive** on the same page are for packaged plugins; on the web they may say the
@@ -203,7 +210,7 @@ dotnet run --project src/Codexish.Server -c Release -- --tray-tests
 
 - [Security policy](SECURITY.md): the security model, what is in and out of scope, and how to report a vulnerability.
 - [Reference](docs/reference.md): configuration, OAuth, checkpoints and parallel conversations, the control API,
-  shells and Git, the ledger and retention, browser mounts, the tray, tests, and limits.
+  shells and Git, the ledger and retention, local MCP servers, browser mounts, the tray, tests, and limits.
 - [Design](docs/v1-design.md) and [plan](docs/v1-plan.md).
 - [Implementation status](IMPLEMENTATION_STATUS.md).
 - [P0 probe](docs/p0-probe.md): the original measurement fixture in `src/Codexish.P0`.

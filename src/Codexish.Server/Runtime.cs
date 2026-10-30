@@ -26,6 +26,8 @@ public sealed class CodexishRuntime : IDisposable
     public Tokens Tokens { get; }
     public ClientRegistry Clients { get; }
     public BrowserMounts Browsers { get; }
+    public McpMounts Mounts { get; }
+    public McpResources Resources { get; }
     public bool AuthDisabled { get; }
     public string HooksDirectory { get; }
     public IReadOnlyList<object> RecoveredProcesses { get; }
@@ -60,6 +62,7 @@ public sealed class CodexishRuntime : IDisposable
         AuthDisabled = authDisabled;
         // The environment is snapshotted once here so its secret-looking values can be stripped from output.
         Redaction.RefreshEnvironment();
+        ChildEnvironment.Initialize(message => Console.Error.WriteLine("fresh_environment_unavailable: " + message));
         Directory.CreateDirectory(config.StateDir);
         HooksDirectory = Path.Combine(config.StateDir, "git-hooks-empty");
         Directory.CreateDirectory(HooksDirectory);
@@ -79,6 +82,8 @@ public sealed class CodexishRuntime : IDisposable
             Tokens = new Tokens(Store, config);
             Clients = new ClientRegistry(Store, config);
             Browsers = new BrowserMounts(this);
+            Mounts = new McpMounts(this);
+            Resources = new McpResources(() => Mounts.ResourceTargets);
             RecoveredInvocations = Store.RecoverInvocations();
             RecoveredProcesses = Processes.Recover();
             Store.Event("server_start", null, new { version = ServerVersion, auth = authDisabled ? "disabled" : "oauth" });
@@ -98,7 +103,7 @@ public sealed class CodexishRuntime : IDisposable
     // D14. The harness text a connector shows the model before it plans anything.
     public const string Instructions =
         "You are operating the user's Windows PC through these tools. Work until the stated completion condition " +
-        "is met and verified; do not stop to ask unless permission is missing or the user cancels. Read before " +
+        "is met and verified; do not stop to ask unless permission is missing or the user cancels. Before changing files in a root, fs_read the instruction files workspace_info lists for it (AGENTS.override.md, AGENTS.md, CLAUDE.md, CLAUDE.local.md, .claude/CLAUDE.md) and the AGENTS.md or CLAUDE.md in each folder you work in. Read before " +
         "editing and pass the returned sha256 to writes. After every edit run the relevant tests or build and fix " +
         "observed failures. Long commands return handles: poll them; a response wait is not a deadline and never " +
         "kills the process. " + Ledger.InvocationIdGuidance + " Inspect unknown operations, " +
@@ -115,52 +120,57 @@ public sealed class CodexishRuntime : IDisposable
         ("lsp_*", "Not implemented; diagnostics come from the project's own build and test commands through shell_run."),
         ("git write tools (commit, checkout, push)", "Deliberate: Git writes run through shell_run under the root's shell grant, so one execution policy covers them."),
         ("approval tools", "There is no per-action approval UI. Grants live in codexish.json and are decided by the local user."),
-        ("clipboard, env passthrough", "Environment variables are never returned, and the clipboard is not a capability of this slice."),
+        ("clipboard, environment values", "Environment variable values are never returned. Mounted stdio servers receive an allowlisted environment plus the variables named in their env and env_vars, which host_capabilities lists by name only. The clipboard is not a capability of this slice."),
         ("fs_mkdir / fs_move / fs_delete", "Not in this slice; fs_apply_patch creates and deletes files, and shell_run covers the rest."),
         ("OS-isolated execution", "There is no sandbox. shell_run, builds, tests and git hooks run with the logged-in user's full rights.")
     ];
 
-    public object Capabilities() => new
+    public object Capabilities()
     {
-        server = new { name = "CODEXish", version = ServerVersion },
-        protocol_version = ProtocolVersion,
-        schema_version = Reply.SchemaVersion,
-        execution_boundary = Reply.Boundary,
-        boundaries = new
+        var mounts = Mounts.CaptureCapabilities();
+        return new
         {
-            structured_file_scope = "fs_* tools are fenced to the configured roots and verify every opened handle.",
-            os_isolated_execution = "none verified; no sandbox, job objects supervise lifetime only, not privilege",
-            user_privilege_scope = "shell_run, process_start, builds, tests and any git hook run as the logged-in Windows user."
-        },
-        roots = Config.Roots.Select(r => new { id = r.Id, path = r.Path, exists = Directory.Exists(r.Path), grants = new { r.Read, r.Write, r.Shell } }),
-        warnings = Warnings,
-        tools = ToolNames.Concat(Browsers.Tools.Select(t => t.ProtocolTool.Name)).ToArray(),
-        browser = Browsers.Describe(),
-        desktop = new { native_available = OperatingSystem.IsWindows(), coordinate_space = "virtual desktop physical pixels", uia_thread = "dedicated MTA", input_tick = "metadata only" },
-        unsupported = Unsupported.Select(u => new { feature = u.Feature, reason = u.Reason }),
-        limits = Limits.Describe(),
-        shell = new
-        {
-            @default = Config.Shell.Default, allowed = Config.Shell.Allowed, usable = Config.Shell.Usable,
-            used_without_shell = Config.Shell.EffectiveDefault,
-            interpreters = Config.Shell.Usable.ToDictionary(s => s, ProcessSupervisor.ResolveShell)
-        },
-        git = new { configured = Config.Git.Path, path = Git.Resolved, available = Git.Available, read_only = true, execution = GitService.Execution },
-        ledger_rebuilt = Store.Rebuilt is { } rebuilt ? new { at = rebuilt.At, quarantined = rebuilt.Quarantined, reason = rebuilt.Reason } : null,
-        retention = Retention.Describe(),
-        redaction = Redaction.Disclosure,
-        authentication = AuthDisabled ? "disabled (loopback development only)" : "built-in OAuth 2.1 with PKCE, opaque bearer tokens",
-        paused = Ledger.Paused,
-        checkpoint = LatestCheckpoint(),
-        checkpoints = NewestCheckpoints(),
-        recovery = new
-        {
-            invocations_cancelled_on_restart = RecoveredInvocations.Cancelled,
-            invocations_unknown_on_restart = RecoveredInvocations.Unknown,
-            processes = RecoveredProcesses
-        },
-        next_tool = "workspace_info"
-    };
+            server = new { name = "CODEXish", version = ServerVersion },
+            protocol_version = ProtocolVersion,
+            schema_version = Reply.SchemaVersion,
+            execution_boundary = Reply.Boundary,
+            boundaries = new
+            {
+                structured_file_scope = "fs_* tools are fenced to the configured roots and verify every opened handle.",
+                os_isolated_execution = "none verified; no sandbox, job objects supervise lifetime only, not privilege",
+                user_privilege_scope = "shell_run, process_start, builds, tests and any git hook run as the logged-in Windows user."
+            },
+            roots = Config.Roots.Select(r => new { id = r.Id, path = r.Path, exists = Directory.Exists(r.Path), grants = new { r.Read, r.Write, r.Shell } }),
+            warnings = Warnings,
+            tools = ToolNames.Concat(mounts.Tools).ToArray(),
+            browser = mounts.Browser,
+            mcp = mounts.Mcp,
+            desktop = new { native_available = OperatingSystem.IsWindows(), coordinate_space = "virtual desktop physical pixels", uia_thread = "dedicated MTA", input_tick = "metadata only" },
+            unsupported = Unsupported.Select(u => new { feature = u.Feature, reason = u.Reason }),
+            limits = Limits.Describe(),
+            shell = new
+            {
+                @default = Config.Shell.Default, allowed = Config.Shell.Allowed, usable = Config.Shell.Usable,
+                used_without_shell = Config.Shell.EffectiveDefault,
+                interpreters = Config.Shell.Usable.ToDictionary(s => s, ProcessSupervisor.ResolveShell)
+            },
+            git = new { configured = Config.Git.Path, path = Git.Resolved, available = Git.Available, read_only = true, execution = GitService.Execution },
+            ledger_rebuilt = Store.Rebuilt is { } rebuilt ? new { at = rebuilt.At, quarantined = rebuilt.Quarantined, reason = rebuilt.Reason } : null,
+            retention = Retention.Describe(),
+            redaction = Redaction.Disclosure,
+            authentication = AuthDisabled ? "disabled (loopback development only)" : "built-in OAuth 2.1 with PKCE, opaque bearer tokens",
+            paused = Ledger.Paused,
+            checkpoint = LatestCheckpoint(),
+            checkpoints = NewestCheckpoints(),
+            recovery = new
+            {
+                invocations_cancelled_on_restart = RecoveredInvocations.Cancelled,
+                invocations_unknown_on_restart = RecoveredInvocations.Unknown,
+                processes = RecoveredProcesses
+            },
+            next_tool = "workspace_info"
+        };
+    }
 
     public object WorkspaceInfo() => new
     {
@@ -170,7 +180,8 @@ public sealed class CodexishRuntime : IDisposable
             path = r.Path,
             grants = new { r.Read, r.Write, r.Shell },
             exists = Directory.Exists(r.Path),
-            is_git_repository = Directory.Exists(Path.Combine(r.Path, ".git")) || File.Exists(Path.Combine(r.Path, ".git"))
+            is_git_repository = Directory.Exists(Path.Combine(r.Path, ".git")) || File.Exists(Path.Combine(r.Path, ".git")),
+            instruction_files = InstructionFiles(r.Path)
         }),
         state_dir = Config.StateDir,
         state_dir_note = Config.Roots.Any(r => PathRules.IsInside(r.Path, Config.StateDir) || PathRules.IsInside(Config.StateDir, r.Path))
@@ -190,6 +201,18 @@ public sealed class CodexishRuntime : IDisposable
         checkpoint = LatestCheckpoint(),
         next_tool = "fs_list or git_status"
     };
+
+    internal static object[] InstructionFiles(string root)
+    {
+        try
+        {
+            if (!Directory.Exists(root)) return [];
+            return new[] { "AGENTS.override.md", "AGENTS.md", "CLAUDE.md", "CLAUDE.local.md", ".claude/CLAUDE.md" }
+                .Select(path => (Path: path, File: new FileInfo(Path.Combine(root, path))))
+                .Where(item => item.File.Exists).Select(item => (object)new { path = item.Path, size = item.File.Length }).ToArray();
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or System.Security.SecurityException) { return []; }
+    }
 
     // The newest checkpoint of all tasks.
     public object? LatestCheckpoint() => Store.LatestCheckpoint() is { } row ? DescribeCheckpoint(row) : null;
@@ -232,7 +255,7 @@ public sealed class CodexishRuntime : IDisposable
         "host_capabilities", "workspace_info", "fs_list", "fs_read", "fs_search", "fs_stat", "fs_write",
         "fs_apply_patch", "shell_run", "process_start", "process_poll", "process_write", "process_stop",
         "git_status", "git_diff", "git_log", "artifact_read", "artifact_search", "operation_inspect",
-        "operation_cancel", "session_checkpoint", "computer_observe", "computer_query_ui", "computer_act"
+        "operation_cancel", "session_checkpoint", "computer_observe", "computer_query_ui", "computer_act", "mcp_resource_list", "mcp_resource_read"
     ];
 
     // Every step runs even when an earlier one fails, and the store and the state-directory lock are released in

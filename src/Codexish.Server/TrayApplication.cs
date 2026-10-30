@@ -639,7 +639,7 @@ public static class TrayApplication
                 var before = owner.State;
                 bool serverWasRunning = before.Server != "stopped", tunnelWasRunning = before.Tunnel != "stopped";
                 await owner.StopAsync();
-                candidate.Save(path);
+                ServerConfig.SaveRoots(path, candidate.Roots);
                 editing.Roots = candidate.Roots;
                 // The running configuration is reused on the next start; recompute its warnings for the new roots.
                 editing.Validate();

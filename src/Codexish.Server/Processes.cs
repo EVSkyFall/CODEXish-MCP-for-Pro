@@ -86,14 +86,16 @@ public sealed class ProcessSupervisor(Store store, Artifacts artifacts, ServerCo
             RedirectStandardError = true,
             CreateNoWindow = true
         };
+        var environment = ChildEnvironment.Capture(error => store.Event("fresh_environment_unavailable", null, new { error }));
+        start.Environment.Clear();
+        foreach (var (name, value) in environment) start.Environment[name] = value;
         string display;
         string? chosenShell = null, interpreter = null;
         if (!string.IsNullOrEmpty(executable))
         {
             if (!string.IsNullOrEmpty(command))
                 throw new CodexishFault("INVALID_ARGUMENT", "Supply either executable+args or command+shell, not both.");
-            start.FileName = executable;
-            foreach (string argument in args ?? []) start.ArgumentList.Add(argument);
+            ChildEnvironment.ConfigureStart(start, executable, args ?? [], environment);
             display = executable + (args is { Length: > 0 } ? " " + string.Join(' ', args) : "");
         }
         else if (!string.IsNullOrEmpty(command))
@@ -106,7 +108,7 @@ public sealed class ProcessSupervisor(Store store, Artifacts artifacts, ServerCo
                     string.IsNullOrWhiteSpace(shell)
                         ? "No shell is allowed in shell.allowed, so a command string cannot run; use executable plus args."
                         : $"shell '{shell}' is not in shell.allowed ({string.Join(", ", allowed)}).");
-            interpreter = ResolveShell(chosenShell);
+            interpreter = ResolveShell(chosenShell, environment);
             start.FileName = interpreter;
             if (chosenShell == "cmd")
             {
@@ -119,6 +121,7 @@ public sealed class ProcessSupervisor(Store store, Artifacts artifacts, ServerCo
                 start.ArgumentList.Add("-NonInteractive");
                 start.ArgumentList.Add("-Command");
                 start.ArgumentList.Add(command);
+                ChildEnvironment.ConfigureStart(start, interpreter, start.ArgumentList.ToArray(), environment);
             }
             display = chosenShell + ": " + command;
         }
@@ -211,8 +214,16 @@ public sealed class ProcessSupervisor(Store store, Artifacts artifacts, ServerCo
 
     // pwsh: PATH, then the newest %ProgramFiles%\PowerShell\*\pwsh.exe, then Windows PowerShell. Looked up on every call,
     // so an interpreter installed, moved or upgraded later is found without a restart.
-    public static string ResolveShell(string shell) => ResolveShell(shell, Environment.GetEnvironmentVariable("PATH"),
-        Environment.GetEnvironmentVariable("ProgramFiles"), OperatingSystem.IsWindows() ? Environment.SystemDirectory : null);
+    public static string ResolveShell(string shell) => ResolveShell(shell, ChildEnvironment.Capture());
+
+    private static string ResolveShell(string shell, IReadOnlyDictionary<string, string?> environment)
+    {
+        string command = shell == "cmd" ? "cmd.exe" : shell == "powershell" ? "powershell.exe" : "pwsh";
+        string found = ChildEnvironment.ResolveCommand(command, environment, Environment.CurrentDirectory);
+        if (found != command) return found;
+        return ResolveShell(shell, null, environment.GetValueOrDefault("ProgramFiles"),
+            OperatingSystem.IsWindows() ? Environment.SystemDirectory : null);
+    }
 
     public static string ResolveShell(string shell, string? pathVariable, string? programFiles, string? systemDirectory) => shell switch
     {

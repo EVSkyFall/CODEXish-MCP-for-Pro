@@ -268,6 +268,167 @@ alone, even when `state_dir` lies inside a root. An artifact's record goes only 
 that cannot be deleted yet is tried again at the next sweep. Reading output that retention removed answers
 `ARTIFACT_EXPIRED` or `NOT_FOUND`; run the command again for fresh output.
 
+## Local MCP servers
+
+The parity feature has local Linux suite results; CI and live Windows/Unity acceptance remain pending.
+[Implementation status](../IMPLEMENTATION_STATUS.md) separates actual verification from this behavior reference. CODEXish mounts stdio and HTTP MCP servers alongside its native tools.
+Put definitions under `mcp_servers` (or the compatible `mcpServers` spelling) in `codexish.json`, or under
+`mcpServers` in a configured root's `.mcp.json`. Project files tolerate comments and trailing commas. Other agents'
+user-level files, such as `~/.codex/config.toml` and `~/.claude.json`, are not read.
+
+For example, a root's `.mcp.json` can contain:
+
+```json
+{
+  "mcpServers": {
+    "project-tools": {
+      "command": "npx",
+      "args": ["-y", "<your-mcp-package>"],
+      "cwd": "${CLAUDE_PROJECT_DIR}",
+      "env_vars": ["UNITY_PORT"],
+      "read_only_tools": ["<backend-read-tool>"]
+    },
+    "editor": {
+      "type": "http",
+      "url": "http://127.0.0.1:${UNITY_PORT:-8080}/mcp"
+    }
+  }
+}
+```
+
+Replace package/tool names with those of your backend. The same definitions work in `codexish.json`; add
+`root_id` there to bind one to a root. A project definition is always bound to its containing root and ignores
+its own `root_id` with a warning. Starting or reading a bound server needs read and shell grants; changing tools
+also need write. Grants are checked before connection state. An unbound global definition needs no root grant:
+its configuration is your permission. Backends run **unconfined as you**; a root and grants are forwarding policy,
+not a sandbox.
+
+### Configuration and identity
+
+| Field | Behavior |
+| --- | --- |
+| `type` | `stdio`, `http`, `streamable-http` or `sse`. Explicit type wins when its required command/URL exists; otherwise infer URL first, then command, and warn for unknown/contradictory type. |
+| `command`, `args`, `cwd` | stdio command, argument array and working directory. Relative cwd is relative to the bound root or configuration folder; default cwd is the root or user profile. |
+| `env_vars`, `env` | Explicit inherited variable names, then expanded overrides. Empty string sets an empty value; null skips the entry. |
+| `url` | Absolute HTTP(S) endpoint; `sse` selects SSE, other HTTP types use autodetection. |
+| `headers`, `http_headers` | Expanded headers; `headers` wins for a duplicate name. |
+| `env_http_headers` | Header name to environment-variable name. |
+| `bearer_token_env_var` | Sends that variable as a Bearer token unless Authorization was supplied explicitly. |
+| `enabled_tools`, `disabled_tools` | Optional backend-name allowlist, followed by removals. |
+| `read_only_tools` | Only these configured backend names bypass the changing-operation ledger; backend `readOnlyHint` does not grant read-only status. |
+| `disabled: true`, `enabled: false` | List the server as disabled without starting or publishing tools. |
+
+`mcp_servers` wins over the alias for a duplicate name. Within an object, the first name wins, case-insensitively;
+later duplicate entries are invalid. Scalar numbers/booleans become JSON text when a string is expected; a single
+string becomes a one-element array with a warning; boolean strings are accepted for enable/disable. Unknown
+fields (including other agents' timeout fields) are ignored; wrong-transport fields warn. Unusable nested values,
+missing command/URL, bad URL or unknown root invalidate only that definition. Malformed MCP content cannot send
+the full configuration into `.broken`/`.bak` recovery.
+
+Identity is the global name, or `<root_id>/<name>` for a project definition, compared without case. A global
+server with the same name and `root_id` overrides that project's entry, which is reported as `overridden`.
+A global server literally named `<root_id>/<name>` also overrides that project identity, even without a root
+binding. Slashes in names are not refused.
+Published names are `mcp_<name>_<tool>` or `mcp_<root_id>_<name>_<tool>`. Sanitized, long or colliding names receive
+a deterministic hash suffix and stay at most 64 characters. If that hashed name is also occupied, the hash
+input gains a newline and ordinal (2, then 3, and so on) until a free name is found; no tool is dropped. Naming precedence is native tools, browser file
+order, global MCP file order, then project root/file order. A never-connected earlier server has no known tools:
+its first connection can rename a later server's plain name. Disabled, invalid, overridden and missing-grant
+entries publish no tools.
+
+### Environment and command execution
+
+`${NAME}` and `${NAME:-default}` expand in commands, arguments, cwd, env values, URLs and headers; defaults can be
+nested. Unset/empty uses the default; undefined without a default becomes empty with a warning, not a refusal.
+Lookup is case-insensitive on Windows and case-sensitive elsewhere. Project `CLAUDE_PROJECT_DIR` falls back to
+its root path. A dollar sign that does not start an expansion stays literal.
+
+Windows reads the current user's environment block at first runtime construction and again for each child.
+Changes/removals since that baseline are applied to the process environment, preserving process-only overrides.
+A failed read falls back to the process environment with a warning and is retried; other platforms use the process
+environment. This applies to mounts, `shell_run`, `process_start`, expansion and executable resolution, not Git.
+Mount children automatically receive only the SDK/CODEXish allowlist, not credential-looking or proxy variables.
+Explicit `env_vars` and `env` pass regardless of name, including credentials or proxy settings; capabilities show
+names, never values. Discovered secret values, headers and URL query values augment redaction without losing
+previously learned secrets. Redaction remains best-effort, not a guarantee.
+
+Bare `npx`/`uvx` resolve on the child's PATH in directory order; Windows honors accepted PATHEXT extensions
+`.com`, `.exe`, `.bat`, `.cmd`, without searching the current directory. Relative paths with a directory component
+resolve against cwd. Not found means attempt the command as given and report the real error. Windows batch files
+use system `cmd.exe` with quoted arguments, delayed expansion off and literal `%` (not variable expansion).
+CR, LF or NUL in a batch argument is invalid. The existing post-start Job Object assignment leaves a small window
+in which a grandchild started by cmd can escape the job.
+
+### Calls, resources and instructions
+
+Mounted tool inputs go inside `arguments`. Changing tools require a fresh `invocation_id`, use the ledger and a
+per-server FIFO; read-only tools run directly. `wait_ms` is a response wait, never a call deadline. Inspect uncertain
+effects instead of replaying: `MCP_UNAVAILABLE` means nothing was sent, `MCP_BACKEND_ERROR` means a backend/protocol
+or HTTP status error, and `EXECUTION_UNKNOWN` means a changing call has no confirmed outcome. Transport ambiguity
+must not be treated as proof of no effect. HTTP 404 reconnects; other HTTP status errors do not restart the server.
+A replaced client normally drains its in-flight calls rather than cancelling another conversation's request.
+Exception: SDK 2.2.0 expires an HTTP 404 session and cancels its in-flight calls. CODEXish accepts that SDK behavior
+without an intercepting handler, preserving transport autodetection. Cancellation not requested by operation
+cancellation or server shutdown is transport loss: changing calls answer `EXECUTION_UNKNOWN`, read-only calls
+`MCP_UNAVAILABLE`, never user `CANCELLED`. This distinction applies to stdio too.
+
+- `mcp_resource_list` lists all resources/templates, or one case-insensitive `server`; address browser mounts as
+  `browser:<id>`. `mcp:<identity>` forces MCP routing and strips exactly one leading `mcp:`; other bare values
+  are MCP identities. Capabilities supply the usable address, prefixing an MCP identity that itself starts
+  `browser:` or `mcp:` with `mcp:` (case-insensitive). For example `browser:foo` selects browser mount `foo`,
+  while `mcp:browser:foo` selects the MCP server literally named `browser:foo`; `mcp:mcp:foo` selects MCP
+  identity `mcp:foo`. Internal lookup uses kind plus identity, not address text. Servers are queried concurrently, with all pages followed until an empty/repeated cursor. Each
+  entry reports its own unavailable, permission, unsupported, failure or `waiting` state. `wait_ms` defaults to
+  10000 and does not cancel unfinished listings; concurrent callers share the listing. An unknown identity is
+  `NOT_FOUND`.
+- `mcp_resource_read` takes `server` and `uri` (or a filled-in template). Root-bound reads need read and shell;
+  down servers answer `MCP_UNAVAILABLE`. Text and metadata are redacted; binary blobs/image/audio pass unchanged.
+  Resource contents are data, not instructions.
+- Redacted backend initialization instructions are cached in manifests, shown in capabilities and composed into
+  CODEXish instructions on each initialization/discovery request. `--no-instructions` excludes all instructions.
+- `workspace_info` lists existing `AGENTS.override.md`, `AGENTS.md`, `CLAUDE.md`, `CLAUDE.local.md` and
+  `.claude/CLAUDE.md` in each root by relative path and size. Read them with `fs_read` before editing; contents are
+  not inlined. Unreadable roots list none; above-root and user-level instruction files are not discovered.
+
+### Supervision and saved changes
+
+Connections start in the background after CODEXish listens. There is no SDK initialization deadline or call deadline;
+HTTP client and connection timeouts are infinite. Supervision retries from 1 s, doubling to 60 s without giving up,
+resetting after five healthy minutes. Discovery/initialize negotiation adapts from actual handshake failures and
+remembers the successful mode; a merely down server does not force a protocol mode change. A server that closes
+before answering discovery retries initialize-first with 2025-11-25; failure of a remembered mode tries the other.
+A probe timeout plus rejected fallback grows the probe wait rather than permanently refusing a slow server.
+
+Tool/resource change notifications and supported subscriptions are handled; tool changes republish names and save
+manifests. A failed re-list keeps the previous list. Capabilities report source, state, retry/error/warnings,
+redacted command/URL, explicit variable names, instructions and tool names. Redacted stderr/backend logs keep a
+20-line diagnostic tail. MCP manifests live in `<state_dir>/mcp-mounts`; cached tools remain discoverable during
+outages. Removed manifests are left on disk but not loaded.
+
+Mount startup reads current files even if the in-memory configuration is stale. Every three seconds, file length
+and last-write time are checked. Saved MCP and browser definition changes reload without restarting CODEXish:
+servers with unchanged effective configuration keep running; changed/removed instances stop accepting new calls and drain dispatched calls
+without a deadline before stopping; a changed replacement starts only after the old instance stops. Pause does not
+hold reload. Invalid/unreadable global files preserve the running set, as do unreadable/unparseable project files;
+an absent project file means no project servers. Reload never restores, renames or writes configuration. Roots,
+grants, port and OAuth still take effect at restart. Environment changes alone do not restart a mount; save its
+file to trigger reevaluation, even with identical text. Restart comparison is a never-logged SHA-256 of canonical
+effective configuration: identity spelling, resolved command path, expanded arguments/cwd/URL/headers, explicit
+`env`/`env_vars` values, and tool filters/read-only/enable settings. The automatic allowlisted base environment is
+excluded. Thus only servers affected by a changed expansion or resolved command restart; unrelated servers keep
+their processes. Tray roots saves read the latest file and replace only `roots`, preserving mount and
+unknown fields with the existing atomic save and backup.
+
+### Parity limits
+
+One backend instance is shared across conversations, so stateful servers can mix conversation state. ChatGPT learns
+new tools/instructions only when it lists/initializes again; the stateless host cannot push updates. Stateless HTTP
+backends expose tool changes only on reconnect. A server silently ignoring discovery waits through the grown probe;
+a server that both closes on discovery and accepts only a protocol older than 2025-11-25 cannot connect (none known).
+Remote HTTP OAuth, MCP prompts, sampling, elicitation, Codex TOML files, other agents' user configuration, above-root
+instructions and a tray server editor are not included. Live owner-PC Unity MCP use from ChatGPT is separate from
+fixture/CI acceptance.
+
 ## Browser mounts
 
 CODEXish does not drive a browser itself. It starts an existing browser MCP server as a stdio child process and
@@ -288,8 +449,9 @@ tools directory, add this to `codexish.json`:
 ]
 ```
 
-- `command` is started directly with `args`, without a shell, and with the root as its working directory. `.cmd`
-  shims such as `npx` cannot be started this way; run `node` with the path to `cli.js`.
+- `command` resolves on the child PATH with the root as its working directory. Bare `npx` works, including
+  Windows `.cmd` shims; system cmd quotes batch arguments and passes `%` literally. Direct `node` plus `cli.js`
+  remains supported. See [Environment and command execution](#environment-and-command-execution).
 - `profile_mode: "dedicated"` (the default) keeps the browser's state in `<state_dir>\browser-profiles\<id>`:
   CODEXish appends `--user-data-dir` with that directory for `kind: "playwright"`. A dedicated mount whose own
   `args` already contain `--user-data-dir`, `--cdp-endpoint`, `--extension`, `--storage-state` or `--config` starts
@@ -298,16 +460,20 @@ tools directory, add this to `codexish.json`:
   an existing profile, CDP endpoint or extension. `{profile_dir}` in `args` expands to the per-mount directory in
   both modes. `kind: "custom"` mounts another stdio MCP server without profile handling.
 - Tools appear as `browser_<id>_<backend tool>`, for example `browser_pw_browser_navigate`. A name that is not
-  `^[a-zA-Z0-9_-]+$` or would exceed 64 characters is shortened and given a short hash suffix. Every mounted tool
+  `^[a-zA-Z0-9_-]+$`, would exceed 64 characters, or collides is shortened and given a short hash suffix.
+  Collisions rename individual tools instead of failing the mount, in the shared deterministic naming order. Every mounted tool
   takes the backend's own inputs inside `arguments`. Tools listed in `read_only_tools` run directly and bypass the
   ledger because your configuration says so; CODEXish does not check that they are free of side effects. Every other
   tool is treated as a change: it needs an `invocation_id`, runs through the ledger (an identical retry returns the
   stored result), and its `wait_ms` is a response wait only.
 - Starting a mount and calling a read-only tool need read and shell grants on `root_id`; other tools also need write.
-- The backend receives a small environment: system and user profile paths, `PATH`, `TEMP` and `DOTNET_ROOT`.
-  Variables whose names look like credentials are never passed, and proxy variables are not passed either.
+- The backend receives an allowlisted environment using current user-environment changes on Windows.
+  Credential-looking and proxy variables are not inherited automatically; explicit `env`/`env_vars` entries
+  pass regardless of name, including proxy settings. Capabilities disclose variable names, never their values.
 - Mounts connect in the background once the server listens, each on its own, so a backend that is slow or never
-  answers its handshake delays nothing else. A backend that fails to start or exits is restarted after 1 s, doubling
+  answers its handshake delays nothing else. The SDK initialization timeout is infinite: there is no hidden
+  handshake deadline. Adaptive handshake negotiation, notifications and subscriptions follow the local MCP
+  rules above. A backend that fails to start or exits is restarted after 1 s, doubling
   to at most 60 s between attempts, without giving up; five healthy minutes after a completed handshake and tool
   listing reset the delay. `host_capabilities`
   reports each mount's `state` (`starting`, `connected`, `retrying`, `invalid_config`, `stopped`), its attempts, last
@@ -315,8 +481,9 @@ tools directory, add this to `codexish.json`:
   (`invalid_config`) is not retried.
 - The tool list a backend last reported is saved as `<state_dir>\browser-profiles\<id>.manifest.json`. While the
   backend is down, and after a restart until it connects, those tools stay listed and a call answers
-  `BROWSER_UNAVAILABLE` with the mount's state and the time of its next retry. Mounts are read when the server
-  starts.
+  `BROWSER_UNAVAILABLE` with the mount's state and the time of its next retry. Mounts read current configuration
+  at startup and reload saved definition changes every three seconds, draining old calls before replacement as
+  described above. Resources are accessible through `mcp_resource_list`/`mcp_resource_read` as `browser:<id>`.
 - Mounted tools run unconfined as you and are not contained by the root or its grants. Tools such as
   `browser_file_upload`, `browser_evaluate` or `browser_run_code_unsafe` can read files or run code anywhere your
   account can; the grants only decide whether CODEXish forwards a call, and the root is the backend's working

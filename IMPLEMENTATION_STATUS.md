@@ -2,6 +2,47 @@
 
 Updated 2026-09-17. Mainline **A / PR #4** is unchanged. Desktop **PR #5 remains Draft**. No merge, force push, branch deletion, or whole-product completion is reported.
 
+## Local MCP parity — local Linux verification; CI/live acceptance pending (2026-10-30)
+
+Work branch `dot/local-mcp-parity`, originally created from `claude/stoic-ptolemy-t6updn` at
+`7979744f8a923daa21e43e449b411ff49f082f3d`, then advanced to the approved source update `086cd2b`;
+specification: `docs/local-mcp-parity-plan.md` revision 5.
+This section records the new work separately from the historical results below. The final sequential Release
+suites ran locally on Linux; their successful results do not establish CI, Windows runtime or ChatGPT acceptance.
+
+Scope: local/global MCP definitions over stdio and HTTP; current user environment and command resolution;
+resources (26 native tools), server/project instructions, supervision/list changes/manifests, mount reload and
+collision naming; roots-only tray saves. No merge, deployment or owner-PC configuration change is claimed.
+
+| Verification | Result for this parity work |
+| --- | --- |
+| Linux Release build | 0 errors, 4 MCP9005 roots warnings |
+| Isolated Windows/WPF cross-compilation of the final source | 0 errors, the same 4 MCP9005 warnings; compile only, not a Windows execution |
+| `--self-test` | Exit 0; SELF_TEST_PASSED 412, DESKTOP_CORE_PASSED 57, DESKTOP_REGRESSIONS 11 passed / 0 failed (fake platform) |
+| `--browser-tests` | Exit 0; BROWSER_TESTS_PASSED 178; real fixture transports and HTTP host, not a real browser/ChatGPT trial |
+| `--tray-tests` | Exit 0; TRAY_CONTROLLER_PASSED 59; Windows-only checks skipped with reasons |
+| CI ubuntu-latest / windows-latest, all three entries | Not yet recorded; required before acceptance |
+| Owner's real Unity MCP via `uvx`/`npx` stdio and HTTP, used from ChatGPT | Not run by this work; separate live acceptance required |
+
+The integration lead ran the final suites sequentially. Local logs are
+`/tmp/local-mcp-final-self-test.log`, `/tmp/local-mcp-final-browser-tests.log` and
+`/tmp/local-mcp-final-tray-tests.log`; these are execution-workspace evidence, not repository artifacts.
+Windows-only runtime checks, notification icon, live desktop, real Unity MCP and ChatGPT were not run.
+
+Earlier integration failures are retained here rather than replaced by the passing result:
+- Browser runs stopped at checks 54 (null arguments) and 82 (pending state); both were corrected before rerunning.
+- The revision-4 HTTP 404 expectation conflicted with SDK session expiry; approved revision 5 specifies expiry
+  and classifies unrequested cancellation as transport loss rather than user cancellation. Tests follow that decision.
+- A browser run failed at check 107 because the fixture HOME did not exist; an explicit hermetic fixture cwd and
+  valid HOME corrected the fixture environment.
+- A self-test run failed at check 213 on a File.Exists-before-close race; waiting for ledger completion corrected
+  the observation ordering. No passing count from these failed runs is treated as final acceptance.
+
+Known limitations remain: one backend is shared across conversations; ChatGPT refreshes tools/instructions only
+on a new list/initialization; stateless HTTP tool changes are learned on reconnect; no remote OAuth, MCP prompts,
+sampling, elicitation, other agents' user configuration or above-root instruction discovery. Windows batch
+children retain the post-start Job Object grandchild window. See the reference for the full behavior and limits.
+
 ## Dynamic Client Registration (pass 4) — local Windows results (2026-09-26)
 
 Branch `feat/v1-connect-hardening`, on top of 00c2b9c (Draft PR #7); the runs below used the uncommitted working tree on the authorized Windows 11 PC with portable SDK 10.0.401. Nothing here involved ChatGPT, a tunnel, a notification icon, the user's configuration or install, the real Startup folder or port 38451. Why: ChatGPT Plugins (Settings → Security and login → Developer mode; ChatGPT Plugins → +) documents only CIMD and DCR for client registration, and a server with only a pre-registered client can fail there.

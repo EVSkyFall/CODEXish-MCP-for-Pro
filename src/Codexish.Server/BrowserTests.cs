@@ -506,6 +506,12 @@ public static class BrowserTests
                     "null mount entries, ids, argument items, kinds and profile modes are invalid_config and null lists become empty, without throwing out of initialization");
             }
 
+            await McpResourceTests.Run(Check);
+            await LocalMcpIntegrationTests.Run(Check);
+            await McpNotificationTests.Run(Check);
+            await McpHttpTests.Run(Check);
+            await McpManagerTests.Run(Check);
+            await McpHandshakeIntegrationTests.Run(Check);
             Console.WriteLine($"BROWSER_TESTS_PASSED: {passed}; real stdio fixture behind the real HTTP host, not a browser or ChatGPT trial.");
             return 0;
         }

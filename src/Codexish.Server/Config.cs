@@ -3,6 +3,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.Json.Nodes;
 
 namespace Codexish.Server;
 
@@ -71,6 +72,8 @@ public sealed class ServerConfig
     [JsonPropertyName("git")] public GitConfig Git { get; set; } = new();
     [JsonPropertyName("oauth")] public OAuthConfig OAuth { get; set; } = new();
     [JsonPropertyName("control_token")] public string ControlToken { get; set; } = "";
+    [JsonPropertyName("mcp_servers")] public JsonElement? McpServers { get; set; }
+    [JsonPropertyName("mcpServers")] public JsonElement? McpServersAlias { get; set; }
     [JsonPropertyName("browser_mounts")] public BrowserMountConfig[] BrowserMounts { get; set; } = [];
     [JsonPropertyName("tunnel")] public TunnelConfig Tunnel { get; set; } = new();
     [JsonPropertyName("retention")] public RetentionConfig Retention { get; set; } = new();
@@ -186,6 +189,17 @@ public sealed class ServerConfig
         if (directory is not null) Directory.CreateDirectory(directory);
         WriteAtomically(full, new UTF8Encoding(false).GetBytes(JsonSerializer.Serialize(this, Format)), full + ".bak");
         SourcePath = full;
+    }
+
+    // The tray edits only roots. Read the file at save time, not the stale configuration it displayed,
+    // preserving other applications' and future versions' fields as JSON nodes.
+    public static void SaveRoots(string path, RootConfig[] roots)
+    {
+        string full = System.IO.Path.GetFullPath(path);
+        var current = JsonNode.Parse(File.ReadAllBytes(full), documentOptions: McpConfiguration.JsonOptions) as JsonObject
+            ?? throw new InvalidDataException("The configuration is not a JSON object; roots were not saved.");
+        current["roots"] = JsonSerializer.SerializeToNode(roots);
+        WriteAtomically(full, Encoding.UTF8.GetBytes(current.ToJsonString(Format)), full + ".bak");
     }
 
     // A temporary file in the same directory is written and flushed, then swapped in with File.Replace, or moved into

@@ -384,7 +384,7 @@ public sealed class TrayController(ServerConfig config) : IAsyncDisposable
                 host.Lifetime.ApplicationStopping.Register(() => stopping.TrySetResult());
                 runtime = candidate; app = host;
                 ServerChanged(address);
-                Log("Server started at " + address + "; browser mounts: " + candidate.Browsers.Summary());
+                Log("Server started at " + address + "; browser mounts: " + candidate.Browsers.Summary() + "; MCP servers: " + candidate.Mounts.Summary());
                 foreach (string warning in candidate.Warnings) Log("Warning: " + warning);
                 return stopping.Task;
             }
@@ -957,6 +957,25 @@ public static class TrayTests
             Check(unreadable is null && why!.Contains("could not be read", StringComparison.Ordinal) && refused is null && refusal!.Contains("requires https", StringComparison.Ordinal) &&
                   usable is not null && none is null,
                 "loading for the tray never throws: an unreadable file or a refused public_url comes back as the reason to show and retry");
+
+            // Simulate a file update after the tray loaded its configuration, then save only roots.
+            var editedJson = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(configPath))!.AsObject();
+            editedJson["mcp_servers"] = System.Text.Json.Nodes.JsonNode.Parse("{\"fresh\":{\"command\":\"fresh-command\"}}");
+            editedJson["mcpServers"] = System.Text.Json.Nodes.JsonNode.Parse("{\"alias\":{\"url\":\"http://localhost/mcp\"}}");
+            editedJson["browser_mounts"] = System.Text.Json.Nodes.JsonNode.Parse("[{\"id\":\"fresh-browser\"}]");
+            editedJson["future_option"] = System.Text.Json.Nodes.JsonNode.Parse("{\"preserve\":[1,2,3]}");
+            File.WriteAllText(configPath, editedJson.ToJsonString());
+            string beforeRootsSave = File.ReadAllText(configPath);
+            ServerConfig.SaveRoots(configPath, [new RootConfig { Id = "edited", Path = directory, Shell = false }]);
+            using (var savedRoots = JsonDocument.Parse(File.ReadAllText(configPath)))
+            using (var beforeRoots = JsonDocument.Parse(beforeRootsSave))
+            {
+                Check(new[] { "mcp_servers", "mcpServers", "browser_mounts", "future_option" }.All(name =>
+                    McpConfiguration.Canonical(savedRoots.RootElement.GetProperty(name)) == McpConfiguration.Canonical(beforeRoots.RootElement.GetProperty(name))) &&
+                    savedRoots.RootElement.GetProperty("roots")[0].GetProperty("id").GetString() == "edited" &&
+                    File.ReadAllText(configPath + ".bak") == beforeRootsSave,
+                    "Edit roots save preserves both MCP keys, browser mounts and unknown newer fields, and keeps the exact previous file as backup");
+            }
 
             if (OperatingSystem.IsWindows())
             {

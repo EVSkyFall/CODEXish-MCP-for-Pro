@@ -13,6 +13,10 @@ if (args.Contains("--design-preview"))
 }
 if (args.Contains("--tray-smoke-test")) return await TrayApplication.Run("", smoke: true);
 if (args.Contains("--tray-tests")) return await TrayTests.Run();
+if (args.Contains("--mcp-initialize-first-fixture")) return await McpHandshakeIntegrationTests.Fixture(args);
+if (args.Contains("--mcp-notification-fixture")) return await McpNotificationTests.Fixture(args);
+if (args.Contains("--mcp-http-fixture")) return await McpHttpTests.Fixture(args);
+if (args.Contains("--local-mcp-fixture")) return await LocalMcpIntegrationTests.Fixture(args);
 if (args.Contains("--browser-fixture")) return await BrowserTests.Fixture(args);
 if (args.Contains("--browser-tests")) return await BrowserTests.Run();
 if (args.Contains("--browser-live-test"))
@@ -71,7 +75,7 @@ Console.WriteLine($"""
     CODEXish v1 (coding core, desktop, browser mounts)
       MCP           http://127.0.0.1:{config.Port}/mcp  (published as {config.PublicUrl}/mcp)
       Roots         {string.Join(", ", config.Roots.Select(r => $"{r.Id}:{(r.Read ? "r" : "")}{(r.Write ? "w" : "")}{(r.Shell ? "x" : "")}{(Directory.Exists(r.Path) ? "" : " (missing)")}"))}
-      Browser       {runtime.Browsers.Summary()}; mounts connect after start, see host_capabilities
+      Browser       {runtime.Browsers.Summary()}; MCP {runtime.Mounts.Summary()}; mounts connect after start, see host_capabilities
       State         {config.StateDir}
       Auth          {(noAuth ? "DISABLED (loopback development only)" : "OAuth bearer required on /mcp")}
       Control       POST http://127.0.0.1:{config.Port}/control/pause with header X-Codexish-Control

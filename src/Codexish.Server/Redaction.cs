@@ -28,6 +28,21 @@ public static partial class Redaction
     public const int MinimumEnvironmentValue = 8;
 
     private static string[] environmentValues = [];
+    private static readonly object AdditiveSync = new();
+    private static string[] additiveValues = [];
+
+    public static void AddSensitiveValue(string? value)
+    {
+        if (string.IsNullOrEmpty(value)) return;
+        lock (AdditiveSync)
+            additiveValues = additiveValues.Append(value).Distinct(StringComparer.Ordinal).OrderByDescending(v => v.Length).ToArray();
+    }
+
+    public static void AddEnvironmentValues(IEnumerable<KeyValuePair<string, string?>> environment)
+    {
+        foreach (var (name, value) in environment)
+            if (IsSecretName(name)) AddSensitiveValue(value);
+    }
 
     // The server snapshots the environment once at startup: a long-running process does not see its parent's
     // environment change, and re-enumerating on every redaction would cost a dictionary copy per call.
@@ -55,7 +70,7 @@ public static partial class Redaction
     {
         if (string.IsNullOrEmpty(text)) return (text, false, []);
         List<string> kinds = [];
-        string[] secrets = environmentValues;
+        string[] secrets = environmentValues.Concat(Volatile.Read(ref additiveValues)).Distinct(StringComparer.Ordinal).OrderByDescending(v => v.Length).ToArray();
         foreach (string value in secrets)
         {
             if (!text.Contains(value, StringComparison.Ordinal)) continue;
