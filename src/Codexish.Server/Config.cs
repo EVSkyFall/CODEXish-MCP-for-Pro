@@ -85,6 +85,7 @@ public sealed class ServerConfig
 
     public const string DefaultRedirectUri = "https://chatgpt.com/connector_platform_oauth_redirect";
     private static readonly JsonSerializerOptions Format = new() { WriteIndented = true };
+    private static readonly JsonSerializerOptions RootsFormat = new() { WriteIndented = true, NewLine = "\n" };
 
     public static string DefaultDirectory => System.IO.Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Codexish");
@@ -277,7 +278,7 @@ public sealed class ServerConfig
         }
         if (copied) stream.WriteByte((byte)',');
         stream.Write("\n  \"roots\": "u8);
-        string formattedRoots = JsonSerializer.Serialize(roots, new JsonSerializerOptions(Format) { NewLine = "\n" }).Replace("\n", "\n  ", StringComparison.Ordinal);
+        string formattedRoots = JsonSerializer.Serialize(roots, RootsFormat).Replace("\n", "\n  ", StringComparison.Ordinal);
         stream.Write(Encoding.UTF8.GetBytes(formattedRoots));
         stream.Write("\n}\n"u8);
         return stream.ToArray();

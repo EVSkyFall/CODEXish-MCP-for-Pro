@@ -21,6 +21,7 @@ public sealed class McpMounts : IAsyncDisposable
     private Task? preparation;
     private bool manifestsPrepared;
     private McpDefinition[] topDefinitions = [];
+    private bool topDefinitionsParsed;
     private string[] topWarnings = [];
     private HashSet<string> changedPaths = new(StringComparer.Ordinal);
     private McpProjectFile[] projects = [];
@@ -255,11 +256,12 @@ public sealed class McpMounts : IAsyncDisposable
                 Warn("codexish.json keeps its previous definitions: " + error.Message, path);
             }
         }
-        if (mainChanged && !mainReadFailed)
+        if (mainChanged && (!mainReadFailed || !topDefinitionsParsed))
         {
-            if (!browserReadFailed && config.SourcePath is { } healthyPath) fileWarnings.Remove(healthyPath);
+            if (!mainReadFailed && !browserReadFailed && config.SourcePath is { } healthyPath) fileWarnings.Remove(healthyPath);
             List<string> warnings = [];
             topDefinitions = McpConfiguration.ParseTopLevel(config, warnings);
+            topDefinitionsParsed = true;
             topWarnings = warnings.Distinct(StringComparer.Ordinal).Select(w => Redaction.Apply(w).Text).ToArray();
         }
         if (!manifestsOnly) projects = config.Roots.Select(r =>

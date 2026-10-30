@@ -3,9 +3,46 @@
 Updated 2026-10-30. Local MCP parity is under review in Draft PR #16. Historical sections retain their own dates
 and source revisions; they are not current whole-product completion claims. No merge or deployment is reported.
 
+## H-review local validation snapshot (2026-10-30)
+
+These results describe the H1–H4 correction working tree over published `05a53be`, source frozen
+2026-10-30 09:54:25 UTC. This is a local source snapshot, not CI evidence for a newly published head.
+The completed published-source CI evidence below applies only to its named commits. Live owner-PC
+Unity/ChatGPT acceptance was not run.
+
+| Environment / source | Observed result |
+| --- | --- |
+| Local Linux Release build, H-review frozen snapshot above | Exit 0; 0 errors, 4 existing MCP9005 roots warnings |
+| Local Linux `--self-test`, same snapshot | Exit 0; 434; desktop core 57; regressions 11 passed / 0 failed; fake desktop platform |
+| Local Linux `--browser-tests`, same snapshot | Exit 0; 328; fixture transports/HTTP host, not a real browser/ChatGPT trial |
+| Local Linux `--tray-tests`, same snapshot | Exit 0; 68; Windows-only checks skipped with reasons |
+| Linux-hosted Windows/WPF cross-compilation, same snapshot | Exit 0; 0 errors, 4 existing MCP9005 warnings; compile only, not Windows execution |
+
+The integration lead verified all 68 tracked C# hashes unchanged since freezing and all 62 server C# files
+byte-identical in the Windows compilation tree. Logs:
+`/workspace/shared/local-mcp-parity-h-delivery/h-{build,self,browser,tray,windows}.log`.
+No H-review aggregate run failed. These workspace logs are local evidence, not committed artifacts.
+
+## Published follow-up evidence — `05a53be` (2026-10-30)
+
+The G-review frozen local snapshot below became published commit `a02bed`.
+[Server CI run 41033609675](https://github.com/EVSkyFall/CODEXish-MCP-for-Pro/actions/runs/41033609675)
+passed on Ubuntu but failed on Windows after self-test check 397 at the formatting assertion. This failed run
+is retained; it was not a Windows pass. Follow-up `05a53be` changed `Config.cs` line 280 to emit LF explicitly.
+That one-line source change is not part of the earlier G-review frozen snapshot.
+
+| Published source / environment | Observed CI result |
+| --- | --- |
+| `05a53be`, Ubuntu server | Passed; self/core/regressions/browser/tray 434/57/11/309/68; [run 41034753223](https://github.com/EVSkyFall/CODEXish-MCP-for-Pro/actions/runs/41034753223) |
+| `05a53be`, Windows server | Passed; self/core/regressions/browser/tray 453/56/11/314/83; [run 41034753223](https://github.com/EVSkyFall/CODEXish-MCP-for-Pro/actions/runs/41034753223) |
+| `05a53be`, Ubuntu / Windows probe | Both passed; 93 / 97; [run 41034753262](https://github.com/EVSkyFall/CODEXish-MCP-for-Pro/actions/runs/41034753262) |
+
+CI synthetic merge `f3247a21` used tree `924f2d3b`, identical to the published source. These results cover
+`05a53be`, not later H-review working-tree edits. Live owner-PC Unity/ChatGPT acceptance remains unrun.
+
 ## G-review local validation snapshot (2026-10-30)
 
-These local results describe the G1–G5 correction working tree based on published commit
+These local results describe the G1–G5 correction source published as `a02bed`, developed on commit
 `593b85227bc3c16a5e8c898cca62ff444b28c008`, source frozen 2026-10-30 09:19:02 UTC. They are not the
 CI results for that base commit and do not establish CI coverage for the corrections. Published-commit CI
 evidence remains separately identified below. No live owner-PC Unity/ChatGPT acceptance was performed.
@@ -94,15 +131,16 @@ Earlier successful runs below are retained as historical evidence, not substitut
 
 Work branch `dot/local-mcp-parity`, originally created from `claude/stoic-ptolemy-t6updn` at
 `7979744f8a923daa21e43e449b411ff49f082f3d`, then advanced to the approved source update `086cd2b`;
-revision-6 specification: `docs/local-mcp-parity-plan.md` revision 6 (`1bb8f24`), merged locally as `5e85d0a`.
-Revision-6 results below are from the local working tree on merge `5e85d0a` (implementation base `61ac42d`
-plus approved plan `1bb8f24`), C# source frozen 2026-10-30 07:04:46 UTC before the documentation-only update.
+revision-6 specification: `docs/local-mcp-parity-plan.md` revision 6 (`1bb8f24`). The local integration merged
+implementation base `61ac42d` with approved plan `1bb8f24`; local merge `5e85d0a` was never a pushed commit.
+Revision-6 results below concern the source published as `726188d`, frozen 2026-10-30 07:04:46 UTC before
+the documentation-only update.
 The source was published in revision-6 implementation head `726188d`. The local Linux Release suites ran
 sequentially. CI results below are separate from local checks; neither establishes live owner-PC/ChatGPT acceptance.
 
 | Revision-6 verification / environment / source | Observed result |
 | --- | --- |
-| Local Linux Release build, frozen working tree on `5e85d0a` | Exit 0; 0 errors, 4 MCP9005 roots warnings |
+| Local Linux Release build, source published as `726188d` | Exit 0; 0 errors, 4 MCP9005 roots warnings |
 | Local Linux `--self-test`, same frozen source | Exit 0; 424, desktop core 57, regressions 11 passed / 0 failed; fake desktop platform |
 | Local Linux `--browser-tests`, same frozen source | Exit 0; 263; real fixture transports/HTTP host, not a real browser or ChatGPT trial |
 | Local Linux `--tray-tests`, same frozen source | Exit 0; 62; Windows-only checks skipped with reasons |

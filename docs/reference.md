@@ -270,7 +270,7 @@ that cannot be deleted yet is tried again at the next sweep. Reading output that
 
 ## Local MCP servers
 
-Published revision-8 head `593b852` passed Ubuntu and Windows server/probe CI; see the linked results below.
+Published follow-up head `05a53be` passed Ubuntu and Windows server/probe CI; see the linked results below.
 Those results apply to that published source and do not validate later edits.
 Live owner-PC Unity/ChatGPT acceptance remains unrun.
 [Implementation status](../IMPLEMENTATION_STATUS.md) separates actual verification from this behavior reference. CODEXish mounts stdio and HTTP MCP servers alongside its native tools.
@@ -439,6 +439,8 @@ and instructions are available immediately after restart, without waiting for ba
 A project server's manifest publishes after its root `.mcp.json` is read in the background; it is not part of
 the pre-listen guarantee. The manifest-only pass never starts servers; the full pass starts each exactly once. A retained global
 manifest-only entry still starts if full preparation encounters bad JSON or a malformed browser section.
+Warm entries never count as started before that full pass. If the first disk configuration read fails, the
+in-memory global MCP definitions provide the fallback, as the browser definitions do.
 Removed manifests are left on disk but not loaded.
 
 Mount startup reads current files even if the in-memory configuration is stale. Every three seconds, file length
@@ -458,7 +460,7 @@ effective configuration: identity spelling, resolved command path, expanded argu
 `env`/`env_vars` values, and tool filters/read-only/enable settings. The automatic allowlisted base environment is
 excluded. Thus only servers affected by a changed expansion or resolved command restart; unrelated servers keep
 their processes. Tray roots saves read the latest file and replace only `roots`, preserving mount and
-unknown fields, including duplicate top-level keys, with readable indentation and the existing atomic save and backup. New bytes are
+unknown fields, including duplicate top-level keys, with readable LF indentation and the existing atomic save and backup. New bytes are
 prepared before stopping anything; parse/read failure leaves the server running. After stopping, a finally path
 restarts whatever was running even if saving fails. After stop, the file is read again; if it changed since
 preparation, the bytes are rebuilt from that newer content. If rereading/rebuilding fails, the server restarts

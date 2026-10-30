@@ -148,6 +148,8 @@ public static class McpManagerTests
         await StartupLifetimeOrdering(check);
         await NullBrowserReason(check);
         await RetainedWarmMountStarts(check);
+        await RetainedInMemoryMcpStarts(check);
+        await SuccessfulEmptyParseRemainsEmpty(check);
     }
     private static async Task RapidReplacement(Action<bool, string> check)
     {
@@ -860,9 +862,74 @@ public static class McpManagerTests
                 runtime.Mounts.Start();
                 check(await Observe(() => prepared.State == "connected") && File.ReadAllText(path) == invalid && File.GetLastWriteTimeUtc(path) == timestamp,
                     "manager: retained warm browser connects without a re-save despite " + (malformedMain ? "bad JSON" : "wrong browser type"));
+                check(!(bool)typeof(McpMount).GetField("started", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(warm)!,
+                    "manager: original warm browser remains unstarted after replacement connects despite " + (malformedMain ? "bad JSON" : "wrong browser type"));
             }
             finally { TestCleanup.RemoveDirectory(directory); }
         }
+    }
+
+    private static async Task RetainedInMemoryMcpStarts(Action<bool, string> check)
+    {
+        foreach (bool alias in new[] { false, true })
+        foreach (bool missing in new[] { false, true })
+        {
+            string directory = Path.Combine(Path.GetTempPath(), "codexish-mcp-memory-retain-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(directory);
+            string path = Path.Combine(directory, "codexish.json");
+            const string invalid = "{ not json";
+            if (!missing) File.WriteAllText(path, invalid);
+            DateTime timestamp = File.GetLastWriteTimeUtc(path);
+            string executable = Environment.ProcessPath!;
+            string[] prefix = Path.GetFileNameWithoutExtension(executable).Equals("dotnet", StringComparison.OrdinalIgnoreCase)
+                ? [Assembly.GetExecutingAssembly().Location] : [];
+            var definition = JsonSerializer.SerializeToElement(new { retained = new { command = executable,
+                args = prefix.Concat(new[] { "--local-mcp-fixture", directory }).ToArray(), read_only_tools = new[] { "inspect" } } });
+            string context = (alias ? "mcpServers" : "mcp_servers") + (missing ? " with missing main file" : " with malformed main file");
+            try
+            {
+                using var runtime = new CodexishRuntime(new ServerConfig
+                {
+                    StateDir = Path.Combine(directory, "state"), SourcePath = path,
+                    McpServers = alias ? null : definition, McpServersAlias = alias ? definition : null
+                }, true);
+                runtime.Mounts.PrepareManifests();
+                var warm = runtime.Mounts.ResourceTargets.OfType<McpMount>().SingleOrDefault(t => t.Identity == "retained");
+                check(warm is not null && warm.State == "not_started" && warm.Attempts == 0,
+                    "manager: in-memory " + context + " publishes an unstarted warm MCP instance");
+                await runtime.Mounts.PrepareAsync();
+                var prepared = runtime.Mounts.ResourceTargets.OfType<McpMount>().Single(t => t.Identity == "retained");
+                check(!ReferenceEquals(warm, prepared), "manager: full pass fingerprints retained in-memory " + context);
+                runtime.Mounts.Start();
+                check(await Observe(() => prepared.State == "connected") &&
+                    (missing ? !File.Exists(path) : File.ReadAllText(path) == invalid && File.GetLastWriteTimeUtc(path) == timestamp),
+                    "manager: retained in-memory " + context + " connects without a re-save");
+                check(!(bool)typeof(McpMount).GetField("started", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(warm)!,
+                    "manager: original warm " + context + " stays unstarted after replacement connects");
+            }
+            finally { TestCleanup.RemoveDirectory(directory); }
+        }
+    }
+
+    private static async Task SuccessfulEmptyParseRemainsEmpty(Action<bool, string> check)
+    {
+        string directory = Path.Combine(Path.GetTempPath(), "codexish-mcp-empty-retain-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        string path = Path.Combine(directory, "codexish.json");
+        File.WriteAllText(path, "{}");
+        try
+        {
+            var config = new ServerConfig { StateDir = Path.Combine(directory, "state"), SourcePath = path };
+            using var runtime = new CodexishRuntime(config, true);
+            await runtime.Mounts.PrepareAsync();
+            // Simulate a stale in-memory entry after a real successful empty parse.
+            config.McpServers = JsonSerializer.SerializeToElement(new { stale = new { command = "unused-fixture" } });
+            File.WriteAllText(path, "{ not json");
+            typeof(McpMounts).GetMethod("ReadDefinitionsAndApply", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(runtime.Mounts, null);
+            check(runtime.Mounts.ResourceTargets.Count == 0,
+                "manager: failed read after successful empty parse does not resurrect stale in-memory MCP entries");
+        }
+        finally { TestCleanup.RemoveDirectory(directory); }
     }
 
 }
