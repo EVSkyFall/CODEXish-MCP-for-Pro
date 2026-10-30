@@ -74,6 +74,9 @@ public static class SelfTest
             }
             Restart(config);
             await HardeningTests.Run(temp, password);
+            LocalMcpConfigurationTests.Run();
+            LocalMcpEnvironmentTests.Run(temp);
+            McpHandshakeTests.Run(Check);
             Console.WriteLine($"SELF_TEST_PASSED: {passed}; no tunnel was opened, no desktop input was sent, " +
                 "and no ChatGPT connector measurement was performed.");
             return 0;
@@ -124,7 +127,7 @@ public static class SelfTest
         var capabilities = Data(tools.HostCapabilities());
         Check(capabilities.GetProperty("schema_version").GetString() == "v1.0", "envelope reports schema_version v1.0");
         Check(capabilities.GetProperty("execution_boundary").GetString() == "unconfined_user", "capabilities state the unconfined execution boundary");
-        Check(capabilities.GetProperty("tools").EnumerateArray().Count() == 24, "capabilities list 21 coding and 3 desktop tools");
+        Check(capabilities.GetProperty("tools").EnumerateArray().Count() == 26, "capabilities list 21 coding, 3 desktop and 2 MCP resource tools");
         Check(capabilities.GetProperty("desktop").GetProperty("native_available").GetBoolean() == OperatingSystem.IsWindows(),
             "capabilities report the actual desktop platform");
         Check(capabilities.GetProperty("limits").GetProperty("source").GetString()!.Contains("frame budget"),

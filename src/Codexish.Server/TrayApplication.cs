@@ -632,20 +632,23 @@ public static class TrayApplication
             var view = TrayWindows.Roots(form, editing.Roots);
             view.Save = roots => Guard(async () =>
             {
-                var candidate = JsonSerializer.Deserialize<ServerConfig>(JsonSerializer.Serialize(editing))!;
-                candidate.Roots = roots;
+                var candidate = editing.CopyForRootEdit(roots);
                 candidate.Validate();
                 // Anything not stopped, running or still retrying, was wanted on, so it comes back after the save.
                 var before = owner.State;
                 bool serverWasRunning = before.Server != "stopped", tunnelWasRunning = before.Tunnel != "stopped";
-                await owner.StopAsync();
-                candidate.Save(path);
-                editing.Roots = candidate.Roots;
-                // The running configuration is reused on the next start; recompute its warnings for the new roots.
-                editing.Validate();
-                // Saving must not leave ChatGPT disconnected: bring back exactly what was on.
-                if (serverWasRunning) await owner.StartAsync();
-                if (tunnelWasRunning) await owner.StartTunnelAsync();
+                await TrayController.SaveRootsAndRestart(path, candidate.Roots, owner.StopAsync, prepared =>
+                {
+                    ServerConfig.SavePrepared(path, prepared);
+                    editing.Roots = candidate.Roots;
+                    // Recompute warnings only after the atomic save succeeds.
+                    editing.Validate();
+                }, async () =>
+                {
+                    // Even a save failure must bring back everything that was on.
+                    try { if (serverWasRunning) await owner.StartAsync(); }
+                    finally { if (tunnelWasRunning) await owner.StartTunnelAsync(); }
+                });
                 Notify(TrayNotice.RootsSaved(serverWasRunning, owner.State));
                 if (candidate.Warnings.Count > 0) ShowText("CODEXish roots saved with warnings", string.Join(Environment.NewLine, candidate.Warnings), Tone.Warning);
                 form.Close();

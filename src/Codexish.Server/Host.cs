@@ -11,6 +11,7 @@ public static class CodexishHost
     public static WebApplication Build(CodexishRuntime runtime, int port, Action<string>? rejectionLog = null,
         bool instructions = true)
     {
+        runtime.Mounts.PrepareManifests();
         var config = runtime.Config;
         var access = new AccessPolicy(config.AllowHosts, config.AllowOrigins);
         var log = rejectionLog ?? Console.WriteLine;
@@ -25,10 +26,18 @@ public static class CodexishHost
         {
             o.ServerInfo = new() { Name = "CODEXish", Version = CodexishRuntime.ServerVersion };
             o.ServerInstructions = instructions ? CodexishRuntime.Instructions : null;
-        }).WithHttpTransport(o => o.SessionMode = HttpServerSessionMode.Stateless)
+        }).WithHttpTransport(o =>
+        {
+            o.SessionMode = HttpServerSessionMode.Stateless;
+            o.ConfigureSessionOptions = (_, options, _) =>
+            {
+                options.ServerInstructions = instructions ? runtime.Mounts.ComposeInstructions() : null;
+                return Task.CompletedTask;
+            };
+        })
           .WithTools<CodexishTools>().WithTools<DesktopTools>()
-          .WithListToolsHandler((_, _) => ValueTask.FromResult(new ModelContextProtocol.Protocol.ListToolsResult { Tools = runtime.Browsers.Tools.Select(t => t.ProtocolTool).ToList() }))
-          .WithCallToolHandler((request, token) => runtime.Browsers.Find(request.Params?.Name) is { } tool
+          .WithListToolsHandler((_, _) => ValueTask.FromResult(new ModelContextProtocol.Protocol.ListToolsResult { Tools = runtime.Mounts.Tools.Select(t => t.ProtocolTool).ToList() }))
+          .WithCallToolHandler((request, token) => runtime.Mounts.Find(request.Params?.Name) is { } tool
               ? tool.InvokeAsync(request, token)
               : throw new ModelContextProtocol.McpProtocolException($"Unknown tool: '{request.Params?.Name}'", ModelContextProtocol.McpErrorCode.InvalidParams));
         var app = builder.Build();

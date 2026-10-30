@@ -57,6 +57,29 @@ public sealed record TrayOptions(bool Start = false, string? PublicUrl = null, s
 // stop ends supervision of that component until the user starts it again.
 public sealed class TrayController(ServerConfig config) : IAsyncDisposable
 {
+    internal static async Task SaveRootsAndRestart(string path, RootConfig[] roots, Func<Task> stop, Action<byte[]> save, Func<Task> restart)
+    {
+        byte[] source = File.ReadAllBytes(path);
+        byte[] prepared = ServerConfig.PrepareRoots(source, roots);
+        try
+        {
+            await stop();
+            byte[] current = File.ReadAllBytes(path);
+            if (!current.AsSpan().SequenceEqual(source)) prepared = ServerConfig.PrepareRoots(current, roots);
+            save(prepared);
+        }
+        finally { await restart(); }
+    }
+
+    internal static async Task LogPreparedStart(Action announce, Func<Task> preparation, Func<string> summary, Action<string> log, CancellationToken token)
+    {
+        // URL, authentication notices and warnings describe the listening host, not optional mounts.
+        announce();
+        try { await preparation().WaitAsync(token); log(summary()); }
+        catch (OperationCanceledException) when (token.IsCancellationRequested) { }
+        catch (Exception error) { log("Mount preparation failed: " + Redaction.Apply(error.Message).Text); }
+    }
+
     public static readonly TimeSpan HealthyRun = Backoff.HealthyRun;
     // The connection log window shows this many recent lines; the files under state_dir\logs keep every line.
     public const int MemoryLines = 5000;
@@ -384,8 +407,12 @@ public sealed class TrayController(ServerConfig config) : IAsyncDisposable
                 host.Lifetime.ApplicationStopping.Register(() => stopping.TrySetResult());
                 runtime = candidate; app = host;
                 ServerChanged(address);
-                Log("Server started at " + address + "; browser mounts: " + candidate.Browsers.Summary());
-                foreach (string warning in candidate.Warnings) Log("Warning: " + warning);
+                _ = LogPreparedStart(() =>
+                {
+                    Log("Server started at " + address);
+                    foreach (string warning in candidate.Warnings) Log("Warning: " + warning);
+                }, () => candidate.Mounts.PrepareAsync(),
+                    () => "Browser mounts: " + candidate.Browsers.Summary() + "; MCP servers: " + candidate.Mounts.Summary(), Log, token);
                 return stopping.Task;
             }
             catch
@@ -738,6 +765,8 @@ public static class TrayTests
             Check(controller.Running && !controller.TunnelRunning, "the same controller restarts with the existing local state and still no tunnel");
 
             int Count(TrayController target, string text) => target.Diagnostics.Count(x => x.Contains(text, StringComparison.Ordinal));
+            Check(await Eventually(() => Count(controller, "Server started at") == 2, 30),
+                "both explicit host starts publish their prepared mount summary before the restart-count baseline");
             int starts = Count(controller, "Server started at");
             controller.HostLifetime!.StopApplication();
             Check(await Eventually(() => Count(controller, "Server stopped without a user stop") == 1 && Count(controller, "Server started at") == starts + 1 && controller.Running, 30),
@@ -957,6 +986,90 @@ public static class TrayTests
             Check(unreadable is null && why!.Contains("could not be read", StringComparison.Ordinal) && refused is null && refusal!.Contains("requires https", StringComparison.Ordinal) &&
                   usable is not null && none is null,
                 "loading for the tray never throws: an unreadable file or a refused public_url comes back as the reason to show and retry");
+
+            // Simulate a file update after the tray loaded its configuration, then save only roots.
+            var editedJson = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(configPath))!.AsObject();
+            editedJson["mcp_servers"] = System.Text.Json.Nodes.JsonNode.Parse("{\"fresh\":{\"command\":\"fresh-command\"}}");
+            editedJson["mcpServers"] = System.Text.Json.Nodes.JsonNode.Parse("{\"alias\":{\"url\":\"http://localhost/mcp\"}}");
+            editedJson["browser_mounts"] = System.Text.Json.Nodes.JsonNode.Parse("[{\"id\":\"fresh-browser\"}]");
+            editedJson["future_option"] = System.Text.Json.Nodes.JsonNode.Parse("{\"preserve\":[1,2,3]}");
+            File.WriteAllText(configPath, editedJson.ToJsonString());
+            string beforeRootsSave = File.ReadAllText(configPath);
+            ServerConfig.SaveRoots(configPath, [new RootConfig { Id = "edited", Path = directory, Shell = false }]);
+            using (var savedRoots = JsonDocument.Parse(File.ReadAllText(configPath)))
+            using (var beforeRoots = JsonDocument.Parse(beforeRootsSave))
+            {
+                Check(new[] { "mcp_servers", "mcpServers", "browser_mounts", "future_option" }.All(name =>
+                    McpConfiguration.Canonical(savedRoots.RootElement.GetProperty(name)) == McpConfiguration.Canonical(beforeRoots.RootElement.GetProperty(name))) &&
+                    savedRoots.RootElement.GetProperty("roots")[0].GetProperty("id").GetString() == "edited" &&
+                    File.ReadAllText(configPath + ".bak") == beforeRootsSave,
+                    "Edit roots save preserves both MCP keys, browser mounts and unknown newer fields, and keeps the exact previous file as backup");
+            }
+
+            File.WriteAllText(configPath, """{/* tolerant */ "future":1,"roots":[],"future":2,"roots":[],"mcp_servers":{"x":{"command":"x"}},}""");
+            byte[] preparedRoots = ServerConfig.PrepareRoots(configPath, [new RootConfig { Id = "once", Path = directory }]);
+            using (var duplicateRoots = JsonDocument.Parse(preparedRoots))
+                Check(duplicateRoots.RootElement.EnumerateObject().Count(p => p.Name == "roots") == 1 &&
+                      duplicateRoots.RootElement.EnumerateObject().Where(p => p.Name == "future").Select(p => p.Value.GetInt32()).SequenceEqual([1, 2]),
+                      "roots preparation tolerates duplicate keys and preserves every other top-level occurrence");
+            File.WriteAllText(configPath, "{ half-written");
+            int rootsStops = 0, rootsRestarts = 0, rootsWrites = 0;
+            bool rootsParseFailed = false;
+            try { await TrayController.SaveRootsAndRestart(configPath, [], () => { rootsStops++; return Task.CompletedTask; },
+                _ => rootsWrites++, () => { rootsRestarts++; return Task.CompletedTask; }); }
+            catch (JsonException) { rootsParseFailed = true; }
+            Check(rootsParseFailed && rootsStops == 0 && rootsRestarts == 0 && rootsWrites == 0,
+                "half-written roots save fails before stopping or changing a running host");
+            File.WriteAllText(configPath, "{}");
+            bool rootsWriteFailed = false;
+            try { await TrayController.SaveRootsAndRestart(configPath, [], () => { rootsStops++; return Task.CompletedTask; },
+                _ => throw new IOException("synthetic save failure"), () => { rootsRestarts++; return Task.CompletedTask; }); }
+            catch (IOException) { rootsWriteFailed = true; }
+            Check(rootsWriteFailed && rootsStops == 1 && rootsRestarts == 1,
+                "failed atomic roots write restarts the previously running components in finally");
+
+            File.WriteAllText(configPath, """{"future":"before","roots":[]}""");
+            await TrayController.SaveRootsAndRestart(configPath, [new RootConfig { Id = "edited", Path = directory }], () =>
+            {
+                File.WriteAllText(configPath, """{"future":"during stop","roots":[],"added":{"preserve":true}}""");
+                return Task.CompletedTask;
+            }, bytes => ServerConfig.SavePrepared(configPath, bytes), () => Task.CompletedTask);
+            using (var changedDuringStop = JsonDocument.Parse(File.ReadAllBytes(configPath)))
+                Check(changedDuringStop.RootElement.GetProperty("future").GetString() == "during stop" &&
+                      changedDuringStop.RootElement.GetProperty("added").GetProperty("preserve").GetBoolean() &&
+                      changedDuringStop.RootElement.GetProperty("roots")[0].GetProperty("id").GetString() == "edited",
+                      "roots save rereads after stop and preserves a concurrent configuration update");
+            File.WriteAllText(configPath, "{}");
+            int failedReprepareWrites = 0, failedReprepareRestarts = 0;
+            bool failedReprepare = false;
+            try
+            {
+                await TrayController.SaveRootsAndRestart(configPath, [], () =>
+                { File.WriteAllText(configPath, "{ changed but incomplete"); return Task.CompletedTask; },
+                    _ => failedReprepareWrites++, () => { failedReprepareRestarts++; return Task.CompletedTask; });
+            }
+            catch (JsonException) { failedReprepare = true; }
+            Check(failedReprepare && failedReprepareWrites == 0 && failedReprepareRestarts == 1 && File.ReadAllText(configPath) == "{ changed but incomplete",
+                "a concurrent half-written file after stop restarts without overwriting any bytes");
+            var preparedBanner = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            List<string> bannerLines = [];
+            bool bannerSummaryRead = false;
+            string[] immediateBanner = ["Server started at http://127.0.0.1:12345/", "OAuth bearer required on /mcp", "Warning: fixture warning"];
+            bool announcedBeforePreparation = false;
+            var pendingBanner = TrayController.LogPreparedStart(() => bannerLines.AddRange(immediateBanner),
+                () => { announcedBeforePreparation = bannerLines.SequenceEqual(immediateBanner); return preparedBanner.Task; },
+                () => { bannerSummaryRead = true; return "prepared mounts"; }, bannerLines.Add, CancellationToken.None);
+            Check(!pendingBanner.IsCompleted && !bannerSummaryRead && announcedBeforePreparation && bannerLines.SequenceEqual(immediateBanner),
+                "console and tray announce URL auth and warnings while mount preparation is held without reading a premature summary");
+            preparedBanner.SetResult(); await pendingBanner;
+            Check(bannerSummaryRead && bannerLines.SequenceEqual([..immediateBanner, "prepared mounts"]), "tray start log reads its mount summary only after preparation");
+            using var cancelledBanner = new CancellationTokenSource();
+            var heldBanner = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            List<string> stoppedBannerLines = [];
+            var stoppedBanner = TrayController.LogPreparedStart(() => stoppedBannerLines.Add("Server started at fixture"), () => heldBanner.Task,
+                () => "must not read stopped mounts", stoppedBannerLines.Add, cancelledBanner.Token);
+            cancelledBanner.Cancel(); await stoppedBanner;
+            Check(stoppedBannerLines.SequenceEqual(["Server started at fixture"]), "stopping during held preparation keeps immediate announcement and omits stale mount summary");
 
             if (OperatingSystem.IsWindows())
             {

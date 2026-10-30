@@ -19,11 +19,22 @@ public sealed class CodexishTools(CodexishRuntime runtime)
     public CallToolResult HostCapabilities() => Reply.Guard(() => Reply.Ok(runtime.Capabilities()));
 
     [McpServerTool(Name = "workspace_info", ReadOnly = true, OpenWorld = false)]
-    [Description("Returns each root's id, absolute path, grants, whether it is a Git repository, the state directory " +
-        "(always outside every root), every live and recorded process with its handle and exit code, the pause state, " +
-        "and the latest checkpoint. Use it to choose a root_id before any fs_*, shell_run or git_* call. " +
-        "Next tool: fs_list or git_status.")]
+    [Description("Returns each root's id, absolute path, grants, whether it is a Git repository, which project instruction files (AGENTS.override.md, AGENTS.md, CLAUDE.md, CLAUDE.local.md, .claude/CLAUDE.md) it holds with their relative path and size, the state directory (state_dir_note says whether it overlaps a root), every live and recorded process with its handle and exit code, the pause state, and the latest checkpoint. Use it to choose a root_id before any fs_*, shell_run or git_* call. Next tool: fs_list or git_status.")]
     public CallToolResult WorkspaceInfo() => Reply.Guard(() => Reply.Ok(runtime.WorkspaceInfo()));
+
+    [McpServerTool(Name = "mcp_resource_list", ReadOnly = true, OpenWorld = true)]
+    [Description(McpResources.ListDescription)]
+    public Task<CallToolResult> McpResourceList(
+        [Description(McpResources.ListServerDescription)] string? server = null,
+        [Description(McpResources.WaitDescription)] int wait_ms = 10000,
+        CancellationToken cancellationToken = default) => runtime.Resources.List(server, wait_ms, cancellationToken);
+
+    [McpServerTool(Name = "mcp_resource_read", ReadOnly = true, OpenWorld = true)]
+    [Description(McpResources.ReadDescription)]
+    public Task<CallToolResult> McpResourceRead(
+        [Description(McpResources.ReadServerDescription)] string server,
+        [Description(McpResources.UriDescription)] string uri,
+        CancellationToken cancellationToken = default) => runtime.Resources.Read(server, uri, cancellationToken);
 
     [McpServerTool(Name = "fs_list", ReadOnly = true, OpenWorld = false)]
     [Description("Lists entries under a directory in one root. depth 1 is the directory itself; raise it to walk " +

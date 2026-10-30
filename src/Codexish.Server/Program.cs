@@ -13,6 +13,11 @@ if (args.Contains("--design-preview"))
 }
 if (args.Contains("--tray-smoke-test")) return await TrayApplication.Run("", smoke: true);
 if (args.Contains("--tray-tests")) return await TrayTests.Run();
+if (args.Contains("--mcp-host-resource-fixture")) return await McpHostResourceTests.Fixture(args);
+if (args.Contains("--mcp-initialize-first-fixture")) return await McpHandshakeIntegrationTests.Fixture(args);
+if (args.Contains("--mcp-notification-fixture")) return await McpNotificationTests.Fixture(args);
+if (args.Contains("--mcp-http-fixture")) return await McpHttpTests.Fixture(args);
+if (args.Contains("--local-mcp-fixture")) return await LocalMcpIntegrationTests.Fixture(args);
 if (args.Contains("--browser-fixture")) return await BrowserTests.Fixture(args);
 if (args.Contains("--browser-tests")) return await BrowserTests.Run();
 if (args.Contains("--browser-live-test"))
@@ -67,18 +72,25 @@ catch (StateLockedException error) { return CommandLine.Refuse(error, Console.Er
 using var runtime = opened;
 // Browser mounts connect in the background once the listener is up, so none of them can delay or stop the server.
 var app = CodexishHost.Build(runtime, config.Port, instructions: !args.Contains("--no-instructions"));
-Console.WriteLine($"""
+// Announce the listener immediately; only the mount summary depends on optional preparation.
+void PrintBanner()
+{
+    Console.WriteLine($"""
     CODEXish v1 (coding core, desktop, browser mounts)
       MCP           http://127.0.0.1:{config.Port}/mcp  (published as {config.PublicUrl}/mcp)
       Roots         {string.Join(", ", config.Roots.Select(r => $"{r.Id}:{(r.Read ? "r" : "")}{(r.Write ? "w" : "")}{(r.Shell ? "x" : "")}{(Directory.Exists(r.Path) ? "" : " (missing)")}"))}
-      Browser       {runtime.Browsers.Summary()}; mounts connect after start, see host_capabilities
       State         {config.StateDir}
       Auth          {(noAuth ? "DISABLED (loopback development only)" : "OAuth bearer required on /mcp")}
       Control       POST http://127.0.0.1:{config.Port}/control/pause with header X-Codexish-Control
     The listener is loopback only; expose it with a tunnel. Host and Origin checks are not authentication.
     Commands run as this Windows user: there is no sandbox. Ctrl+C stops the server.
     """);
-foreach (string warning in runtime.Warnings) Console.WriteLine("WARNING: " + warning);
+    foreach (string warning in runtime.Warnings) Console.WriteLine("WARNING: " + warning);
+}
+app.Lifetime.ApplicationStarted.Register(() => _ = TrayController.LogPreparedStart(PrintBanner,
+    () => runtime.Mounts.PrepareAsync(),
+    () => $"  Browser       {runtime.Browsers.Summary()}; MCP {runtime.Mounts.Summary()}; mounts connect after start, see host_capabilities",
+    Console.WriteLine, app.Lifetime.ApplicationStopping));
 await app.RunAsync();
 return 0;
 

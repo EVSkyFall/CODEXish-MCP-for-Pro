@@ -59,7 +59,7 @@ public static class BrowserTests
         public CallToolResult Picture() => new() { Content = [ImageContentBlock.FromBytes(Convert.FromBase64String("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aOcQAAAAASUVORK5CYII="), "image/png")] };
 
         [McpServerTool(Name = "error", ReadOnly = false), Description("Return an explicit backend tool error.")]
-        public CallToolResult Error() => new() { IsError = true, Content = [new TextContentBlock { Text = "test backend error" }] };
+        public CallToolResult Error(bool unreadable = false) => unreadable ? new() { Content = null! } : new() { IsError = true, Content = [new TextContentBlock { Text = "test backend error" }] };
 
         [McpServerTool(Name = "process", ReadOnly = true), Description("Report this fixture's process id, arguments and environment variable names.")]
         public CallToolResult ProcessInfo() => new()
@@ -301,6 +301,12 @@ public static class BrowserTests
                     Check((await Call("picture", new { })).Content.OfType<ImageContentBlock>().Count() == 1, "image content survives the stdio and HTTP hops");
                     var failed = await Call("error", new { }, "browser-error");
                     Check(Reply.CodeOf(failed) == "BROWSER_BACKEND_ERROR" && Texts(failed).SequenceEqual(["test backend error"]), "a backend tool error stays an error with its text");
+                    var unreadable = await Call("error", new { unreadable = true }, "browser-unreadable");
+                    var unreadableError = unreadable.StructuredContent!.Value.GetProperty("error");
+                    Check(Reply.CodeOf(unreadable) == "BROWSER_BACKEND_ERROR" && unreadableError.GetProperty("side_effects").GetString() == "unknown" &&
+                        unreadableError.GetProperty("message").GetString() == "Browser backend 'fixture' sent an answer CODEXish could not read; inspect the browser before another action." &&
+                        unreadableError.GetProperty("details").GetProperty("mount").GetString() == "fixture" && unreadableError.GetProperty("details").TryGetProperty("provider_error", out _),
+                        "unreadable mounted browser answer retains browser wording, mount details and uncertain effects");
                     Check(Texts(await Call(LongToolName, new { })).SequenceEqual(["long"]), "the shortened tool name still calls the backend's original tool");
 
                     var resource = await Call("resource", new { });
@@ -391,6 +397,7 @@ public static class BrowserTests
                     await using var hangClient = await McpClient.CreateAsync(new HttpClientTransport(new() { Endpoint = new Uri(address + "/mcp") }),
                         new() { ProtocolVersion = CodexishRuntime.ProtocolVersion });
                     var early = await hangClient.CallToolAsync(new CallToolRequestParams { Name = "workspace_info", Arguments = new Dictionary<string, JsonElement>() });
+                    await hangRuntime.Mounts.PrepareAsync();
                     Check(Reply.CodeOf(early) is null && hangRuntime.Browsers.Resources("hang").State is "starting" or "not_started",
                         "the host listens and answers while a mount is still in its handshake");
                     Check(await Until(() => hangRuntime.Browsers.Resources("quick").State == "connected", 60) &&
@@ -418,6 +425,7 @@ public static class BrowserTests
             {
                 await using var flakyApp = CodexishHost.Build(flakyRuntime, 0);
                 await flakyApp.StartAsync();
+                await flakyRuntime.Mounts.PrepareAsync();
                 try
                 {
                     string address = flakyApp.Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>()!.Addresses.Single();
@@ -449,6 +457,7 @@ public static class BrowserTests
             flakyConfig.BrowserMounts = [new() { Id = "brief", RootId = "test", Kind = "custom", Command = missingBackend, ReadOnlyTools = ["snapshot"] }];
             using (var afterRuntime = new CodexishRuntime(flakyConfig, true))
             {
+                await afterRuntime.Mounts.PrepareAsync();
                 Check(afterRuntime.Browsers.Tools.Count == 7 && afterRuntime.Browsers.Resources("brief").ToolsSource == "manifest",
                     "after a restart the saved tool list is published before the backend has connected");
                 await using var afterApp = CodexishHost.Build(afterRuntime, 0);
@@ -506,6 +515,13 @@ public static class BrowserTests
                     "null mount entries, ids, argument items, kinds and profile modes are invalid_config and null lists become empty, without throwing out of initialization");
             }
 
+            await McpResourceTests.Run(Check);
+            await McpHostResourceTests.Run(Check);
+            await LocalMcpIntegrationTests.Run(Check);
+            await McpNotificationTests.Run(Check);
+            await McpHttpTests.Run(Check);
+            await McpManagerTests.Run(Check);
+            await McpHandshakeIntegrationTests.Run(Check);
             Console.WriteLine($"BROWSER_TESTS_PASSED: {passed}; real stdio fixture behind the real HTTP host, not a browser or ChatGPT trial.");
             return 0;
         }

@@ -71,6 +71,8 @@ public sealed class ServerConfig
     [JsonPropertyName("git")] public GitConfig Git { get; set; } = new();
     [JsonPropertyName("oauth")] public OAuthConfig OAuth { get; set; } = new();
     [JsonPropertyName("control_token")] public string ControlToken { get; set; } = "";
+    [JsonPropertyName("mcp_servers")] public JsonElement? McpServers { get; set; }
+    [JsonPropertyName("mcpServers")] public JsonElement? McpServersAlias { get; set; }
     [JsonPropertyName("browser_mounts")] public BrowserMountConfig[] BrowserMounts { get; set; } = [];
     [JsonPropertyName("tunnel")] public TunnelConfig Tunnel { get; set; } = new();
     [JsonPropertyName("retention")] public RetentionConfig Retention { get; set; } = new();
@@ -83,6 +85,7 @@ public sealed class ServerConfig
 
     public const string DefaultRedirectUri = "https://chatgpt.com/connector_platform_oauth_redirect";
     private static readonly JsonSerializerOptions Format = new() { WriteIndented = true };
+    private static readonly JsonSerializerOptions RootsFormat = new() { WriteIndented = true, NewLine = "\n" };
 
     public static string DefaultDirectory => System.IO.Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Codexish");
@@ -114,9 +117,49 @@ public sealed class ServerConfig
         return config;
     }
 
-    private static ServerConfig Parse(byte[] bytes, string path) =>
-        JsonSerializer.Deserialize<ServerConfig>(bytes)
-            ?? throw new InvalidDataException($"The configuration at {path} is not a JSON object.");
+    private static ServerConfig Parse(byte[] bytes, string path)
+    {
+        using var document = McpConfiguration.ParseDocument(bytes);
+        if (document.RootElement.ValueKind != JsonValueKind.Object)
+            throw new InvalidDataException($"The configuration at {path} is not a JSON object.");
+        using var stream = new MemoryStream();
+        using (var writer = new Utf8JsonWriter(stream))
+        {
+            writer.WriteStartObject();
+            foreach (var property in document.RootElement.EnumerateObject())
+                if (ReadableName(property) is { } name && name is not ("browser_mounts" or "mcp_servers" or "mcpServers")) CopyRawProperty(writer, property, name);
+            writer.WriteEndObject();
+        }
+        var config = JsonSerializer.Deserialize<ServerConfig>(stream.ToArray(), MountReadOptions)!;
+        if (TryGetReadableProperty(document.RootElement, "mcp_servers", out var mcp)) config.McpServers = mcp.Clone();
+        if (TryGetReadableProperty(document.RootElement, "mcpServers", out var alias)) config.McpServersAlias = alias.Clone();
+        if (TryGetReadableProperty(document.RootElement, "browser_mounts", out var browser))
+            try { config.BrowserMounts = ParseBrowserMounts(browser); }
+            catch (Exception error) { config.BrowserMountParseWarning = "browser_mounts: " + McpConfiguration.Reason(error); }
+        return config;
+    }
+
+    [JsonIgnore] public string? BrowserMountParseWarning { get; private set; }
+
+    // Each optional browser entry is isolated just like an MCP definition, including failures decoding Unicode.
+    private static readonly JsonSerializerOptions MountReadOptions = new() { ReadCommentHandling = JsonCommentHandling.Skip, AllowTrailingCommas = true };
+    public static BrowserMountConfig[] ParseBrowserMounts(JsonElement raw)
+    {
+        if (raw.ValueKind == JsonValueKind.Null) return [];
+        if (raw.ValueKind != JsonValueKind.Array) throw new JsonException("browser_mounts must be an array");
+        List<BrowserMountConfig> result = [];
+        foreach (var entry in raw.EnumerateArray())
+        {
+            try { result.Add(entry.Deserialize<BrowserMountConfig>(MountReadOptions) ?? new BrowserMountConfig { Id = "", ParseError = "browser entry must be an object" }); }
+            catch (Exception error)
+            {
+                string id = "(unreadable entry " + (result.Count + 1) + ")";
+                try { if (entry.ValueKind == JsonValueKind.Object && entry.TryGetProperty("id", out var name)) id = name.GetString() ?? id; } catch (Exception) { }
+                result.Add(new BrowserMountConfig { Id = id, ParseError = McpConfiguration.Reason(error) });
+            }
+        }
+        return result.ToArray();
+    }
 
     // The unreadable bytes are kept first. The backup replaces the main file only while that file still holds exactly
     // those bytes: if another writer saved in between, its newer file is loaded instead, or, when that one is
@@ -188,6 +231,87 @@ public sealed class ServerConfig
         SourcePath = full;
     }
 
+    internal ServerConfig CopyForRootEdit(RootConfig[] roots)
+    {
+        // Raw optional definitions may contain unreadable Unicode. They are not edited or serialized here.
+        var ordinary = (ServerConfig)MemberwiseClone();
+        ordinary.McpServers = ordinary.McpServersAlias = null;
+        ordinary.BrowserMounts = [];
+        var copy = JsonSerializer.Deserialize<ServerConfig>(JsonSerializer.Serialize(ordinary))!;
+        copy.McpServers = McpServers; copy.McpServersAlias = McpServersAlias;
+        copy.BrowserMounts = BrowserMounts; copy.BrowserMountParseWarning = BrowserMountParseWarning;
+        copy.Roots = roots;
+        return copy;
+    }
+
+    // Prepare while the host is still running; retain duplicate properties and raw name/value bytes.
+    public static byte[] PrepareRoots(string path, RootConfig[] roots) => PrepareRoots(File.ReadAllBytes(path), roots);
+
+    internal static byte[] PrepareRoots(byte[] source, RootConfig[] roots)
+    {
+        using var current = McpConfiguration.ParseDocument(source);
+        if (current.RootElement.ValueKind != JsonValueKind.Object)
+            throw new InvalidDataException("The configuration is not a JSON object; roots were not saved.");
+        // Utf8JsonWriter has no raw property-name API. Copy each original name/colon/value slice
+        // instead, so even a name containing a lone surrogate escape survives byte-for-byte.
+        ReadOnlySpan<byte> json = source;
+        if (json.StartsWith(new byte[] { 0xef, 0xbb, 0xbf })) json = json[3..];
+        var reader = new Utf8JsonReader(json, new JsonReaderOptions { AllowTrailingCommas = true, CommentHandling = JsonCommentHandling.Skip });
+        reader.Read(); // The document above established that this is an object.
+        using var stream = new MemoryStream();
+        stream.WriteByte((byte)'{');
+        bool copied = false;
+        while (reader.Read() && reader.TokenType != JsonTokenType.EndObject)
+        {
+            int propertyStart = checked((int)reader.TokenStartIndex);
+            bool isRoots;
+            try { isRoots = reader.GetString() == "roots"; }
+            catch (InvalidOperationException) { isRoots = false; }
+            reader.Read();
+            reader.Skip();
+            int propertyEnd = checked((int)reader.BytesConsumed);
+            if (isRoots) continue;
+            if (copied) stream.WriteByte((byte)',');
+            stream.Write("\n  "u8);
+            stream.Write(json[propertyStart..propertyEnd]);
+            copied = true;
+        }
+        if (copied) stream.WriteByte((byte)',');
+        stream.Write("\n  \"roots\": "u8);
+        string formattedRoots = JsonSerializer.Serialize(roots, RootsFormat).Replace("\n", "\n  ", StringComparison.Ordinal);
+        stream.Write(Encoding.UTF8.GetBytes(formattedRoots));
+        stream.Write("\n}\n"u8);
+        return stream.ToArray();
+    }
+
+    internal static bool TryGetReadableProperty(JsonElement document, string name, out JsonElement value)
+    {
+        bool found = false; value = default;
+        foreach (var property in document.EnumerateObject())
+            if (ReadableName(property) == name) { value = property.Value; found = true; }
+        return found;
+    }
+
+    private static string? ReadableName(JsonProperty property)
+    {
+        try { return property.Name; }
+        catch (InvalidOperationException) { return null; } // An unreadable Unicode name cannot name a setting we use.
+    }
+
+    private static void CopyRawProperty(Utf8JsonWriter writer, JsonProperty property, string name)
+    {
+        writer.WritePropertyName(name);
+        writer.WriteRawValue(property.Value.GetRawText(), skipInputValidation: true);
+    }
+
+    public static void SavePrepared(string path, byte[] bytes)
+    {
+        string full = System.IO.Path.GetFullPath(path);
+        WriteAtomically(full, bytes, full + ".bak");
+    }
+
+    public static void SaveRoots(string path, RootConfig[] roots) => SavePrepared(path, PrepareRoots(path, roots));
+
     // A temporary file in the same directory is written and flushed, then swapped in with File.Replace, or moved into
     // place when there is nothing to replace.
     internal static void WriteAtomically(string path, byte[] bytes, string? backup)
@@ -215,6 +339,7 @@ public sealed class ServerConfig
     public void Validate()
     {
         List<string> warnings = [];
+        if (BrowserMountParseWarning is { } browserWarning) warnings.Add(browserWarning);
         if (Port is < 0 or > 65535) throw new ArgumentException("port must be between 0 and 65535.");
         NormalizeNulls(warnings);
         // An entry the access policy cannot use is dropped here, so AccessPolicy never sees it.
