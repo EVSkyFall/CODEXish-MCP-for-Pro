@@ -3,24 +3,53 @@
 Updated 2026-10-30. Local MCP parity is under review in Draft PR #16. Historical sections retain their own dates
 and source revisions; they are not current whole-product completion claims. No merge or deployment is reported.
 
-## Local MCP parity — revision-7 local verification; CI pending (2026-10-30)
+## Local MCP parity — revision-8 local verification; CI pending (2026-10-30)
 
-Current specification: `docs/local-mcp-parity-plan.md` revision 7, source `f27278e`.
-Revision-7 local results are from the final working tree on merge
-`1411b9fd5446207bda7751da32d3ef31c733e4e0` (parents `726188d` and `f27278e`), source frozen
-2026-10-30 08:13:55 UTC. The implementation commit will be assigned after this documentation update.
+Current specification: `docs/local-mcp-parity-plan.md` revision 8, source `571f101`.
+Revision-8 local validation used the source frozen 2026-10-30 08:51:36 UTC in the working tree on local
+integration merge `18942d4596ac5913b657b0aa1f35b319863344e2` (published implementation `91465ea` plus
+approved plan `571f101`). This identifies the tested local source, not a published revision-8 commit.
+Revision-8 CI remains pending and live owner-PC Unity/ChatGPT acceptance is unrun.
+
+| Revision-8 verification / environment / source | Observed result |
+| --- | --- |
+| Local Linux Release build, frozen source above | Exit 0; 0 errors, 4 existing MCP9005 roots warnings |
+| Local Linux `--self-test`, same source | Exit 0; 433, desktop core 57, regressions 11 passed / 0 failed; fake desktop platform |
+| Local Linux `--browser-tests`, same source | Exit 0; 300; fixture transports/HTTP host, not a real browser/ChatGPT trial |
+| Local Linux `--tray-tests`, same source | Exit 0; 68; Windows-only checks skipped with reasons |
+| Linux-hosted Windows/WPF cross-compilation, same source | Exit 0; 0 errors, 4 existing MCP9005 warnings; compile only, not Windows execution |
+| Revision-8 Ubuntu/Windows CI | Pending |
+| Live owner-PC Windows/Unity/ChatGPT acceptance | Not run |
+
+The integration lead verified all 68 tracked C# hashes unchanged since the freeze and all 62 server C# files
+byte-identical in the isolated Windows build. Logs are
+`/workspace/shared/local-mcp-parity-rev8-delivery/rev8-{build,self,browser,tray,windows}.log`
+(local evidence, not committed artifacts). No revision-8 aggregate run failed.
+Completed revision-7 results below remain separate historical evidence.
+
+### Revision-7 verification (2026-10-30)
+
+Specification for this result: `docs/local-mcp-parity-plan.md` revision 7, source `f27278e`.
+Revision-7 local results correspond to published implementation commit `91465ea`, whose tested source was
+frozen 2026-10-30 08:13:55 UTC. The earlier local integration merge identifier was not the published commit
+and is not used as published-history evidence.
 The integration lead verified all 68 tracked C# hashes unchanged since that freeze and all 62 server C# files
 byte-identical in the isolated Windows cross-compilation tree.
 
 | Revision-7 verification / environment / source | Observed result |
 | --- | --- |
-| Local Linux Release build, frozen working tree on `1411b9f` | Exit 0; 0 errors, 4 existing MCP9005 roots warnings |
+| Local Linux Release build, source published as `91465ea` | Exit 0; 0 errors, 4 existing MCP9005 roots warnings |
 | Local Linux `--self-test`, same frozen source | Exit 0; 432, desktop core 57, regressions 11 passed / 0 failed; fake desktop platform |
 | Local Linux `--browser-tests`, same frozen source | Exit 0; 284; fixture transports and HTTP host, not a real browser/ChatGPT trial |
 | Local Linux `--tray-tests`, same frozen source | Exit 0; 67; Windows-only checks skipped with reasons |
 | Linux-hosted Windows/WPF cross-compilation, same frozen source | Exit 0; 0 errors, 4 existing MCP9005 warnings; compile only, not Windows execution |
-| Revision-7 Ubuntu/Windows CI | Pending; revision-6 CI below does not validate these changes |
+| Revision-7 Ubuntu/Windows server CI, head `91465ea` | Both passed; Ubuntu self/core/regressions/browser/tray: 432/57/11/284/67; Windows: 451/56/11/289/82; [run 41026274762](https://github.com/EVSkyFall/CODEXish-MCP-for-Pro/actions/runs/41026274762) |
+| Revision-7 Ubuntu/Windows probe CI, head `91465ea` | Both passed; Ubuntu 93 / Windows 97; [run 41026274638](https://github.com/EVSkyFall/CODEXish-MCP-for-Pro/actions/runs/41026274638) |
 | Live owner-PC Windows/Unity/ChatGPT acceptance | Not run |
+
+Revision-7 CI synthetic merge `7fd48dab8c8a0a6f6af7fa953a890a9844ba4e06` and published head
+`91465ea4b592c7f1b087deefe64c867b47b9044c` have identical tree
+`27bfcea38e279c093ed59e2b54db0da3e877140a`; these results apply to that published source.
 
 Workspace evidence: `/workspace/shared/local-mcp-parity-rev7-delivery/rev7-{build,self,browser,tray,windows}.log`.
 These are local logs, not committed artifacts. Earlier local Linux revision-7 failures remain recorded:

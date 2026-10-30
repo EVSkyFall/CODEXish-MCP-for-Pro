@@ -144,6 +144,9 @@ public static class McpManagerTests
         await ConfigurationWarningsRefresh(check);
         await InitialPreparationFailureRecovers(check);
         await ConfigurationIoFailureRetries(check);
+        await StableConfigurationFailures(check);
+        await StartupLifetimeOrdering(check);
+        await NullBrowserReason(check);
     }
     private static async Task RapidReplacement(Action<bool, string> check)
     {
@@ -631,23 +634,30 @@ public static class McpManagerTests
         string directory = Path.Combine(Path.GetTempPath(), "codexish-mcp-initial-recovery-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(directory);
         string path = Path.Combine(directory, "codexish.json");
-        File.WriteAllText(path, "{\"mcp_servers\":{\"recovered\":{\"command\":\"unused-fixture\",\"disabled\":true}}}");
+        File.WriteAllText(path, "{\"mcp_servers\":{\"recovered\":{\"command\":\"unused-fixture\"}}}");
         try
         {
             using var runtime = new CodexishRuntime(new ServerConfig { StateDir = Path.Combine(directory, "state"), SourcePath = path }, true);
             int reads = 0;
+            McpMount? capturedWarm = null;
+            bool warmStayedUnstarted = false;
             runtime.Mounts.BeforeReloadRead = () =>
             {
                 if (Interlocked.Increment(ref reads) == 1) throw new InvalidOperationException("initial injected reader failure");
+                warmStayedUnstarted = capturedWarm is not null && !(bool)typeof(McpMount).GetField("started", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(capturedWarm)!;
             };
             Task preparation = runtime.Mounts.PrepareAsync();
             await preparation;
             string? error = JsonSerializer.SerializeToElement(runtime.Mounts.Describe()).GetProperty("reload_error").GetString();
             check(preparation.IsCompletedSuccessfully && error?.Contains("initial injected reader failure", StringComparison.Ordinal) == true && runtime.Mounts.ResourceTargets.Any(t => t.Identity == "recovered"),
                 "manager: initial reader exception produces a warning without faulting the cached preparation task");
+            var warmTarget = runtime.Mounts.ResourceTargets.Single(t => t.Identity == "recovered");
+            capturedWarm = (McpMount)warmTarget;
             runtime.Mounts.Start();
-            check(await Observe(() => reads >= 2 && runtime.Mounts.ResourceTargets.Any(t => t.Identity == "recovered")),
+            check(await Observe(() => reads >= 2 && !ReferenceEquals(warmTarget, runtime.Mounts.ResourceTargets.Single(t => t.Identity == "recovered")) &&
+                JsonSerializer.SerializeToElement(runtime.Mounts.Describe()).GetProperty("reload_error").ValueKind == JsonValueKind.Null),
                 "manager: normal polling retries the initial preparation failure and applies the unchanged file");
+            check(warmStayedUnstarted, "manager: failed initial full pass never starts its warm manifest instance before successful polling recovery");
             Task disposal = runtime.Mounts.DisposeAsync().AsTask(); await disposal;
             check(disposal.IsCompletedSuccessfully,
                 "manager: disposal completes after initial preparation failure and successful polling recovery");
@@ -699,6 +709,113 @@ public static class McpManagerTests
             }
             finally { TestCleanup.RemoveDirectory(directory); }
         }
+    }
+
+    private static async Task StableConfigurationFailures(Action<bool, string> check)
+    {
+        foreach (bool denied in new[] { false, true })
+        {
+            string directory = Path.Combine(Path.GetTempPath(), "codexish-mcp-stable-failure-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(directory);
+            string path = Path.Combine(directory, "codexish.json");
+            if (denied) File.WriteAllText(path, "{}");
+            try
+            {
+                using var runtime = new CodexishRuntime(new ServerConfig { StateDir = Path.Combine(directory, "state"), SourcePath = path }, true);
+                int reads = 0;
+                runtime.Mounts.ReadConfigurationFile = file =>
+                {
+                    Interlocked.Increment(ref reads);
+                    if (denied) throw new UnauthorizedAccessException("injected configuration access denied");
+                    return File.ReadAllBytes(file);
+                };
+                await runtime.Mounts.PrepareAsync();
+                int initialReads = reads;
+                var changed = typeof(McpMounts).GetMethod("Changed", BindingFlags.Instance | BindingFlags.NonPublic)!;
+                var apply = typeof(McpMounts).GetMethod("ApplyRead", BindingFlags.Instance | BindingFlags.NonPublic)!;
+                var paths = typeof(McpMounts).GetField("changedPaths", BindingFlags.Instance | BindingFlags.NonPublic)!;
+                for (int i = 0; i < 5; i++)
+                    if ((bool)changed.Invoke(runtime.Mounts, null)!) apply.Invoke(runtime.Mounts, [paths.GetValue(runtime.Mounts), false]);
+                check(reads == initialReads, "manager: " + (denied ? "denied" : "missing") + " configuration keeps its stamp across five polling passes");
+                check(runtime.Store.Events("mcp_reload_warning").Count == 1,
+                    "manager: repeated " + (denied ? "denied" : "missing") + " configuration warning is recorded once in SQLite across preparation and polls");
+                // Explicit re-reads of the same file still deduplicate identical diagnostic text.
+                var reload = typeof(McpMounts).GetMethod("ReadDefinitionsAndApply", BindingFlags.Instance | BindingFlags.NonPublic)!;
+                reload.Invoke(runtime.Mounts, null); reload.Invoke(runtime.Mounts, null);
+                check(runtime.Store.Events("mcp_reload_warning").Count == 1,
+                    "manager: identical per-file warning text remains deduplicated on repeated actual reads");
+            }
+            finally { TestCleanup.RemoveDirectory(directory); }
+        }
+    }
+
+    private static async Task StartupLifetimeOrdering(Action<bool, string> check)
+    {
+        string directory = Path.Combine(Path.GetTempPath(), "codexish-mcp-start-order-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        var started = typeof(McpMount).GetField("started", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        try
+        {
+            var config = new ServerConfig { StateDir = Path.Combine(directory, "warm"), McpServers = JsonSerializer.SerializeToElement(new
+                { ordered = new { command = "unused-fixture" } }) };
+            using (var runtime = new CodexishRuntime(config, true))
+            {
+                var prepareSync = typeof(McpMounts).GetField("prepareSync", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(runtime.Mounts)!;
+                lock (prepareSync)
+                {
+                    runtime.Mounts.Start();
+                    runtime.Mounts.PrepareManifests();
+                    var warm = (McpMount)runtime.Mounts.ResourceTargets.Single();
+                    check(!(bool)started.GetValue(warm)! && warm.Attempts == 0,
+                        "manager: Start before manifest preparation never starts the manifest-only instance");
+                }
+                await runtime.Mounts.PrepareAsync();
+            }
+            config.StateDir = Path.Combine(directory, "predecessor");
+            config.SourcePath = Path.Combine(directory, "codexish.json");
+            File.WriteAllText(config.SourcePath, "{\"mcp_servers\":{\"ordered\":{\"command\":\"unused-fixture\"}}}");
+            using (var runtime = new CodexishRuntime(config, true))
+            {
+                await runtime.Mounts.PrepareAsync();
+                var mount = (McpMount)runtime.Mounts.ResourceTargets.Single();
+                var predecessor = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                var lifetimes = (Dictionary<string, Task>)typeof(McpMounts).GetField("lifetimes", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(runtime.Mounts)!;
+                // Model the existing replacement continuation: the initial loop must not bypass it.
+                var startAfter = typeof(McpMounts).GetMethod("StartAfter", BindingFlags.Instance | BindingFlags.NonPublic)!;
+                lifetimes["mcp:7:ordered:0"] = (Task)startAfter.Invoke(runtime.Mounts, [predecessor.Task, mount])!;
+                try
+                {
+                    runtime.Mounts.Start();
+                    // A poll proves the initial start loop has already been passed, without using a tight timing bound.
+                    int polled = 0; runtime.Mounts.BeforeReloadRead = () => Interlocked.Increment(ref polled);
+                    File.AppendAllText(config.SourcePath, " ");
+                    var loop = typeof(McpMounts).GetField("reloadLoop", BindingFlags.Instance | BindingFlags.NonPublic)!;
+                    bool observedPoll = await Observe(() => Volatile.Read(ref polled) != 0);
+                    check(observedPoll && !(bool)started.GetValue(mount)! && !((Task)loop.GetValue(runtime.Mounts)!).IsCompleted,
+                        "manager: initial start loop does not start a mount while its predecessor lifetime is unfinished");
+                    predecessor.TrySetResult();
+                    check(await Observe(() => (bool)started.GetValue(mount)!),
+                        "manager: initial mount starts after its predecessor lifetime completes");
+                }
+                finally { predecessor.TrySetResult(); }
+            }
+        }
+        finally { TestCleanup.RemoveDirectory(directory); }
+    }
+
+    private static async Task NullBrowserReason(Action<bool, string> check)
+    {
+        string directory = Path.Combine(Path.GetTempPath(), "codexish-mcp-null-browser-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        try
+        {
+            using var runtime = new CodexishRuntime(new ServerConfig { StateDir = directory, BrowserMounts = [null!] }, true);
+            await runtime.Mounts.PrepareAsync();
+            var browser = JsonSerializer.SerializeToElement(runtime.Mounts.DescribeBrowsers()).GetProperty("mounted")[0];
+            check(browser.GetProperty("error").GetString() == "the browser_mounts entry is null",
+                "manager: null browser entry reason has no final period");
+        }
+        finally { TestCleanup.RemoveDirectory(directory); }
     }
 
 }

@@ -194,6 +194,23 @@ public static class McpHttpTests
             }
             await Until(() => target.State == "connected", "completed-client reconnect");
             check(Reply.CodeOf(await Call("ping")) is null, mode + " completed client reconnect restores calls");
+            // The fixture confirms the changing call reached its handler before the client ends.
+            // There is no operation cancellation and no pre-dispatch uncertainty in this regression.
+            using (var active = target.AcquireResourceLease())
+            {
+                var inFlight = Call("slow_change", changing: true);
+                await Until(() => File.Exists(Path.Combine(directory, "slow_change-started")), "changing call dispatched before session completion");
+                var closing = active.Client!.DisposeAsync().AsTask();
+                await Until(() => active.Client.Completion.IsCompleted, "in-flight client completion");
+                var result = await inFlight;
+                check(Reply.CodeOf(result) == "EXECUTION_UNKNOWN" && Effects(result) == "unknown" &&
+                    result.StructuredContent!.Value.GetProperty("error").GetProperty("message").GetString() == "The MCP transport did not produce a confirmed result; do not replay an uncertain action.",
+                    mode + " session completing after confirmed changing dispatch returns EXECUTION_UNKNOWN, not nothing-sent or cancellation");
+                await closing;
+            }
+            await Until(() => target.State == "connected", "post-dispatch completion reconnect");
+            check(Reply.CodeOf(await Call("ping")) is null, mode + " session completion after dispatch reconnects and restores subsequent calls");
+            File.Delete(Path.Combine(directory, "slow_change-started"));
             int attempts = target.Attempts;
             using (var lease = target.AcquireResourceLease())
             {

@@ -71,9 +71,11 @@ public sealed class TrayController(ServerConfig config) : IAsyncDisposable
         finally { await restart(); }
     }
 
-    internal static async Task LogPreparedStart(Task preparation, Func<string> summary, Action<string> log, CancellationToken token)
+    internal static async Task LogPreparedStart(Action announce, Func<Task> preparation, Func<string> summary, Action<string> log, CancellationToken token)
     {
-        try { await preparation.WaitAsync(token); log(summary()); }
+        // URL, authentication notices and warnings describe the listening host, not optional mounts.
+        announce();
+        try { await preparation().WaitAsync(token); log(summary()); }
         catch (OperationCanceledException) when (token.IsCancellationRequested) { }
         catch (Exception error) { log("Mount preparation failed: " + Redaction.Apply(error.Message).Text); }
     }
@@ -405,9 +407,12 @@ public sealed class TrayController(ServerConfig config) : IAsyncDisposable
                 host.Lifetime.ApplicationStopping.Register(() => stopping.TrySetResult());
                 runtime = candidate; app = host;
                 ServerChanged(address);
-                _ = LogPreparedStart(candidate.Mounts.PrepareAsync(),
-                    () => "Server started at " + address + "; browser mounts: " + candidate.Browsers.Summary() + "; MCP servers: " + candidate.Mounts.Summary(), Log, token);
-                foreach (string warning in candidate.Warnings) Log("Warning: " + warning);
+                _ = LogPreparedStart(() =>
+                {
+                    Log("Server started at " + address);
+                    foreach (string warning in candidate.Warnings) Log("Warning: " + warning);
+                }, () => candidate.Mounts.PrepareAsync(),
+                    () => "Browser mounts: " + candidate.Browsers.Summary() + "; MCP servers: " + candidate.Mounts.Summary(), Log, token);
                 return stopping.Task;
             }
             catch
@@ -1049,11 +1054,22 @@ public static class TrayTests
             var preparedBanner = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             List<string> bannerLines = [];
             bool bannerSummaryRead = false;
-            var pendingBanner = TrayController.LogPreparedStart(preparedBanner.Task, () => { bannerSummaryRead = true; return "prepared mounts"; }, bannerLines.Add, CancellationToken.None);
-            Check(!pendingBanner.IsCompleted && !bannerSummaryRead && bannerLines.Count == 0,
-                "tray start returns while mount preparation is pending without reading a premature summary");
+            string[] immediateBanner = ["Server started at http://127.0.0.1:12345/", "OAuth bearer required on /mcp", "Warning: fixture warning"];
+            bool announcedBeforePreparation = false;
+            var pendingBanner = TrayController.LogPreparedStart(() => bannerLines.AddRange(immediateBanner),
+                () => { announcedBeforePreparation = bannerLines.SequenceEqual(immediateBanner); return preparedBanner.Task; },
+                () => { bannerSummaryRead = true; return "prepared mounts"; }, bannerLines.Add, CancellationToken.None);
+            Check(!pendingBanner.IsCompleted && !bannerSummaryRead && announcedBeforePreparation && bannerLines.SequenceEqual(immediateBanner),
+                "console and tray announce URL auth and warnings while mount preparation is held without reading a premature summary");
             preparedBanner.SetResult(); await pendingBanner;
-            Check(bannerSummaryRead && bannerLines.SequenceEqual(["prepared mounts"]), "tray start log reads its mount summary only after preparation");
+            Check(bannerSummaryRead && bannerLines.SequenceEqual([..immediateBanner, "prepared mounts"]), "tray start log reads its mount summary only after preparation");
+            using var cancelledBanner = new CancellationTokenSource();
+            var heldBanner = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            List<string> stoppedBannerLines = [];
+            var stoppedBanner = TrayController.LogPreparedStart(() => stoppedBannerLines.Add("Server started at fixture"), () => heldBanner.Task,
+                () => "must not read stopped mounts", stoppedBannerLines.Add, cancelledBanner.Token);
+            cancelledBanner.Cancel(); await stoppedBanner;
+            Check(stoppedBannerLines.SequenceEqual(["Server started at fixture"]), "stopping during held preparation keeps immediate announcement and omits stale mount summary");
 
             if (OperatingSystem.IsWindows())
             {

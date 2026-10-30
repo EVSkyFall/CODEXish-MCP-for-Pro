@@ -48,6 +48,7 @@ public sealed class McpDefinition
 public sealed record McpProjectFile(string RootId, string State, string? Error, McpDefinition[] Definitions, bool KeptPrevious = false)
 {
     public string[] Warnings { get; init; } = [];
+    internal bool RetryRead { get; init; }
 }
 
 public static class McpConfiguration
@@ -92,9 +93,12 @@ public static class McpConfiguration
         catch (DirectoryNotFoundException) { return new(root.Id, "absent", null, []); }
 
         catch (Exception error) when (error is IOException or UnauthorizedAccessException or System.Security.SecurityException)
-        { return new(root.Id, "unreadable", Reason(error), previous?.Definitions ?? [], previous is not null); }
+        { return new(root.Id, "unreadable", Reason(error), previous?.Definitions ?? [], previous is not null) { RetryRead = IsTransientReadFailure(error) }; }
         catch (Exception error) { return new(root.Id, "unparseable", Reason(error), previous?.Definitions ?? [], previous is not null); }
     }
+
+    internal static bool IsTransientReadFailure(Exception error) =>
+        error is IOException and not (FileNotFoundException or DirectoryNotFoundException);
 
     public static McpDefinition[] ApplyOverrides(IEnumerable<McpDefinition> top, IEnumerable<McpDefinition> project)
     {

@@ -25,6 +25,8 @@ public sealed class McpMounts : IAsyncDisposable
     private HashSet<string> changedPaths = new(StringComparer.Ordinal);
     private McpProjectFile[] projects = [];
     private readonly Dictionary<string, (bool Exists, long Length, long Ticks)> stamps = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, string> fileWarnings = new(StringComparer.Ordinal);
+    private const string ManifestOnlySignature = "manifest-only";
     private readonly List<Task> retirements = [];
     private readonly Dictionary<string, Task> lifetimes = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<McpMount> retiredMounts = [];
@@ -167,7 +169,10 @@ public sealed class McpMounts : IAsyncDisposable
                     lock (reloadSync) { stamps.Clear(); Warn("Mount configuration reload failed: " + error.Message); }
                 }
                 if (stopping.IsCancellationRequested) return;
-                foreach (var e in Volatile.Read(ref snapshot).Entries) e.Mount.Start();
+                lock (reloadSync)
+                    foreach (var e in Volatile.Read(ref snapshot).Entries)
+                        if (e.Signature != ManifestOnlySignature &&
+                            (!lifetimes.TryGetValue(e.Key, out var predecessor) || predecessor.IsCompleted)) e.Mount.Start();
                 while (true)
                 {
                     await Task.Delay(TimeSpan.FromSeconds(3), stopping.Token);
@@ -241,17 +246,18 @@ public sealed class McpMounts : IAsyncDisposable
                     config.BrowserMounts = ServerConfig.TryGetReadableProperty(doc.RootElement, "browser_mounts", out var browsers)
                         ? ServerConfig.ParseBrowserMounts(browsers) : [];
                 }
-                catch (Exception error) { browserReadFailed = true; Warn("browser_mounts keeps its previous definitions: " + error.Message); }
+                catch (Exception error) { browserReadFailed = true; Warn("browser_mounts keeps its previous definitions: " + error.Message, path); }
             }
             catch (Exception error)
             {
                 mainReadFailed = true;
-                if (error is IOException or UnauthorizedAccessException or System.Security.SecurityException) stamps.Remove(path);
-                Warn("codexish.json keeps its previous definitions: " + error.Message);
+                if (McpConfiguration.IsTransientReadFailure(error)) stamps.Remove(path);
+                Warn("codexish.json keeps its previous definitions: " + error.Message, path);
             }
         }
         if (mainChanged && !mainReadFailed)
         {
+            if (!browserReadFailed && config.SourcePath is { } healthyPath) fileWarnings.Remove(healthyPath);
             List<string> warnings = [];
             topDefinitions = McpConfiguration.ParseTopLevel(config, warnings);
             topWarnings = warnings.Distinct(StringComparer.Ordinal).Select(w => Redaction.Apply(w).Text).ToArray();
@@ -262,21 +268,21 @@ public sealed class McpMounts : IAsyncDisposable
             string projectPath = Path.Combine(r.Path, ".mcp.json");
             var result = force || previous is null || changed.Contains(projectPath)
                 ? McpConfiguration.ReadProject(r, previous, ReadConfigurationFile) : previous;
-            if (result.State == "unreadable") stamps.Remove(projectPath);
+            if (result.RetryRead) stamps.Remove(projectPath);
             return result;
         }).ToArray();
         if (!manifestsOnly) AfterReloadRead?.Invoke();
         var definitions = McpConfiguration.ApplyOverrides(topDefinitions, projects.SelectMany(p => p.Definitions));
         var prior = Volatile.Read(ref snapshot).Entries.ToDictionary(e => e.Key, StringComparer.OrdinalIgnoreCase);
         string Effective(string key, McpDefinition definition, bool sourceChanged)
-            => manifestsOnly ? "manifest-only" : !sourceChanged && prior.TryGetValue(key, out var old) ? old.Signature : McpEffectiveConfiguration.Fingerprint(config, definition);
+            => manifestsOnly ? ManifestOnlySignature : !sourceChanged && prior.TryGetValue(key, out var old) ? old.Signature : McpEffectiveConfiguration.Fingerprint(config, definition);
         var desired = new List<(string Key, string Signature, McpDefinition Definition, BrowserMountConfig? Browser, string? Profile)>();
         var ids = BrowserMounts.NewIdSet();
         int ordinal = 0;
         foreach (var raw in config.BrowserMounts ?? [])
         {
             var b = BrowserMounts.Normalize(raw);
-            var problem = raw is null ? "the browser_mounts entry is null." : BrowserMounts.Invalid(b, ids);
+            var problem = raw is null ? "the browser_mounts entry is null" : BrowserMounts.Invalid(b, ids);
             var root = config.Roots.FirstOrDefault(r => r.Id.Equals(b.RootId, StringComparison.OrdinalIgnoreCase));
             var profile = problem is null ? Path.Combine(config.StateDir, "browser-profiles", b.Id) : "";
             var d = new McpDefinition { Name = b.Id, Identity = "browser:" + b.Id, Source = "codexish.json", RootId = b.RootId,
@@ -314,7 +320,7 @@ public sealed class McpMounts : IAsyncDisposable
             var entry = new Entry(item.Key, item.Signature, policyState, mount, item.Browser, item.Profile, item.Definition);
             next.Add(entry);
             if (old is not null) replacements.Add((old, entry));
-            else if (started != 0 && !stopping.IsCancellationRequested)
+            else if (!manifestsOnly && started != 0 && !stopping.IsCancellationRequested)
             {
                 if (lifetimes.TryGetValue(item.Key, out var predecessor) && !predecessor.IsCompleted)
                     Track(item.Key, StartAfter(predecessor, mount));
@@ -364,9 +370,13 @@ public sealed class McpMounts : IAsyncDisposable
             retirements.RemoveAll(t => t.IsCompleted);
         }
     }
-    private void Warn(string text)
+    private void Warn(string text, string? file = null)
     {
         reloadError = Redaction.Apply(text).Text;
+        // A lasting source problem stays visible, but does not append the same SQLite event every poll.
+        string key = file ?? "<mount preparation>";
+        if (fileWarnings.TryGetValue(key, out var previous) && previous == reloadError) return;
+        fileWarnings[key] = reloadError;
         // A logging failure must not terminate configuration supervision either.
         try { owner.Store.Event("mcp_reload_warning", null, new { error = reloadError }); } catch { }
     }

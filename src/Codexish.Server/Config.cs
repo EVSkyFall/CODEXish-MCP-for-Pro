@@ -243,7 +243,7 @@ public sealed class ServerConfig
         return copy;
     }
 
-    // Prepare while the host is still running. JsonDocument preserves duplicate properties, unlike JsonNode.
+    // Prepare while the host is still running; retain duplicate properties and raw name/value bytes.
     public static byte[] PrepareRoots(string path, RootConfig[] roots) => PrepareRoots(File.ReadAllBytes(path), roots);
 
     internal static byte[] PrepareRoots(byte[] source, RootConfig[] roots)
@@ -251,16 +251,33 @@ public sealed class ServerConfig
         using var current = McpConfiguration.ParseDocument(source);
         if (current.RootElement.ValueKind != JsonValueKind.Object)
             throw new InvalidDataException("The configuration is not a JSON object; roots were not saved.");
+        // Utf8JsonWriter has no raw property-name API. Copy each original name/colon/value slice
+        // instead, so even a name containing a lone surrogate escape survives byte-for-byte.
+        ReadOnlySpan<byte> json = source;
+        if (json.StartsWith(new byte[] { 0xef, 0xbb, 0xbf })) json = json[3..];
+        var reader = new Utf8JsonReader(json, new JsonReaderOptions { AllowTrailingCommas = true, CommentHandling = JsonCommentHandling.Skip });
+        reader.Read(); // The document above established that this is an object.
         using var stream = new MemoryStream();
-        using (var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { Indented = true }))
+        stream.WriteByte((byte)'{');
+        bool copied = false;
+        while (reader.Read() && reader.TokenType != JsonTokenType.EndObject)
         {
-            writer.WriteStartObject();
-            foreach (var property in current.RootElement.EnumerateObject())
-                if (ReadableName(property) is { } name && name != "roots")
-                    CopyRawProperty(writer, property, name);
-            writer.WritePropertyName("roots"); JsonSerializer.Serialize(writer, roots);
-            writer.WriteEndObject();
+            int propertyStart = checked((int)reader.TokenStartIndex);
+            bool isRoots;
+            try { isRoots = reader.GetString() == "roots"; }
+            catch (InvalidOperationException) { isRoots = false; }
+            reader.Read();
+            reader.Skip();
+            int propertyEnd = checked((int)reader.BytesConsumed);
+            if (isRoots) continue;
+            if (copied) stream.WriteByte((byte)',');
+            stream.Write(json[propertyStart..propertyEnd]);
+            copied = true;
         }
+        if (copied) stream.WriteByte((byte)',');
+        stream.Write("\"roots\":"u8);
+        stream.Write(JsonSerializer.SerializeToUtf8Bytes(roots));
+        stream.WriteByte((byte)'}');
         return stream.ToArray();
     }
 

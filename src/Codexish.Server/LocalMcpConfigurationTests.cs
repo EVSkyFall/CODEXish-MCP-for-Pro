@@ -113,8 +113,19 @@ public static class LocalMcpConfigurationTests
             ServerConfig.SaveRoots(configPath, [root]);
             using (var rawSaved = McpConfiguration.ParseDocument(File.ReadAllBytes(configPath)))
                 Check(rawSaved.RootElement.GetProperty("future").GetRawText() == "\"\\uD800\"" &&
-                      rawSaved.RootElement.EnumerateObject().Count() == 3 && ServerConfig.Load(configPath).Roots.Single().Id == root.Id,
-                      "tray raw copy preserves unreadable unused values and skips only unreadable names");
+                      rawSaved.RootElement.EnumerateObject().Count() == 4 &&
+                      File.ReadAllText(configPath).Contains("\"\\uD800\":{\"unused\":\"\\uD800\"}", StringComparison.Ordinal) &&
+                      ServerConfig.Load(configPath).Roots.Single().Id == root.Id,
+                      "tray raw copy preserves unreadable property names and values byte-for-byte");
+            File.WriteAllText(configPath, """{/* comment */ "\uD800" : [1,{"raw":"\uDC00"},], "roots":[], "\uD800" : null, "\u0072oots":[], "escaped\"name": true,} """);
+            ServerConfig.SaveRoots(configPath, [root]);
+            string rawNamesSaved = File.ReadAllText(configPath);
+            using (var rawNamesDocument = McpConfiguration.ParseDocument(File.ReadAllBytes(configPath)))
+                Check(rawNamesSaved.Contains("\"\\uD800\" : [1,{\"raw\":\"\\uDC00\"},]", StringComparison.Ordinal) &&
+                      rawNamesSaved.Contains("\"\\uD800\" : null", StringComparison.Ordinal) &&
+                      rawNamesSaved.Contains("\"escaped\\\"name\": true", StringComparison.Ordinal) &&
+                      rawNamesDocument.RootElement.EnumerateObject().Count() == 4 && ServerConfig.Load(configPath).Roots.Length == 1,
+                      "roots raw copying retains duplicate unreadable names and escaped names while replacing every spelling of roots once");
             File.WriteAllText(configPath, """{"browser_mounts":[{"id":"earlier","command":"x"}],"\uD800":null,"browser_mounts":42,"mcp_servers":{"earlier":{"command":"x"}},"mcp_servers":{"last":{"command":"y"}}}""");
             var duplicateTop = ServerConfig.Load(configPath);
             Check(duplicateTop.BrowserMounts.Length == 0 && duplicateTop.BrowserMountParseWarning is not null &&

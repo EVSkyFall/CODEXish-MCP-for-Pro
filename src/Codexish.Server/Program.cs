@@ -72,15 +72,13 @@ catch (StateLockedException error) { return CommandLine.Refuse(error, Console.Er
 using var runtime = opened;
 // Browser mounts connect in the background once the listener is up, so none of them can delay or stop the server.
 var app = CodexishHost.Build(runtime, config.Port, instructions: !args.Contains("--no-instructions"));
-// Log mount summaries after optional preparation, without delaying the listener on that work.
-async Task PrintBanner()
+// Announce the listener immediately; only the mount summary depends on optional preparation.
+void PrintBanner()
 {
-    await runtime.Mounts.PrepareAsync();
     Console.WriteLine($"""
     CODEXish v1 (coding core, desktop, browser mounts)
       MCP           http://127.0.0.1:{config.Port}/mcp  (published as {config.PublicUrl}/mcp)
       Roots         {string.Join(", ", config.Roots.Select(r => $"{r.Id}:{(r.Read ? "r" : "")}{(r.Write ? "w" : "")}{(r.Shell ? "x" : "")}{(Directory.Exists(r.Path) ? "" : " (missing)")}"))}
-      Browser       {runtime.Browsers.Summary()}; MCP {runtime.Mounts.Summary()}; mounts connect after start, see host_capabilities
       State         {config.StateDir}
       Auth          {(noAuth ? "DISABLED (loopback development only)" : "OAuth bearer required on /mcp")}
       Control       POST http://127.0.0.1:{config.Port}/control/pause with header X-Codexish-Control
@@ -89,7 +87,10 @@ async Task PrintBanner()
     """);
     foreach (string warning in runtime.Warnings) Console.WriteLine("WARNING: " + warning);
 }
-app.Lifetime.ApplicationStarted.Register(() => _ = PrintBanner());
+app.Lifetime.ApplicationStarted.Register(() => _ = TrayController.LogPreparedStart(PrintBanner,
+    () => runtime.Mounts.PrepareAsync(),
+    () => $"  Browser       {runtime.Browsers.Summary()}; MCP {runtime.Mounts.Summary()}; mounts connect after start, see host_capabilities",
+    Console.WriteLine, app.Lifetime.ApplicationStopping));
 await app.RunAsync();
 return 0;
 

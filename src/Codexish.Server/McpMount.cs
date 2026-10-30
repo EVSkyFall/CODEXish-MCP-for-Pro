@@ -605,7 +605,9 @@ public sealed class McpMount : IMcpResourceTarget, IAsyncDisposable
             }
             catch (Exception error) when (!McpResultDecoder.IsTransportLoss(error, lease?.Client?.Completion.IsCompleted == true))
             {
-                return Reply.Error(backendError, $"MCP server '{mount.Identity}' sent an answer CODEXish could not read; check the state the tool acts on before another action.", uncertain,
+                return Reply.Error(backendError, isBrowser
+                    ? $"Browser backend '{mount.browser!.Id}' sent an answer CODEXish could not read; inspect the browser before another action."
+                    : $"MCP server '{mount.Identity}' sent an answer CODEXish could not read; check the state the tool acts on before another action.", uncertain,
                     details: new Dictionary<string, object?> { [isBrowser ? "mount" : "server"] = isBrowser ? mount.browser!.Id : mount.Identity, ["backend_tool"] = backend, ["provider_error"] = Redaction.Apply(error.Message).Text });
             }
             catch (Exception error)

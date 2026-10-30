@@ -59,7 +59,7 @@ public static class BrowserTests
         public CallToolResult Picture() => new() { Content = [ImageContentBlock.FromBytes(Convert.FromBase64String("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aOcQAAAAASUVORK5CYII="), "image/png")] };
 
         [McpServerTool(Name = "error", ReadOnly = false), Description("Return an explicit backend tool error.")]
-        public CallToolResult Error() => new() { IsError = true, Content = [new TextContentBlock { Text = "test backend error" }] };
+        public CallToolResult Error(bool unreadable = false) => unreadable ? new() { Content = null! } : new() { IsError = true, Content = [new TextContentBlock { Text = "test backend error" }] };
 
         [McpServerTool(Name = "process", ReadOnly = true), Description("Report this fixture's process id, arguments and environment variable names.")]
         public CallToolResult ProcessInfo() => new()
@@ -301,6 +301,12 @@ public static class BrowserTests
                     Check((await Call("picture", new { })).Content.OfType<ImageContentBlock>().Count() == 1, "image content survives the stdio and HTTP hops");
                     var failed = await Call("error", new { }, "browser-error");
                     Check(Reply.CodeOf(failed) == "BROWSER_BACKEND_ERROR" && Texts(failed).SequenceEqual(["test backend error"]), "a backend tool error stays an error with its text");
+                    var unreadable = await Call("error", new { unreadable = true }, "browser-unreadable");
+                    var unreadableError = unreadable.StructuredContent!.Value.GetProperty("error");
+                    Check(Reply.CodeOf(unreadable) == "BROWSER_BACKEND_ERROR" && unreadableError.GetProperty("side_effects").GetString() == "unknown" &&
+                        unreadableError.GetProperty("message").GetString() == "Browser backend 'fixture' sent an answer CODEXish could not read; inspect the browser before another action." &&
+                        unreadableError.GetProperty("details").GetProperty("mount").GetString() == "fixture" && unreadableError.GetProperty("details").TryGetProperty("provider_error", out _),
+                        "unreadable mounted browser answer retains browser wording, mount details and uncertain effects");
                     Check(Texts(await Call(LongToolName, new { })).SequenceEqual(["long"]), "the shortened tool name still calls the backend's original tool");
 
                     var resource = await Call("resource", new { });

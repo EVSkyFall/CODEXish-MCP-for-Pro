@@ -270,9 +270,9 @@ that cannot be deleted yet is tried again at the next sweep. Reading output that
 
 ## Local MCP servers
 
-Revision-6 implementation head `726188d` passed Ubuntu and Windows CI (the CI merge tree was identical).
-Revision-7 local Linux suites passed on the working tree based on `1411b9f`, source frozen 2026-10-30
-08:13:55 UTC; revision-7 CI remains pending.
+Published revision-7 head `91465ea` passed Ubuntu and Windows server/probe CI; see the linked results below.
+Revision-8 local Linux suites passed on source frozen 2026-10-30 08:51:36 UTC (working tree over `91465ea`
+plus plan `571f101`); revision-8 CI remains pending.
 Live owner-PC Unity/ChatGPT acceptance remains unrun.
 [Implementation status](../IMPLEMENTATION_STATUS.md) separates actual verification from this behavior reference. CODEXish mounts stdio and HTTP MCP servers alongside its native tools.
 Put definitions under `mcp_servers` (or the compatible `mcpServers` spelling) in `codexish.json`, or under
@@ -437,12 +437,15 @@ outages. Before the host listens, global definitions from `codexish.json` and th
 are parsed and published without environment reads, PATH probing or root I/O. Project files, effective
 fingerprints and actual starts follow in the background, publishing as they finish. Thus global cached tools
 and instructions are available immediately after restart, without waiting for backend connection or slow PATH.
+A project server's manifest publishes after its root `.mcp.json` is read in the background; it is not part of
+the pre-listen guarantee. The manifest-only pass never starts servers; the full pass starts each exactly once.
 Removed manifests are left on disk but not loaded.
 
 Mount startup reads current files even if the in-memory configuration is stale. Every three seconds, file length
 and last-write time are checked and recorded before reading, never after applying, so a concurrent save is
-seen next pass. An I/O read failure (such as a sharing violation) drops that file's stamp so the next pass
-retries the unchanged file; it does not require another save. Only definitions from changed files are re-read/re-fingerprinted; unchanged files retain their
+seen next pass. A transient I/O failure (such as a sharing violation or offline share) drops that file's stamp
+so the next pass retries the unchanged file without another save. Missing or denied files keep their stamps
+until a change. A file warning is recorded only when its text changes, not on every pass of a lasting problem. Only definitions from changed files are re-read/re-fingerprinted; unchanged files retain their
 signatures. Saved MCP and browser definition changes reload without restarting CODEXish:
 servers with unchanged effective configuration keep running; changed/removed instances stop accepting new calls and drain dispatched calls
 without a deadline before stopping; a changed replacement starts only after the old instance stops. Pause does not
