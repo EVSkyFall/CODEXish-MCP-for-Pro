@@ -38,10 +38,9 @@ mounted from an existing browser MCP server such as Playwright MCP (see [Browser
 `codexish.json`, or loaded from each root's `.mcp.json`, over stdio or HTTP. Saved mount changes reload without
 restarting CODEXish; only servers whose effective configuration changed restart. Mounted resources and server instructions reach ChatGPT alongside the tools. On Windows,
 child commands use current user-environment changes, including newly installed `npx`/`uvx` on PATH.
-Revision-7 head `91465ea` passed [Ubuntu and Windows server CI](https://github.com/EVSkyFall/CODEXish-MCP-for-Pro/actions/runs/41026274762)
-and [probe CI](https://github.com/EVSkyFall/CODEXish-MCP-for-Pro/actions/runs/41026274638).
-Revision-8 local Linux suites passed on source frozen 2026-10-30 08:51:36 UTC (working tree over `91465ea`
-plus plan `571f101`); revision-8 CI remains pending and live owner-PC Unity/ChatGPT use remains unrun. See
+Published revision-8 head `593b852` passed [Ubuntu and Windows server CI](https://github.com/EVSkyFall/CODEXish-MCP-for-Pro/actions/runs/41030316166)
+and [probe CI](https://github.com/EVSkyFall/CODEXish-MCP-for-Pro/actions/runs/41030316210). These results apply to
+that commit, not later edits; live owner-PC Unity/ChatGPT use remains unrun. See
 [verification status](IMPLEMENTATION_STATUS.md) for actual results.
 
 ## What you need

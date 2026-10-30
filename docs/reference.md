@@ -270,9 +270,8 @@ that cannot be deleted yet is tried again at the next sweep. Reading output that
 
 ## Local MCP servers
 
-Published revision-7 head `91465ea` passed Ubuntu and Windows server/probe CI; see the linked results below.
-Revision-8 local Linux suites passed on source frozen 2026-10-30 08:51:36 UTC (working tree over `91465ea`
-plus plan `571f101`); revision-8 CI remains pending.
+Published revision-8 head `593b852` passed Ubuntu and Windows server/probe CI; see the linked results below.
+Those results apply to that published source and do not validate later edits.
 Live owner-PC Unity/ChatGPT acceptance remains unrun.
 [Implementation status](../IMPLEMENTATION_STATUS.md) separates actual verification from this behavior reference. CODEXish mounts stdio and HTTP MCP servers alongside its native tools.
 Put definitions under `mcp_servers` (or the compatible `mcpServers` spelling) in `codexish.json`, or under
@@ -438,14 +437,16 @@ are parsed and published without environment reads, PATH probing or root I/O. Pr
 fingerprints and actual starts follow in the background, publishing as they finish. Thus global cached tools
 and instructions are available immediately after restart, without waiting for backend connection or slow PATH.
 A project server's manifest publishes after its root `.mcp.json` is read in the background; it is not part of
-the pre-listen guarantee. The manifest-only pass never starts servers; the full pass starts each exactly once.
+the pre-listen guarantee. The manifest-only pass never starts servers; the full pass starts each exactly once. A retained global
+manifest-only entry still starts if full preparation encounters bad JSON or a malformed browser section.
 Removed manifests are left on disk but not loaded.
 
 Mount startup reads current files even if the in-memory configuration is stale. Every three seconds, file length
 and last-write time are checked and recorded before reading, never after applying, so a concurrent save is
 seen next pass. A transient I/O failure (such as a sharing violation or offline share) drops that file's stamp
 so the next pass retries the unchanged file without another save. Missing or denied files keep their stamps
-until a change. A file warning is recorded only when its text changes, not on every pass of a lasting problem. Only definitions from changed files are re-read/re-fingerprinted; unchanged files retain their
+until a change. A file warning is recorded only when its text changes, not on every pass of a lasting problem. A healthy read
+clears the remembered warning, so a later recurrence is reported again once. Only definitions from changed files are re-read/re-fingerprinted; unchanged files retain their
 signatures. Saved MCP and browser definition changes reload without restarting CODEXish:
 servers with unchanged effective configuration keep running; changed/removed instances stop accepting new calls and drain dispatched calls
 without a deadline before stopping; a changed replacement starts only after the old instance stops. Pause does not
@@ -457,7 +458,7 @@ effective configuration: identity spelling, resolved command path, expanded argu
 `env`/`env_vars` values, and tool filters/read-only/enable settings. The automatic allowlisted base environment is
 excluded. Thus only servers affected by a changed expansion or resolved command restart; unrelated servers keep
 their processes. Tray roots saves read the latest file and replace only `roots`, preserving mount and
-unknown fields, including duplicate top-level keys, with the existing atomic save and backup. New bytes are
+unknown fields, including duplicate top-level keys, with readable indentation and the existing atomic save and backup. New bytes are
 prepared before stopping anything; parse/read failure leaves the server running. After stopping, a finally path
 restarts whatever was running even if saving fails. After stop, the file is read again; if it changed since
 preparation, the bytes are rebuilt from that newer content. If rereading/rebuilding fails, the server restarts

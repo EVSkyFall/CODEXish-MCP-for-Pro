@@ -147,6 +147,7 @@ public static class McpManagerTests
         await StableConfigurationFailures(check);
         await StartupLifetimeOrdering(check);
         await NullBrowserReason(check);
+        await RetainedWarmMountStarts(check);
     }
     private static async Task RapidReplacement(Action<bool, string> check)
     {
@@ -345,6 +346,14 @@ public static class McpManagerTests
             Save("subsequent-save");
             check(await Until(() => runtime.Mounts.ResourceTargets.Single().Identity == "subsequent-save") && Warning() is null,
                 "manager: later saves still apply normally after unexpected reload recovery");
+            int PriorFailures() => runtime.Store.Events("mcp_reload_warning").Count(e => e.Json?.Contains("injected reader failure", StringComparison.Ordinal) == true);
+            check(PriorFailures() == 1, "manager: first unexpected reload failure has one diagnostic before recurrence");
+            Interlocked.Exchange(ref reads, 0);
+            Save("same-failure-again");
+            check(await Until(() => PriorFailures() == 2),
+                "manager: the same unexpected failure after a successful full pass records a new diagnostic event");
+            check(await Until(() => runtime.Mounts.ResourceTargets.Single().Identity == "same-failure-again") && Warning() is null,
+                "manager: repeated unexpected failure recovers again without another file save");
         }
         finally { TestCleanup.RemoveDirectory(directory); }
     }
@@ -816,6 +825,44 @@ public static class McpManagerTests
                 "manager: null browser entry reason has no final period");
         }
         finally { TestCleanup.RemoveDirectory(directory); }
+    }
+
+    private static async Task RetainedWarmMountStarts(Action<bool, string> check)
+    {
+        foreach (bool malformedMain in new[] { true, false })
+        {
+            string directory = Path.Combine(Path.GetTempPath(), "codexish-mcp-warm-retain-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(directory);
+            string path = Path.Combine(directory, "codexish.json");
+            string executable = Environment.ProcessPath!;
+            string[] prefix = Path.GetFileNameWithoutExtension(executable).Equals("dotnet", StringComparison.OrdinalIgnoreCase)
+                ? [Assembly.GetExecutingAssembly().Location] : [];
+            string invalid = malformedMain ? "{ not json" : "{\"browser_mounts\":{\"wrong\":\"type\"}}";
+            File.WriteAllText(path, invalid);
+            DateTime timestamp = File.GetLastWriteTimeUtc(path);
+            try
+            {
+                using var runtime = new CodexishRuntime(new ServerConfig
+                {
+                    StateDir = Path.Combine(directory, "state"), SourcePath = path,
+                    Roots = [new RootConfig { Id = "root", Path = directory }],
+                    BrowserMounts = [new BrowserMountConfig { Id = "retained", RootId = "root", Kind = "custom", Command = executable,
+                        Args = prefix.Concat(new[] { "--local-mcp-fixture", directory }).ToArray(), ReadOnlyTools = ["inspect"] }]
+                }, true);
+                runtime.Mounts.PrepareManifests();
+                var warm = (McpMount)runtime.Mounts.ResourceTargets.Single();
+                check(warm.State == "not_started" && warm.Attempts == 0,
+                    "manager: retained in-memory browser is published but not started by manifest-only pass with " + (malformedMain ? "bad JSON" : "wrong browser type"));
+                await runtime.Mounts.PrepareAsync();
+                var prepared = (McpMount)runtime.Mounts.ResourceTargets.Single();
+                check(!ReferenceEquals(warm, prepared),
+                    "manager: full pass fingerprints and replaces retained warm browser despite " + (malformedMain ? "bad JSON" : "wrong browser type"));
+                runtime.Mounts.Start();
+                check(await Observe(() => prepared.State == "connected") && File.ReadAllText(path) == invalid && File.GetLastWriteTimeUtc(path) == timestamp,
+                    "manager: retained warm browser connects without a re-save despite " + (malformedMain ? "bad JSON" : "wrong browser type"));
+            }
+            finally { TestCleanup.RemoveDirectory(directory); }
+        }
     }
 
 }

@@ -126,6 +126,10 @@ public static class LocalMcpConfigurationTests
                       rawNamesSaved.Contains("\"escaped\\\"name\": true", StringComparison.Ordinal) &&
                       rawNamesDocument.RootElement.EnumerateObject().Count() == 4 && ServerConfig.Load(configPath).Roots.Length == 1,
                       "roots raw copying retains duplicate unreadable names and escaped names while replacing every spelling of roots once");
+            Check(rawNamesSaved.StartsWith("{\n  \"\\uD800\" : ", StringComparison.Ordinal) &&
+                      rawNamesSaved.Contains(",\n  \"escaped\\\"name\": true,\n  \"roots\": [\n    {\n      \"id\": \"root\"", StringComparison.Ordinal) &&
+                      rawNamesSaved.EndsWith("\n    }\n  ]\n}\n", StringComparison.Ordinal),
+                      "roots save keeps raw property text while indenting top-level properties and the replacement roots array");
             File.WriteAllText(configPath, """{"browser_mounts":[{"id":"earlier","command":"x"}],"\uD800":null,"browser_mounts":42,"mcp_servers":{"earlier":{"command":"x"}},"mcp_servers":{"last":{"command":"y"}}}""");
             var duplicateTop = ServerConfig.Load(configPath);
             Check(duplicateTop.BrowserMounts.Length == 0 && duplicateTop.BrowserMountParseWarning is not null &&

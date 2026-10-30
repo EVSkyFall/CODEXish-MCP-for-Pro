@@ -271,13 +271,15 @@ public sealed class ServerConfig
             int propertyEnd = checked((int)reader.BytesConsumed);
             if (isRoots) continue;
             if (copied) stream.WriteByte((byte)',');
+            stream.Write("\n  "u8);
             stream.Write(json[propertyStart..propertyEnd]);
             copied = true;
         }
         if (copied) stream.WriteByte((byte)',');
-        stream.Write("\"roots\":"u8);
-        stream.Write(JsonSerializer.SerializeToUtf8Bytes(roots));
-        stream.WriteByte((byte)'}');
+        stream.Write("\n  \"roots\": "u8);
+        string formattedRoots = JsonSerializer.Serialize(roots, Format).Replace("\n", "\n  ", StringComparison.Ordinal);
+        stream.Write(Encoding.UTF8.GetBytes(formattedRoots));
+        stream.Write("\n}\n"u8);
         return stream.ToArray();
     }
 

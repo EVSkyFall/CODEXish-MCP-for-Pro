@@ -275,7 +275,7 @@ public sealed class McpMounts : IAsyncDisposable
         var definitions = McpConfiguration.ApplyOverrides(topDefinitions, projects.SelectMany(p => p.Definitions));
         var prior = Volatile.Read(ref snapshot).Entries.ToDictionary(e => e.Key, StringComparer.OrdinalIgnoreCase);
         string Effective(string key, McpDefinition definition, bool sourceChanged)
-            => manifestsOnly ? ManifestOnlySignature : !sourceChanged && prior.TryGetValue(key, out var old) ? old.Signature : McpEffectiveConfiguration.Fingerprint(config, definition);
+            => manifestsOnly ? ManifestOnlySignature : !sourceChanged && prior.TryGetValue(key, out var old) && old.Signature != ManifestOnlySignature ? old.Signature : McpEffectiveConfiguration.Fingerprint(config, definition);
         var desired = new List<(string Key, string Signature, McpDefinition Definition, BrowserMountConfig? Browser, string? Profile)>();
         var ids = BrowserMounts.NewIdSet();
         int ordinal = 0;
@@ -313,7 +313,7 @@ public sealed class McpMounts : IAsyncDisposable
                 ? projects.Any(p => p.RootId == item.Definition.RootId && p.State is "unreadable" or "unparseable")
                 : mainReadFailed || item.Browser is not null && browserReadFailed;
             string policyState = item.Definition.State + "\n" + item.Definition.OverriddenBy;
-            if (prior.Remove(item.Key, out var old) && (old.Signature == item.Signature && old.PolicyState == policyState || retainedSource && old.PolicyState == policyState))
+            if (prior.Remove(item.Key, out var old) && old.Signature != ManifestOnlySignature && (old.Signature == item.Signature && old.PolicyState == policyState || retainedSource && old.PolicyState == policyState))
             { old.Mount.RefreshConfigurationWarnings(item.Definition.Warnings.ToArray()); old.Mount.RefreshLaunchDefinition(item.Definition); next.Add(old with { Display = item.Definition }); continue; }
             var mount = new McpMount(owner, item.Definition, Republish, item.Browser);
             if (old is not null) mount.MarkStarting();
@@ -346,6 +346,7 @@ public sealed class McpMounts : IAsyncDisposable
             Track(old.Key, CompleteRetirement(old.Mount, StartAfter(Task.WhenAll(predecessor, drain), fresh?.Mount)));
         }
         PruneRetirements();
+        if (!manifestsOnly) fileWarnings.Remove("<mount preparation>");
     }
     private async Task StartAfter(Task predecessor, McpMount? fresh)
     {
