@@ -1,35 +1,61 @@
 # Actual implementation and verification status
 
-Updated 2026-09-17. Mainline **A / PR #4** is unchanged. Desktop **PR #5 remains Draft**. No merge, force push, branch deletion, or whole-product completion is reported.
+Updated 2026-10-30. Local MCP parity is under review in Draft PR #16. Historical sections retain their own dates
+and source revisions; they are not current whole-product completion claims. No merge or deployment is reported.
 
-## Local MCP parity — local Linux verification; CI/live acceptance pending (2026-10-30)
+## Local MCP parity — revision-6 local verification; CI pending (2026-10-30)
 
 Work branch `dot/local-mcp-parity`, originally created from `claude/stoic-ptolemy-t6updn` at
 `7979744f8a923daa21e43e449b411ff49f082f3d`, then advanced to the approved source update `086cd2b`;
-specification: `docs/local-mcp-parity-plan.md` revision 5.
-This section records the new work separately from the historical results below. The final sequential Release
-suites ran locally on Linux; their successful results do not establish CI, Windows runtime or ChatGPT acceptance.
+current specification: `docs/local-mcp-parity-plan.md` revision 6 (`1bb8f24`), merged locally as `5e85d0a`.
+Revision-6 results below are from the local working tree on merge `5e85d0a` (implementation base `61ac42d`
+plus approved plan `1bb8f24`), C# source frozen 2026-10-30 07:04:46 UTC before the documentation-only update.
+The resulting implementation commit is not yet assigned at this writing. The local Linux Release suites ran
+sequentially; they do not establish revision-6 CI, Windows runtime or ChatGPT acceptance.
+
+| Revision-6 verification / environment / source | Observed result |
+| --- | --- |
+| Local Linux Release build, frozen working tree on `5e85d0a` | Exit 0; 0 errors, 4 MCP9005 roots warnings |
+| Local Linux `--self-test`, same frozen source | Exit 0; 424, desktop core 57, regressions 11 passed / 0 failed; fake desktop platform |
+| Local Linux `--browser-tests`, same frozen source | Exit 0; 263; real fixture transports/HTTP host, not a real browser or ChatGPT trial |
+| Local Linux `--tray-tests`, same frozen source | Exit 0; 62; Windows-only checks skipped with reasons |
+| Linux-hosted Windows/WPF cross-compilation, same frozen source | Exit 0; 0 errors, 4 MCP9005 warnings; 62 C# files byte-identical to tested Linux source; compile only |
+| Revision-6 Ubuntu/Windows CI | Pending; the successful `61ac42d` run below predates these fixes |
+| Live owner-PC Windows/Unity/ChatGPT acceptance | Not run |
+
+Workspace logs: `/tmp/rev6-final4-build.log`, `/tmp/rev6-final4-self.log`,
+`/tmp/rev6-final4-browser.log`, `/tmp/rev6-final4-tray.log`, `/tmp/rev6-final4-windows.log`.
+These paths are local evidence, not committed artifacts. The integration lead verified the source equality.
+Two earlier local Linux revision-6 working-tree failures are retained: self-test check 315 and browser check 50
+read mount state before asynchronous preparation finished. The fixtures now await preparation before the same
+unchanged assertions; no check was weakened or removed. Final manager coverage includes 57 checks, including
+same-effective-configuration display/warning refresh and initial failure recovery; natural retry also verifies
+the latest literal configuration is used.
+
+### Historical revision-5 verification
+
+The following results are qualified to their original source commits and are not revision-6 acceptance.
 
 Scope: local/global MCP definitions over stdio and HTTP; current user environment and command resolution;
 resources (26 native tools), server/project instructions, supervision/list changes/manifests, mount reload and
 collision naming; roots-only tray saves. No merge, deployment or owner-PC configuration change is claimed.
 
-| Verification | Result for this parity work |
+| Verification / environment / source | Observed result |
 | --- | --- |
-| Linux Release build | 0 errors, 4 MCP9005 roots warnings |
-| Isolated Windows/WPF cross-compilation of the final source | 0 errors, the same 4 MCP9005 warnings; compile only, not a Windows execution |
-| `--self-test` | Exit 0; SELF_TEST_PASSED 412, DESKTOP_CORE_PASSED 57, DESKTOP_REGRESSIONS 11 passed / 0 failed (fake platform) |
-| `--browser-tests` | Exit 0; BROWSER_TESTS_PASSED 178; real fixture transports and HTTP host, not a real browser/ChatGPT trial |
-| `--tray-tests` | Exit 0; TRAY_CONTROLLER_PASSED 59; Windows-only checks skipped with reasons |
-| Initial CI on `1370e7f` | Ubuntu server and both probe jobs passed. Windows server build and self-test (429, desktop core 57, regressions 11) passed; browser suite failed after 89; tray step not reached. See follow-up below. |
+| Local Linux Release, source subsequently committed as `1370e7f` | 0 errors, 4 MCP9005 roots warnings |
+| Local Linux-hosted Windows/WPF cross-compilation, source `1370e7f` | 0 errors, the same 4 MCP9005 warnings; compile only, not a Windows execution |
+| Local Linux `--self-test`, source `1370e7f` | Exit 0; SELF_TEST_PASSED 412, DESKTOP_CORE_PASSED 57, DESKTOP_REGRESSIONS 11 passed / 0 failed (fake platform) |
+| Local Linux `--browser-tests`, source `1370e7f` | Exit 0; BROWSER_TESTS_PASSED 178; real fixture transports and HTTP host, not a real browser/ChatGPT trial |
+| Local Linux `--tray-tests`, source `1370e7f` | Exit 0; TRAY_CONTROLLER_PASSED 59; Windows-only checks skipped with reasons |
+| Initial CI on `1370e7f` | Ubuntu server and both probe jobs passed. Windows server build and self-test (429, desktop core 57, regressions 11) passed; browser suite failed after 89; tray step not reached. [Server CI run](https://github.com/EVSkyFall/CODEXish-MCP-for-Pro/actions/runs/41012103691); see follow-up below. |
 | Owner's real Unity MCP via `uvx`/`npx` stdio and HTTP, used from ChatGPT | Not run by this work; separate live acceptance required |
 
-The integration lead ran the final suites sequentially. Local logs are
+For the source subsequently committed as `1370e7f`, the integration lead ran the local Linux suites sequentially. Local logs are
 `/tmp/local-mcp-final-self-test.log`, `/tmp/local-mcp-final-browser-tests.log` and
 `/tmp/local-mcp-final-tray-tests.log`; these are execution-workspace evidence, not repository artifacts.
 Windows-only runtime checks were not run in the local Linux workspace; the initial Windows CI outcome is recorded above. Notification icon, live desktop, real Unity MCP and ChatGPT were not run.
 
-Earlier integration failures are retained here rather than replaced by the passing result:
+Earlier local Linux integration failures (uncommitted work leading to `1370e7f`) are retained here rather than replaced by the passing result:
 - Browser runs stopped at checks 54 (null arguments) and 82 (pending state); both were corrected before rerunning.
 - The revision-4 HTTP 404 expectation conflicted with SDK session expiry; approved revision 5 specifies expiry
   and classifies unrequested cancellation as transport loss rather than user cancellation. Tests follow that decision.
@@ -38,7 +64,7 @@ Earlier integration failures are retained here rather than replaced by the passi
 - A self-test run failed at check 213 on a File.Exists-before-close race; waiting for ledger completion corrected
   the observation ordering. No passing count from these failed runs is treated as final acceptance.
 
-CI follow-up: [Windows job 123920060843](https://github.com/EVSkyFall/CODEXish-MCP-for-Pro/actions/runs/41012103691/job/123920060843)
+CI follow-up on `1370e7f`: [Windows job 123920060843](https://github.com/EVSkyFall/CODEXish-MCP-for-Pro/actions/runs/41012103691/job/123920060843)
 failed in the Windows-only shim fixture before its newly saved definition was published by the three-second
 reload loop. The polling predicate used strict `Single` lookup and threw instead of observing "not present yet".
 The fixture now uses presence-aware state polling, with an additional cross-platform assertion for unpublished
@@ -47,9 +73,9 @@ The same follow-up also fixes the review finding that an unexpected reload excep
 background loop after consuming file stamps. Each iteration now records a redacted warning and clears the
 stamps so the unchanged saved file is retried on the next tick; logging failure cannot terminate supervision.
 An injected-reader regression covers the warning, retry without another save, and a subsequent valid save.
-Time bounds and workflow/scripts are unchanged. Follow-up Linux Release validation passed self-test 412,
+Time bounds and workflow/scripts are unchanged. Follow-up local Linux Release validation of source committed as `3774ea1` passed self-test 412,
 desktop core 57, regressions 11, browser-tests 183, and tray-tests 59; Windows-target/WPF cross-compilation again has
-0 errors and 4 MCP9005 warnings. Windows CI rerun remains required; cross-compilation is not execution.
+0 errors and 4 MCP9005 warnings. That compile check is not Windows execution; the next CI outcome is recorded below.
 
 Second CI follow-up on `3774ea1`: [Windows job 123924765897](https://github.com/EVSkyFall/CODEXish-MCP-for-Pro/actions/runs/41013599138/job/123924765897)
 passed the shim connection, literal argument round-trip, supervisor PID and invalid batch argument checks,
@@ -60,9 +86,15 @@ stamp without ever reading B. B then failed to apply within the existing 30-seco
 Stamp capture now occurs before reading (including construction), never after applying; a concurrent save
 therefore remains visible to the next tick. Integration wait failures now print redacted mount states,
 errors, reload errors and published tool names before failing. No assertion or timeout was relaxed.
-The same three-check injected interleaving passed after the fix. Final Linux Release validation passed
+The same three-check injected interleaving passed after the fix in source committed as `61ac42d`. Local Linux Release validation of that source passed
 self-test 412, desktop core 57, regressions 11, browser-tests 186 and tray-tests 59. Windows-target/WPF
-cross-compilation passed with 0 errors and the same 4 MCP9005 warnings; Windows execution awaits CI.
+cross-compilation of `61ac42d` passed with 0 errors and the same 4 MCP9005 warnings (compile only).
+
+CI on `61ac42d`: [server run 41014866649](https://github.com/EVSkyFall/CODEXish-MCP-for-Pro/actions/runs/41014866649)
+completed successfully for both Ubuntu and Windows (Windows job `123928797730`, Ubuntu job `123928798189`).
+[Probe run 41014866584](https://github.com/EVSkyFall/CODEXish-MCP-for-Pro/actions/runs/41014866584) also passed
+both OS jobs. These are verified job conclusions; final CI pass counts have not been extracted here. They do not
+verify subsequent revision-6 changes or live owner-PC Unity/ChatGPT use.
 
 Known limitations remain: one backend is shared across conversations; ChatGPT refreshes tools/instructions only
 on a new list/initialization; stateless HTTP tool changes are learned on reconnect; no remote OAuth, MCP prompts,

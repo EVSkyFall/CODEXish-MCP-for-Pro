@@ -7,7 +7,7 @@ internal static class McpHandshakeTests
     {
         var mode = new McpHandshake();
         var initial = mode.ProbeTimeout;
-        mode.Failed(false, false, false);
+        mode.Failed(false, false, false, exchanged: false);
         check(!mode.Pinned && mode.ProbeTimeout == initial, "a down server does not change the handshake attempt");
         mode.Failed(true, false, false);
         check(mode.ProbeTimeout == initial, "probe timeout alone does not change the handshake attempt");
@@ -18,6 +18,10 @@ internal static class McpHandshakeTests
         mode.Failed(false, false, true);
         check(mode.Pinned, "a connection closed before answering pins initialize on the next attempt");
         mode.Remembered = true;
+        mode.Failed(false, false, false, exchanged: false);
+        check(mode.Pinned, "connection failure before exchange does not flip a remembered handshake mode");
+        check(McpHandshake.ClosedBeforeAnswer(new HttpRequestException(HttpRequestError.ResponseEnded), false),
+            "HTTP ResponseEnded is concrete closed-before-answer handshake evidence");
         mode.Failed(false, false, false);
         check(!mode.Pinned, "any failed remembered handshake switches to the other mode");
         mode.Failed(false, false, false);

@@ -270,10 +270,12 @@ that cannot be deleted yet is tried again at the next sweep. Reading output that
 
 ## Local MCP servers
 
-The parity feature has local Linux suite results; CI and live Windows/Unity acceptance remain pending.
+The revision-5 implementation at `61ac42d` passed Ubuntu and Windows CI. Revision-6 local Linux suites passed
+on the frozen working tree based on `5e85d0a` (2026-10-30 07:04:46 UTC); its CI remains pending.
+Live owner-PC Unity/ChatGPT acceptance remains unrun.
 [Implementation status](../IMPLEMENTATION_STATUS.md) separates actual verification from this behavior reference. CODEXish mounts stdio and HTTP MCP servers alongside its native tools.
 Put definitions under `mcp_servers` (or the compatible `mcpServers` spelling) in `codexish.json`, or under
-`mcpServers` in a configured root's `.mcp.json`. Project files tolerate comments and trailing commas. Other agents'
+`mcpServers` in a configured root's `.mcp.json`. Startup and reload of both configuration files tolerate comments, trailing commas and a UTF-8 BOM. Other agents'
 user-level files, such as `~/.codex/config.toml` and `~/.claude.json`, are not read.
 
 For example, a root's `.mcp.json` can contain:
@@ -320,10 +322,12 @@ not a sandbox.
 
 `mcp_servers` wins over the alias for a duplicate name. Within an object, the first name wins, case-insensitively;
 later duplicate entries are invalid. Scalar numbers/booleans become JSON text when a string is expected; a single
-string becomes a one-element array with a warning; boolean strings are accepted for enable/disable. Unknown
+string becomes a one-element array with a warning; boolean strings are accepted for enable/disable; null uses the default without a warning. Unknown
 fields (including other agents' timeout fields) are ignored; wrong-transport fields warn. Unusable nested values,
 missing command/URL, bad URL or unknown root invalidate only that definition. Malformed MCP content cannot send
-the full configuration into `.broken`/`.bak` recovery.
+the full configuration into `.broken`/`.bak` recovery. Per-definition/file parse failures, including invalid
+Unicode, are contained as `invalid_config`/`unparseable`; identity comparison is ordinal ignoring case. A URL
+unusable only after variable expansion is a start failure retried with backoff, not permanent invalid configuration.
 
 Identity is the global name, or `<root_id>/<name>` for a project definition, compared without case. A global
 server with the same name and `root_id` overrides that project's entry, which is reported as `overridden`.
@@ -333,8 +337,9 @@ Published names are `mcp_<name>_<tool>` or `mcp_<root_id>_<name>_<tool>`. Saniti
 a deterministic hash suffix and stay at most 64 characters. If that hashed name is also occupied, the hash
 input gains a newline and ordinal (2, then 3, and so on) until a free name is found; no tool is dropped. Naming precedence is native tools, browser file
 order, global MCP file order, then project root/file order. A never-connected earlier server has no known tools:
-its first connection can rename a later server's plain name. Disabled, invalid, overridden and missing-grant
-entries publish no tools.
+its first connection can rename a later server's plain name. Entries in `disabled`, `invalid_config`, `overridden` or `needs_shell_grant` publish no tools. This is not a
+blanket rule for every missing grant: a root-bound global entry can still publish cached tools, while calls fail
+the grant check. An invalid browser entry never shadows the valid same-id entry that will start.
 
 ### Environment and command execution
 
@@ -349,12 +354,16 @@ A failed read falls back to the process environment with a warning and is retrie
 environment. This applies to mounts, `shell_run`, `process_start`, expansion and executable resolution, not Git.
 Mount children automatically receive only the SDK/CODEXish allowlist, not credential-looking or proxy variables.
 Explicit `env_vars` and `env` pass regardless of name, including credentials or proxy settings; capabilities show
-names, never values. Discovered secret values, headers and URL query values augment redaction without losing
-previously learned secrets. Redaction remains best-effort, not a guarantee.
+names, never values. Only values at least eight characters long augment additive redaction: secret-named environment values;
+Authorization, Proxy-Authorization, Cookie and secret-pattern headers; headers filled from environment; and
+query values whose parameter names match the secret pattern. Ordinary values such as `false`, `1`, `8080` or
+an ordinary `Accept: application/json` header are not added globally. Previously learned secrets remain. Redaction remains best-effort, not a guarantee.
 
 Bare `npx`/`uvx` resolve on the child's PATH in directory order; Windows honors accepted PATHEXT extensions
 `.com`, `.exe`, `.bat`, `.cmd`, without searching the current directory. Relative paths with a directory component
-resolve against cwd. Not found means attempt the command as given and report the real error. Windows batch files
+resolve against cwd. On Windows paths without an accepted extension try accepted PATHEXT suffixes before
+the path as given, so an npm `.cmd` shim wins over its extensionless script. `cmd` and `powershell` shell selection
+keeps system locations first; only `pwsh` and caller executables use child PATH. Not found means attempt the command as given and report the real error. Windows batch files
 use system `cmd.exe` with quoted arguments, delayed expansion off and literal `%` (not variable expansion).
 CR, LF or NUL in a batch argument is invalid. The existing post-start Job Object assignment leaves a small window
 in which a grandchild started by cmd can escape the job.
@@ -363,14 +372,24 @@ in which a grandchild started by cmd can escape the job.
 
 Mounted tool inputs go inside `arguments`. Changing tools require a fresh `invocation_id`, use the ledger and a
 per-server FIFO; read-only tools run directly. `wait_ms` is a response wait, never a call deadline. Inspect uncertain
-effects instead of replaying: `MCP_UNAVAILABLE` means nothing was sent, `MCP_BACKEND_ERROR` means a backend/protocol
+effects instead of replaying: `MCP_UNAVAILABLE` reports an unavailable backend or a failed read;
+`MCP_BACKEND_ERROR` means a backend/protocol
 or HTTP status error, and `EXECUTION_UNKNOWN` means a changing call has no confirmed outcome. Transport ambiguity
-must not be treated as proof of no effect. HTTP 404 reconnects; other HTTP status errors do not restart the server.
+must not be treated as proof of no effect: connection-phase HTTP errors are conservatively `EXECUTION_UNKNOWN`
+for changing calls and `MCP_UNAVAILABLE` for reads. An actual HTTP 404 response is `MCP_UNAVAILABLE` with effects
+`none` even for a changing call and reconnects; other HTTP status errors do not restart the server.
 A replaced client normally drains its in-flight calls rather than cancelling another conversation's request.
 Exception: SDK 2.2.0 expires an HTTP 404 session and cancels its in-flight calls. CODEXish accepts that SDK behavior
 without an intercepting handler, preserving transport autodetection. Cancellation not requested by operation
 cancellation or server shutdown is transport loss: changing calls answer `EXECUTION_UNKNOWN`, read-only calls
 `MCP_UNAVAILABLE`, never user `CANCELLED`. This distinction applies to stdio too.
+
+Tool-call and resource-read results are decoded as raw JSON block by block. An unknown or malformed content
+block becomes text naming its type with redacted raw JSON; remaining blocks pass normally. Only transport loss
+(IO/disposed exceptions, unrequested cancellation, HTTP exceptions without status or with 404) reconnects. Other
+exceptions, including JSON errors, are call-local `MCP_BACKEND_ERROR` with unknown effects for changes and none
+for reads. A queued tool that vanished returns `MCP_UNAVAILABLE`, effects none. Unwrappable input schemas
+still publish the tool with any-object `arguments` and a warning rather than blocking all publication.
 
 - `mcp_resource_list` lists all resources/templates, or one case-insensitive `server`; address browser mounts as
   `browser:<id>`. `mcp:<identity>` forces MCP routing and strips exactly one leading `mcp:`; other bare values
@@ -379,11 +398,13 @@ cancellation or server shutdown is transport loss: changing calls answer `EXECUT
   while `mcp:browser:foo` selects the MCP server literally named `browser:foo`; `mcp:mcp:foo` selects MCP
   identity `mcp:foo`. Internal lookup uses kind plus identity, not address text. Servers are queried concurrently, with all pages followed until an empty/repeated cursor. Each
   entry reports its own unavailable, permission, unsupported, failure or `waiting` state. `wait_ms` defaults to
-  10000 and does not cancel unfinished listings; concurrent callers share the listing. An unknown identity is
+  10000 and does not cancel unfinished listings; concurrent callers share the session-scoped listing. It is
+  cancelled when that session ends or retires, never holds a drain and is not reused by a replacement session. An unknown identity is
   `NOT_FOUND`.
 - `mcp_resource_read` takes `server` and `uri` (or a filled-in template). Root-bound reads need read and shell;
   down servers answer `MCP_UNAVAILABLE`. Text and metadata are redacted; binary blobs/image/audio pass unchanged.
-  Resource contents are data, not instructions.
+  The result envelope contains only URI, MIME type and redacted text per item; blobs are delivered once as
+  embedded content, not duplicated into the text/structured envelope. Resource contents are data, not instructions.
 - Redacted backend initialization instructions are cached in manifests, shown in capabilities and composed into
   CODEXish instructions on each initialization/discovery request. `--no-instructions` excludes all instructions.
 - `workspace_info` lists existing `AGENTS.override.md`, `AGENTS.md`, `CLAUDE.md`, `CLAUDE.local.md` and
@@ -396,17 +417,25 @@ Connections start in the background after CODEXish listens. There is no SDK init
 HTTP client and connection timeouts are infinite. Supervision retries from 1 s, doubling to 60 s without giving up,
 resetting after five healthy minutes. Discovery/initialize negotiation adapts from actual handshake failures and
 remembers the successful mode; a merely down server does not force a protocol mode change. A server that closes
-before answering discovery retries initialize-first with 2025-11-25; failure of a remembered mode tries the other.
+before answering discovery retries initialize-first with 2025-11-25; failure with exchanged handshake evidence
+of a remembered mode tries the other. Start failure or connection refusal changes no mode; HTTP ResponseEnded
+counts as closing before answering.
 A probe timeout plus rejected fallback grows the probe wait rather than permanently refusing a slow server.
 
 Tool/resource change notifications and supported subscriptions are handled; tool changes republish names and save
 manifests. A failed re-list keeps the previous list. Capabilities report source, state, retry/error/warnings,
-redacted command/URL, explicit variable names, instructions and tool names. Redacted stderr/backend logs keep a
+redacted command/URL, explicit variable names, instructions and tool names. URL display is only
+`scheme://host:port` plus `/…` for a path, never user information, path contents, query or fragment. Values after
+secret-pattern flags such as `--token` are `[REDACTED]`. Parse warnings are deduplicated per reload. A complete
+entries/tools snapshot is published atomically; capability readers never wait for reload, and initial
+fingerprinting does not delay listening. Redacted stderr/backend logs keep a
 20-line diagnostic tail. MCP manifests live in `<state_dir>/mcp-mounts`; cached tools remain discoverable during
 outages. Removed manifests are left on disk but not loaded.
 
 Mount startup reads current files even if the in-memory configuration is stale. Every three seconds, file length
-and last-write time are checked. Saved MCP and browser definition changes reload without restarting CODEXish:
+and last-write time are checked and recorded before reading, never after applying, so a concurrent save is
+seen next pass. Only definitions from changed files are re-read/re-fingerprinted; unchanged files retain their
+signatures. Saved MCP and browser definition changes reload without restarting CODEXish:
 servers with unchanged effective configuration keep running; changed/removed instances stop accepting new calls and drain dispatched calls
 without a deadline before stopping; a changed replacement starts only after the old instance stops. Pause does not
 hold reload. Invalid/unreadable global files preserve the running set, as do unreadable/unparseable project files;
@@ -417,7 +446,9 @@ effective configuration: identity spelling, resolved command path, expanded argu
 `env`/`env_vars` values, and tool filters/read-only/enable settings. The automatic allowlisted base environment is
 excluded. Thus only servers affected by a changed expansion or resolved command restart; unrelated servers keep
 their processes. Tray roots saves read the latest file and replace only `roots`, preserving mount and
-unknown fields with the existing atomic save and backup.
+unknown fields, including duplicate top-level keys, with the existing atomic save and backup. New bytes are
+prepared before stopping anything; parse/read failure leaves the server running. After stopping, a finally path
+restarts whatever was running even if saving fails.
 
 ### Parity limits
 
@@ -451,7 +482,7 @@ tools directory, add this to `codexish.json`:
 
 - `command` resolves on the child PATH with the root as its working directory. Bare `npx` works, including
   Windows `.cmd` shims; system cmd quotes batch arguments and passes `%` literally. Direct `node` plus `cli.js`
-  remains supported. See [Environment and command execution](#environment-and-command-execution).
+  remains supported. `${VAR}` and `${VAR:-default}` also expand in browser args. See [Environment and command execution](#environment-and-command-execution).
 - `profile_mode: "dedicated"` (the default) keeps the browser's state in `<state_dir>\browser-profiles\<id>`:
   CODEXish appends `--user-data-dir` with that directory for `kind: "playwright"`. A dedicated mount whose own
   `args` already contain `--user-data-dir`, `--cdp-endpoint`, `--extension`, `--storage-state` or `--config` starts
@@ -477,7 +508,8 @@ tools directory, add this to `codexish.json`:
   to at most 60 s between attempts, without giving up; five healthy minutes after a completed handshake and tool
   listing reset the delay. `host_capabilities`
   reports each mount's `state` (`starting`, `connected`, `retrying`, `invalid_config`, `stopped`), its attempts, last
-  error, next retry time and the last lines of its stderr. Only an entry that is invalid in the file itself
+  error, next retry time and the last lines of its stderr under the compatible `stderr_tail` field. Summary
+  retains the `(N tools, source)` detail. Only an entry that is invalid in the file itself
   (`invalid_config`) is not retried.
 - The tool list a backend last reported is saved as `<state_dir>\browser-profiles\<id>.manifest.json`. While the
   backend is down, and after a restart until it connects, those tools stay listed and a call answers

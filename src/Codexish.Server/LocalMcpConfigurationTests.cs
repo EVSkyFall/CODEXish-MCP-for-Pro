@@ -10,8 +10,9 @@ public static class LocalMcpConfigurationTests
         static ServerConfig Config(string json) => JsonSerializer.Deserialize<ServerConfig>(json)!;
         static McpDefinition One(string json) => McpConfiguration.ParseTopLevel(Config("{\"mcp_servers\":{\"test\":" + json + "}}"))[0];
         var config = Config("""{"mcp_servers":{"a":{"command":"first"},"A":{"command":"second"},"a":{"command":"third"}},"mcpServers":{"a":{"command":"alias"},"b":{"command":"other"}}} """);
-        var entries = McpConfiguration.ParseTopLevel(config);
-        Check(entries.Length == 4 && entries[0].Command == "first" && entries[1].Error == "duplicate of an earlier entry" && entries[2].Error == "duplicate of an earlier entry" && entries[3].Name == "b" && config.Warnings.Any(w => w.Contains("a")), "primary wins alias; exact and case duplicates remain isolated and reported");
+        List<string> parseWarnings = [];
+        var entries = McpConfiguration.ParseTopLevel(config, parseWarnings);
+        Check(entries.Length == 4 && entries[0].Command == "first" && entries[1].Error == "duplicate of an earlier entry" && entries[2].Error == "duplicate of an earlier entry" && entries[3].Name == "b" && parseWarnings.SequenceEqual(["mcpServers server 'a' is also in mcp_servers; mcp_servers wins."]) && config.Warnings.Count == 0, "primary wins alias; exact and case duplicates remain isolated and reported");
         Check(McpConfiguration.ParseTopLevel(Config("""{"mcp_servers":7,"mcpServers":{"a":{"command":"ok"}}}""")).Single().Command == "ok", "non-object primary does not hide valid alias");
         Check(One("""{"command":"x","url":"http://localhost","type":"stdio"}""").Transport == "stdio" &&
               One("""{"command":"x","url":"http://localhost","type":"http"}""").Transport == "http" &&
@@ -20,6 +21,17 @@ public static class LocalMcpConfigurationTests
               One("""{"command":"x","type":"future"}""").Warnings.Count > 0, "explicit type and inference follow usable fields");
         Check(One("""{"command":"x","disabled":"TrUe"}""").State == "disabled" && One("""{"command":"x","enabled":"FALSE"}""").State == "disabled" &&
               One("""{"command":"x","enabled":22}""").State == "not_started", "boolean strings honored; malformed enabled ignored");
+        Check(One("""{"command":"x","disabled":null,"enabled":null}""").State == "not_started" &&
+              One("""{"command":"x","disabled":null,"enabled":null}""").Warnings.Count == 0, "null enable flags keep the default without a warning");
+        var unicode = McpConfiguration.ParseTopLevel(Config("""{"mcp_servers":{"\uD800":{"command":"x"},"bad":{"command":"\uD800"},"ok":{"command":"x"}}}"""));
+        Check(unicode.Length == 3 && unicode[0].State == "invalid_config" && unicode[1].State == "invalid_config" && unicode[2].Command == "x" &&
+              unicode.Take(2).All(d => !d.Error!.EndsWith('.') && !d.Error.Contains("InvalidOperationException")), "lone-surrogate name and value are isolated with clause reasons; next entry remains usable");
+        using (var tolerantBrowsers = McpConfiguration.ParseDocument(System.Text.Encoding.UTF8.GetBytes("""[{"id":"ok", /* entry comment */ "command":"x","args":["a",],},]""")))
+        {
+            var browser = ServerConfig.ParseBrowserMounts(tolerantBrowsers.RootElement).Single();
+            Check(browser.ParseError is null && browser.Id == "ok" && browser.Command == "x" && browser.Args.SequenceEqual(["a"]),
+                "browser entries use the same comment and trailing-comma tolerance as the containing file");
+        }
         var coerced = One("""{"command":42,"args":"x","env":{"PORT":8080,"FLAG":true,"EMPTY":"","SKIP":null},"future":{"nested":[1]}}""");
         Check(coerced.Command == "42" && coerced.Args.SequenceEqual(["x"]) && coerced.Env["PORT"] == "8080" && coerced.Env["FLAG"] == "true" && coerced.Env["EMPTY"] == "" && coerced.Env["SKIP"] is null && coerced.State == "not_started", "scalar coercion, null and empty env values, unknown fields");
         Check(One("""{"command":"x","env":{"bad":{}}}""").State == "invalid_config" && One("""{"command":"x","args":[{}]}""").Error!.Contains("args"), "nested scalar values invalidate just their definition");
@@ -62,6 +74,26 @@ public static class LocalMcpConfigurationTests
             string original = File.ReadAllText(configPath);
             var loaded = ServerConfig.Load(configPath);
             Check(File.ReadAllText(configPath) == original && Directory.GetFiles(directory, "*.broken-*").Length == 0 && McpConfiguration.ParseTopLevel(loaded)[1].Command == "works", "nested server type error never invokes .broken/.bak startup recovery");
+            var tolerant = "{/* startup comment */ \"state_dir\":" + JsonSerializer.Serialize(safe.StateDir) + ",\"mcp_servers\":{\"ok\":{\"command\":\"works\",},},}";
+            File.WriteAllBytes(configPath, [0xef, 0xbb, 0xbf, .. System.Text.Encoding.UTF8.GetBytes(tolerant)]);
+            byte[] tolerantBytes = File.ReadAllBytes(configPath);
+            var tolerantLoaded = ServerConfig.Load(configPath);
+            Check(McpConfiguration.ParseTopLevel(tolerantLoaded).Single().Command == "works" && File.ReadAllBytes(configPath).SequenceEqual(tolerantBytes) &&
+                  Directory.GetFiles(directory, "*.broken-*").Length == 0, "startup BOM comments and trailing commas survive without recovery or rewriting");
+            File.WriteAllBytes(projectPath, [0xef, 0xbb, 0xbf, .. System.Text.Encoding.UTF8.GetBytes("""{/* comment */ "mcpServers":{"bad":{"command":"\uD800"},"ok":{"command":"x"},},}""")]);
+            var unicodeProject = McpConfiguration.ReadProject(root);
+            Check(unicodeProject.State == "read" && unicodeProject.Definitions[0].State == "invalid_config" && unicodeProject.Definitions[1].Command == "x", "project BOM and Unicode failure are contained to one definition");
+            File.WriteAllText(configPath, """{"browser_mounts":[{"id":"bad","command":"\uD800"},{"id":"ok","command":"x"}],"mcp_servers":{"bad":{"command":"\uD800"},"ok":{"command":"works"}}}""");
+            var unicodeLoaded = ServerConfig.Load(configPath);
+            Check(unicodeLoaded.BrowserMounts.Length == 2 && unicodeLoaded.BrowserMounts[0].ParseError is not null && unicodeLoaded.BrowserMounts[1].Id == "ok" &&
+                  McpConfiguration.ParseTopLevel(unicodeLoaded)[0].State == "invalid_config" && Directory.GetFiles(directory, "*.broken-*").Length == 0,
+                  "startup isolates malformed browser and MCP entries without backup recovery");
+            var rootsCopy = unicodeLoaded.CopyForRootEdit([root]);
+            rootsCopy.Validate();
+            ServerConfig.SaveRoots(configPath, rootsCopy.Roots);
+            var rootsReload = ServerConfig.Load(configPath);
+            Check(rootsReload.Roots.Single().Id == root.Id && McpConfiguration.ParseTopLevel(rootsReload)[0].State == "invalid_config" &&
+                  rootsReload.BrowserMounts[0].ParseError is not null, "roots edit preserves malformed optional definitions without decoding or blocking the save");
             using var first = JsonDocument.Parse("""{"b":1,"a":2,"a":3}"""); using var second = JsonDocument.Parse("""{"a":2,"a":3,"b":1}""");
             Check(McpConfiguration.Canonical(first.RootElement) == McpConfiguration.Canonical(second.RootElement), "canonical definitions preserve duplicate keys and ignore property order");
         }

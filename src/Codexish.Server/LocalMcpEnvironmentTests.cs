@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Text.Json;
 using static Codexish.Server.SelfTest;
 
 namespace Codexish.Server;
@@ -45,8 +46,14 @@ internal static class LocalMcpEnvironmentTests
         Check(explicitEnv["EMPTY"] == "" && explicitEnv["SET"] == "set" && !explicitEnv.ContainsKey("NULL") && warnings.Any(w => w.Contains("UNKNOWN")), "MCP explicit empty null and undefined environment rules");
         Redaction.RefreshEnvironment();
         Check(Redaction.Apply("local-mcp-synthetic-secret").Redacted, "MCP additive redaction survives RefreshEnvironment");
-        Redaction.AddSensitiveValue("local-mcp-header-value");
-        Check(Redaction.Apply("local-mcp-header-value").Redacted, "MCP explicit header redaction");
+        Redaction.AddHeaderValue("Authorization", "local-mcp-header-value");
+        Redaction.AddHeaderValue("Accept", "application/json");
+        Redaction.AddEnvironmentValues(new Dictionary<string, string?> { ["TOKENIZERS_PARALLELISM"] = "false", ["ORDINARY"] = "ordinary-value" });
+        Redaction.AddUrlQueryValues(new Uri("https://fixture.invalid/?v=1&type=application/json&token=query-secret-long"));
+        Check(Redaction.Apply("local-mcp-header-value").Redacted && Redaction.Apply("query-secret-long").Redacted, "MCP sensitive header and named query values are registered for redaction");
+        Check(Redaction.Apply("false 1 8080 application/json ordinary-value").Text == "false 1 8080 application/json ordinary-value", "MCP short and ordinary environment header and query values remain unchanged");
+        Check(Redaction.DisplayArguments(["--api-key", "ordinary-key-value", "--token=ordinary-token-value", "--name", "safe"]).SequenceEqual(["--api-key", "[REDACTED]", "--token=[REDACTED]", "--name", "safe"]), "MCP argument display masks secret-pattern flag values");
+        Check(Redaction.DisplayUrl("https://user:password@example.com:4321/private-token/path?q=secret#fragment") == "https://example.com:4321/…", "MCP URL display reveals authority only, never path credentials or query");
         string dir = Path.Combine(temp, "mcp-command-env"); Directory.CreateDirectory(dir);
         string first = Path.Combine(dir, "first"), second = Path.Combine(dir, "second"); Directory.CreateDirectory(first); Directory.CreateDirectory(second);
         string suffix = OperatingSystem.IsWindows() ? ".cmd" : "";
@@ -71,13 +78,25 @@ internal static class LocalMcpEnvironmentTests
             File.WriteAllText(Path.Combine(first, "ignored.ps1"), "fixture");
             pathEnv["PATHEXT"] = ".PS1;.CMD";
             Check(ChildEnvironment.ResolveCommand("ignored", pathEnv, dir) == "ignored", "MCP PATHEXT ignores unsupported extensions");
+            File.WriteAllText(Path.Combine(first, "fixture"), "npm shell script");
+            Check(string.Equals(ChildEnvironment.ResolveCommand(Path.Combine(first, "fixture"), pathEnv, dir), firstTool, StringComparison.OrdinalIgnoreCase), "MCP explicit extensionless Windows path prefers cmd over npm shell script");
+            string originalPath = Environment.GetEnvironmentVariable("PATH") ?? "";
+            try
+            {
+                File.WriteAllText(Path.Combine(first, "cmd.exe"), "fake"); File.WriteAllText(Path.Combine(first, "powershell.exe"), "fake");
+                Environment.SetEnvironmentVariable("PATH", first + ";" + originalPath);
+                Check(ProcessSupervisor.ResolveShell("cmd") == Path.Combine(Environment.SystemDirectory, "cmd.exe") && ProcessSupervisor.ResolveShell("powershell") == Path.Combine(Environment.SystemDirectory, "WindowsPowerShell", "v1.0", "powershell.exe"), "MCP cmd and Windows PowerShell prefer system locations over child PATH");
+            }
+            finally { Environment.SetEnvironmentVariable("PATH", originalPath); }
         }
         else Console.WriteLine("SKIP MCP Windows current-user environment and PATHEXT checks: not Windows");
         var fingerprintConfig = new ServerConfig { SourcePath = Path.Combine(temp, "codexish.json") };
-        var definition = new McpDefinition { Identity = "fingerprint", Command = "missing-fixture", Args = ["a"], Env = new() { ["EXPLICIT"] = "one" } };
+        fingerprintConfig.McpServers = JsonSerializer.SerializeToElement(new { fingerprint = new { command = "missing-fixture", args = new[] { "a" }, env = new { EXPLICIT = "one" }, unknown = "before" } });
+        var definition = McpConfiguration.ParseTopLevel(fingerprintConfig).Single();
         string fingerprint = McpEffectiveConfiguration.Fingerprint(fingerprintConfig, definition);
-        definition.Signature = "raw unknown field changed";
-        Check(fingerprint == McpEffectiveConfiguration.Fingerprint(fingerprintConfig, definition) && fingerprint.Length == 64, "MCP effective fingerprint ignores unknown raw fields and retains only SHA256");
+        fingerprintConfig.McpServers = JsonSerializer.SerializeToElement(new { fingerprint = new { command = "missing-fixture", args = new[] { "a" }, env = new { EXPLICIT = "one" }, unknown = new { future_setting = true } } });
+        definition = McpConfiguration.ParseTopLevel(fingerprintConfig).Single();
+        Check(fingerprint == McpEffectiveConfiguration.Fingerprint(fingerprintConfig, definition) && fingerprint.Length == 64, "MCP effective fingerprint ignores actually parsed unknown raw fields and retains only SHA256");
         definition.Env["EXPLICIT"] = "two";
         Check(fingerprint != McpEffectiveConfiguration.Fingerprint(fingerprintConfig, definition), "MCP effective fingerprint detects explicit environment changes");
         definition.Transport = "http"; definition.Url = "http://127.0.0.1/fixture"; definition.Headers["X-Fixture"] = "one";

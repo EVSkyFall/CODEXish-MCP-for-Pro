@@ -53,6 +53,7 @@ public static class McpManagerTests
             Manifest("a_b", "c", true, occupiedBrowser["browser_a_b_".Length..], occupiedBrowser2["browser_a_b_".Length..]);
             Manifest("a", "b_c", true);
             using var runtime = new CodexishRuntime(config, true);
+            await runtime.Mounts.PrepareAsync();
             var names = runtime.Mounts.Tools.Select(t => t.ProtocolTool.Name).ToArray();
             string projectHash = McpMounts.HashedName("mcp", "a/b", "echo");
             check(names.Contains("mcp_a_b_echo") && names.Contains(projectHash) && names.Count(n => n == "mcp_a_b_echo") == 1,
@@ -92,11 +93,16 @@ public static class McpManagerTests
                 "manager: top-level slash is sanitized with a hash, project separator is structural, long tool names fit 64 characters");
             var baseline = config.McpServers!.Value.Clone();
             var reload = typeof(McpMounts).GetMethod("ReadDefinitionsAndApply", BindingFlags.Instance | BindingFlags.NonPublic)!;
-            int captured = 0;
+            int captured = 0, toolReads = 0, finished = 0;
+            using var reading = new ManualResetEventSlim();
             var reader = Task.Run(() =>
             {
-                for (int i = 0; i < 200; i++)
+                while (Volatile.Read(ref finished) == 0 || captured < 200)
                 {
+                    var tools = runtime.Mounts.Tools.Select(t => t.ProtocolTool.Name).ToArray();
+                    if (!tools.Contains("mcp_a_b_echo") || !tools.Contains(projectHash) || tools.Distinct().Count() != tools.Length)
+                        throw new InvalidOperationException("tools/list observed empty, partial, or duplicate publication during reload");
+                    Interlocked.Increment(ref toolReads);
                     var capability = JsonSerializer.SerializeToElement(runtime.Capabilities());
                     var mounted = capability.GetProperty("browser").GetProperty("mounted").EnumerateArray()
                         .Concat(capability.GetProperty("mcp").GetProperty("mounted").EnumerateArray()).ToArray();
@@ -105,25 +111,38 @@ public static class McpManagerTests
                     if (mounted.Length != 7 || !reported.Order().SequenceEqual(CodexishRuntime.ToolNames.Concat(declared).Order()) || reported.Distinct().Count() != reported.Length)
                         throw new InvalidOperationException("capability generation mixes server declarations and global tool names");
                     Interlocked.Increment(ref captured);
+                    reading.Set();
                 }
             });
-            for (int i = 0; i < 100; i++)
+            reading.Wait();
+            try
             {
-                var replacement = System.Text.Json.Nodes.JsonNode.Parse(baseline.GetRawText())!.AsObject();
-                replacement["resource"]!["disabled"] = i % 2 == 0;
-                config.McpServers = JsonSerializer.SerializeToElement(replacement);
-                reload.Invoke(runtime.Mounts, null);
+                for (int i = 0; i < 100; i++)
+                {
+                    var replacement = System.Text.Json.Nodes.JsonNode.Parse(baseline.GetRawText())!.AsObject();
+                    replacement["resource"]!["disabled"] = i % 2 == 0;
+                    config.McpServers = JsonSerializer.SerializeToElement(replacement);
+                    reload.Invoke(runtime.Mounts, null);
+                }
             }
+            finally { Volatile.Write(ref finished, 1); }
             await reader;
-            check(captured == 200, "manager: 200 capability snapshots during 100 forced reloads retain every server and exactly native plus declared mounted tools");
+            check(captured >= 200 && toolReads >= 200, "manager: concurrent tools/list and capability reads during 100 nonstarted reloads never observe partial publication and retain native plus declared tools");
 
         }
         finally { TestCleanup.RemoveDirectory(directory); }
         await RapidReplacement(check);
         await PausedReplacement(check);
-        RetainedBrowser(check);
+        await RetainedBrowser(check);
         await ReloadRecoversUnexpectedFailure(check);
         await SaveDuringReload(check);
+        await SourceScopedReload(check);
+        await KelvinIdentities(check);
+        await NonblockingCapabilities(check);
+        await NonblockingInitialPreparation(check);
+        await StopBeforeStart(check);
+        await ConfigurationWarningsRefresh(check);
+        await InitialPreparationFailureRecovers(check);
     }
     private static async Task RapidReplacement(Action<bool, string> check)
     {
@@ -151,6 +170,7 @@ public static class McpManagerTests
         try
         {
             using var runtime = new CodexishRuntime(config, true);
+            await runtime.Mounts.PrepareAsync();
             runtime.Mounts.Start();
             check(await Until(() => ((McpMount)runtime.Mounts.ResourceTargets.Single()).State == "connected"), "manager: rapid-replacement fixture A connects");
             var original = (McpMount)runtime.Mounts.ResourceTargets.Single();
@@ -158,12 +178,12 @@ public static class McpManagerTests
             using var lease = original.AcquireResourceLease();
             var call = lease.Client!.CallToolAsync(new CallToolRequestParams { Name = "slow", Arguments = new Dictionary<string, JsonElement>() });
             check(await Until(() => File.Exists(Path.Combine(directory, "slow-started"))), "manager: old instance has a dispatched slow call before reload");
-            var reload = typeof(McpMounts).GetMethod("ReadDefinitionsAndApply", BindingFlags.Instance | BindingFlags.NonPublic)!;
-            Save("B"); reload.Invoke(runtime.Mounts, null);
+            Save("B");
+            check(await Until(() => !ReferenceEquals(original, runtime.Mounts.ResourceTargets.Single())), "manager: polling observes replacement B without a concurrent forced reload");
             var middle = (McpMount)runtime.Mounts.ResourceTargets.Single();
-            Save("C"); reload.Invoke(runtime.Mounts, null);
+            Save("C");
+            check(await Until(() => !ReferenceEquals(middle, runtime.Mounts.ResourceTargets.Single())), "manager: polling observes replacement C while B is pending");
             var latest = (McpMount)runtime.Mounts.ResourceTargets.Single();
-            await Task.Delay(200);
             check(original.State == "draining" && middle.ProcessId is null && latest.ProcessId is null && !call.IsCompleted,
                 "manager: rapid A-to-B-to-C reload does not start either replacement while A's call is active");
             File.WriteAllText(Path.Combine(directory, "slow-release"), "release");
@@ -174,6 +194,7 @@ public static class McpManagerTests
             try { using var old = Process.GetProcessById(originalPid); originalAlive = !old.HasExited; } catch (ArgumentException) { originalAlive = false; }
             check(!originalAlive && latest.ProcessId != originalPid && middle.ProcessId is null,
                 "manager: A exits before C is connected and superseded B never starts");
+            check(await Until(() => RetiredCount(runtime.Mounts) == 0), "manager: completed retirement tasks, mounts and lifetime keys are pruned after replacement");
             string launches = File.ReadAllText(launchLog);
             check(launches.Contains("--generation A", StringComparison.Ordinal) && launches.Contains("--generation C", StringComparison.Ordinal) && !launches.Contains("--generation B", StringComparison.Ordinal),
                 "manager: fixture launch log confirms only generations A and C actually launched");
@@ -212,6 +233,7 @@ public static class McpManagerTests
         try
         {
             using var runtime = new CodexishRuntime(config, true);
+            await runtime.Mounts.PrepareAsync();
             await using var host = CodexishHost.Build(runtime, 0);
             await host.StartAsync();
             try
@@ -227,7 +249,6 @@ public static class McpManagerTests
                 }});
                 check(Reply.StatusOf(queued) == "queued", "manager: pause accepts changing call into ledger without dispatch");
                 Save("new", true);
-                typeof(McpMounts).GetMethod("ReadDefinitionsAndApply", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(runtime.Mounts, null);
                 check(await Until(() => ((McpMount)runtime.Mounts.ResourceTargets.Single()).State == "connected" && ((McpMount)runtime.Mounts.ResourceTargets.Single()).ProcessId != oldPid),
                     "manager: mount reload starts current instance while ledger remains paused");
                 runtime.Ledger.Resume();
@@ -244,7 +265,7 @@ public static class McpManagerTests
         finally { TestCleanup.RemoveDirectory(directory); }
     }
 
-    private static void RetainedBrowser(Action<bool, string> check)
+    private static async Task RetainedBrowser(Action<bool, string> check)
     {
         string directory = Path.Combine(Path.GetTempPath(), "codexish-mcp-browser-retain-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(directory);
@@ -257,6 +278,7 @@ public static class McpManagerTests
                 BrowserMounts = [new BrowserMountConfig { Id = "retained", RootId = "root", Kind = "custom", Command = "unused-fixture", Args = ["${" + variable + "}"] }] };
             config.Save(path);
             using var runtime = new CodexishRuntime(config, true);
+            await runtime.Mounts.PrepareAsync();
             var before = runtime.Mounts.ResourceTargets.Single();
             Environment.SetEnvironmentVariable(variable, "after");
             File.WriteAllText(path, "{\"browser_mounts\":{\"wrong\":\"type\"}}");
@@ -294,6 +316,7 @@ public static class McpManagerTests
         try
         {
             using var runtime = new CodexishRuntime(new ServerConfig { StateDir = Path.Combine(directory, "state"), SourcePath = path }, true);
+            await runtime.Mounts.PrepareAsync();
             var original = runtime.Mounts.ResourceTargets.Single();
             int reads = 0;
             string secret = "ghp_" + new string('q', 36);
@@ -343,6 +366,7 @@ public static class McpManagerTests
         try
         {
             using var runtime = new CodexishRuntime(new ServerConfig { StateDir = Path.Combine(directory, "state"), SourcePath = path }, true);
+            await runtime.Mounts.PrepareAsync();
             int saves = 0;
             byte[]? savedBytes = null;
             DateTime savedAt = default;
@@ -361,6 +385,246 @@ public static class McpManagerTests
                 "manager: save during reload is not consumed by trailing stamp bookkeeping and is applied on the next tick");
             check(savedBytes is not null && File.ReadAllBytes(path).SequenceEqual(savedBytes) && File.GetLastWriteTimeUtc(path) == savedAt,
                 "manager: newer generation is applied without another file write or timestamp change");
+        }
+        finally { TestCleanup.RemoveDirectory(directory); }
+    }
+
+    private static int RetiredCount(McpMounts mounts)
+    {
+        int total = 0;
+        foreach (string name in new[] { "retiredMounts", "retirements", "lifetimes" })
+        {
+            var collection = typeof(McpMounts).GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(mounts)!;
+            total += (int)collection.GetType().GetProperty("Count")!.GetValue(collection)!;
+        }
+        return total;
+    }
+
+    private static async Task<bool> Observe(Func<bool> condition)
+    {
+        var clock = Stopwatch.StartNew();
+        while (!condition()) { if (clock.Elapsed > TimeSpan.FromSeconds(30)) return false; await Task.Delay(20); }
+        return true;
+    }
+
+    private static async Task SourceScopedReload(Action<bool, string> check)
+    {
+        string directory = Path.Combine(Path.GetTempPath(), "codexish-mcp-source-scope-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        string path = Path.Combine(directory, "codexish.json"), projectPath = Path.Combine(directory, ".mcp.json");
+        string variable = "CODEXISH_MANAGER_SOURCE_SCOPE", old = Environment.GetEnvironmentVariable(variable) ?? "";
+        string Definition(string generation) => JsonSerializer.Serialize(new { command = "unused-fixture", disabled = true, args = new[] { "${" + variable + "}", generation } });
+        void SaveProject(string generation) => File.WriteAllText(projectPath, "{\"mcpServers\":{\"project\":" + Definition(generation) + "}}");
+        void SaveMain(string generation) => File.WriteAllText(path, "{\"mcp_servers\":{\"top\":" + Definition(generation) + "}}");
+        try
+        {
+            Environment.SetEnvironmentVariable(variable, "original"); SaveMain("main-A"); SaveProject("project-A");
+            using var runtime = new CodexishRuntime(new ServerConfig { StateDir = Path.Combine(directory, "state"), SourcePath = path,
+                Roots = [new RootConfig { Id = "root", Path = directory }] }, true);
+            await runtime.Mounts.PrepareAsync();
+            IMcpResourceTarget Target(string identity) => runtime.Mounts.ResourceTargets.Single(t => t.Identity == identity);
+            var top = Target("top"); var project = Target("root/project");
+            Environment.SetEnvironmentVariable(variable, "project-change"); SaveProject("project-B"); runtime.Mounts.Start();
+            check(await Observe(() => !ReferenceEquals(project, Target("root/project"))) && ReferenceEquals(top, Target("top")),
+                "manager: project-file save re-fingerprints that project only, retaining unchanged top-level environment signature");
+            project = Target("root/project");
+            Environment.SetEnvironmentVariable(variable, "main-change"); SaveMain("main-B");
+            check(await Observe(() => !ReferenceEquals(top, Target("top"))) && ReferenceEquals(project, Target("root/project")),
+                "manager: main-file save re-fingerprints main definitions only, retaining unchanged project environment signature");
+            top = Target("top");
+            SaveProject("project-B");
+            check(await Observe(() => !ReferenceEquals(project, Target("root/project"))) && ReferenceEquals(top, Target("top")),
+                "manager: a later project save applies its previously deferred environment change without restarting main definitions");
+        }
+        finally { Environment.SetEnvironmentVariable(variable, old.Length == 0 ? null : old); TestCleanup.RemoveDirectory(directory); }
+    }
+
+    private static async Task KelvinIdentities(Action<bool, string> check)
+    {
+        string directory = Path.Combine(Path.GetTempPath(), "codexish-mcp-kelvin-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        string path = Path.Combine(directory, "codexish.json");
+        void Save(string generation) => File.WriteAllText(path, JsonSerializer.Serialize(new { mcp_servers = new Dictionary<string, object>
+        {
+            ["\u212A"] = new { command = "unused-fixture", disabled = true, args = new[] { generation } },
+            ["k"] = new { command = "unused-fixture", disabled = true, args = new[] { generation } },
+            ["unrelated"] = new { command = "unused-fixture", disabled = true }
+        }}));
+        try
+        {
+            Save("first");
+            using var runtime = new CodexishRuntime(new ServerConfig { StateDir = Path.Combine(directory, "state"), SourcePath = path }, true);
+            await runtime.Mounts.PrepareAsync();
+            var before = runtime.Mounts.ResourceTargets.ToArray();
+            check(before.Length == 3 && before.Select(t => t.Identity).Contains("\u212A") && before.Select(t => t.Identity).Contains("k"),
+                "manager: Kelvin-sign and ASCII k identities survive initial preparation without lowercased-key collision");
+            Save("second-generation"); runtime.Mounts.Start();
+            check(await Observe(() => runtime.Mounts.ResourceTargets.Any(t => t.Identity == "k" && !before.Contains(t))) &&
+                  runtime.Mounts.ResourceTargets.Count == 3 && runtime.Mounts.ResourceTargets.Any(t => t.Identity == "\u212A" && !before.Contains(t)),
+                "manager: Kelvin-sign and ASCII k identities both reload while unrelated definition remains available");
+            check(ReferenceEquals(before.Single(t => t.Identity == "unrelated"), runtime.Mounts.ResourceTargets.Single(t => t.Identity == "unrelated")),
+                "manager: identity comparer containment does not restart an unrelated unchanged entry");
+        }
+        finally { TestCleanup.RemoveDirectory(directory); }
+    }
+
+    private static async Task NonblockingCapabilities(Action<bool, string> check)
+    {
+        string directory = Path.Combine(Path.GetTempPath(), "codexish-mcp-nonblocking-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        string path = Path.Combine(directory, "codexish.json");
+        void Save(string generation) => File.WriteAllText(path, JsonSerializer.Serialize(new { mcp_servers = new Dictionary<string, object>
+            { [generation] = new { command = "unused-fixture", disabled = true } } }));
+        using var entered = new ManualResetEventSlim(); using var release = new ManualResetEventSlim();
+        try
+        {
+            Save("initial");
+            using var runtime = new CodexishRuntime(new ServerConfig { StateDir = Path.Combine(directory, "state"), SourcePath = path }, true);
+            await runtime.Mounts.PrepareAsync();
+            runtime.Mounts.BeforeReloadRead = () => { entered.Set(); release.Wait(); };
+            Save("replacement"); runtime.Mounts.Start();
+            try
+            {
+                check(await Observe(() => entered.IsSet), "manager: configuration reader is observably blocked before replacement publication");
+                var capabilities = Task.Run(() => JsonSerializer.SerializeToElement(runtime.Capabilities()));
+                bool returned = await Task.WhenAny(capabilities, Task.Delay(TimeSpan.FromSeconds(2))) == capabilities;
+                check(returned, "manager: host_capabilities returns the previous snapshot without waiting for a blocked configuration reader");
+                if (returned) check((await capabilities).GetProperty("mcp").GetProperty("mounted").EnumerateArray().Single().GetProperty("identity").GetString() == "initial",
+                    "manager: nonblocking capabilities retains the complete prior generation while reload is blocked");
+            }
+            finally { release.Set(); }
+            check(await Observe(() => runtime.Mounts.ResourceTargets.Single().Identity == "replacement"),
+                "manager: blocked read publishes its replacement after release without preventing future progress");
+        }
+        finally { release.Set(); TestCleanup.RemoveDirectory(directory); }
+    }
+
+    private static async Task NonblockingInitialPreparation(Action<bool, string> check)
+    {
+        string directory = Path.Combine(Path.GetTempPath(), "codexish-mcp-initial-nonblocking-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        using var entered = new ManualResetEventSlim(); using var release = new ManualResetEventSlim();
+        try
+        {
+            using var runtime = new CodexishRuntime(new ServerConfig { StateDir = Path.Combine(directory, "state"),
+                McpServers = JsonSerializer.SerializeToElement(new { pending = new { command = "unused-fixture", disabled = true } }) }, true);
+            runtime.Mounts.BeforeReloadRead = () => { entered.Set(); release.Wait(); };
+            await using var host = CodexishHost.Build(runtime, 0);
+            Task start = host.StartAsync();
+            try
+            {
+                check(await Observe(() => entered.IsSet), "manager: first mount preparation is observably blocked on its reader");
+                check(await Task.WhenAny(start, Task.Delay(TimeSpan.FromSeconds(2))) == start,
+                    "manager: host starts listening without waiting for first mount fingerprint preparation");
+                await start;
+                string address = host.Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>()!.Addresses.Single();
+                using var http = new HttpClient();
+                var response = http.GetAsync(address + "/healthz");
+                check(await Task.WhenAny(response, Task.Delay(TimeSpan.FromSeconds(2))) == response && (await response).IsSuccessStatusCode,
+                    "manager: listening host answers health requests while initial mount configuration remains blocked");
+            }
+            finally { release.Set(); await start; await host.StopAsync(); }
+        }
+        finally { release.Set(); TestCleanup.RemoveDirectory(directory); }
+    }
+
+    private static async Task StopBeforeStart(Action<bool, string> check)
+    {
+        string directory = Path.Combine(Path.GetTempPath(), "codexish-mcp-stop-before-start-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        try
+        {
+            using var runtime = new CodexishRuntime(new ServerConfig { StateDir = Path.Combine(directory, "state"),
+                McpServers = JsonSerializer.SerializeToElement(new { stopped = new { command = "unused-fixture" } }) }, true);
+            await runtime.Mounts.PrepareAsync();
+            var mount = (McpMount)runtime.Mounts.ResourceTargets.Single();
+            runtime.Mounts.Stop(); runtime.Mounts.Start(); mount.Start();
+            // Start synchronously decides whether to schedule a supervision task; no timing sleep is needed.
+            bool started = (bool)typeof(McpMount).GetField("started", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(mount)!;
+            check(!started && !mount.HasSession && mount.ProcessId is null,
+                "manager: neither manager nor direct mount Start schedules supervision after Stop");
+        }
+        finally { TestCleanup.RemoveDirectory(directory); }
+    }
+
+    private static async Task ConfigurationWarningsRefresh(Action<bool, string> check)
+    {
+        string directory = Path.Combine(Path.GetTempPath(), "codexish-mcp-warning-refresh-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        try
+        {
+            var config = new ServerConfig { StateDir = Path.Combine(directory, "state") };
+            void SetArgs(bool scalar) => config.McpServers = JsonDocument.Parse(scalar
+                ? "{\"warnings\":{\"command\":\"unused-fixture\",\"args\":\"same\"}}"
+                : "{\"warnings\":{\"command\":\"unused-fixture\",\"args\":[\"same\"]}}").RootElement.Clone();
+            SetArgs(false);
+            // A malformed optional manifest produces a real runtime warning, independent of parse warnings.
+            string manifestHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes("warnings")))[..10].ToLowerInvariant();
+            string manifest = Path.Combine(config.StateDir, "mcp-mounts", "warnings-" + manifestHash + ".manifest.json");
+            Directory.CreateDirectory(Path.GetDirectoryName(manifest)!); File.WriteAllText(manifest, "{");
+            using var runtime = new CodexishRuntime(config, true);
+            await runtime.Mounts.PrepareAsync();
+            var original = runtime.Mounts.ResourceTargets.Single();
+            string[] Warnings() => JsonSerializer.SerializeToElement(runtime.Mounts.Describe()).GetProperty("mounted")[0]
+                .GetProperty("warnings").EnumerateArray().Select(w => w.GetString()!).ToArray();
+            int configWarningCount = config.Warnings.Count;
+            string runtimeWarning = Warnings().Single(w => w.StartsWith("manifest read:", StringComparison.Ordinal));
+            var reload = typeof(McpMounts).GetMethod("ReadDefinitionsAndApply", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            SetArgs(true); reload.Invoke(runtime.Mounts, null);
+            check(ReferenceEquals(original, runtime.Mounts.ResourceTargets.Single()) && Warnings().Any(w => w.Contains("args is a scalar", StringComparison.Ordinal)),
+                "manager: equivalent array-to-scalar config keeps the mount but refreshes its parse warning");
+            for (int i = 0; i < 5; i++) reload.Invoke(runtime.Mounts, null);
+            check(Warnings().Count(w => w.Contains("args is a scalar", StringComparison.Ordinal)) == 1 && config.Warnings.Count == configWarningCount,
+                "manager: repeated equivalent reloads deduplicate parse warnings without growing shared config warnings");
+            SetArgs(false); reload.Invoke(runtime.Mounts, null);
+            check(ReferenceEquals(original, runtime.Mounts.ResourceTargets.Single()) && !Warnings().Any(w => w.Contains("args is a scalar", StringComparison.Ordinal)),
+                "manager: equivalent scalar-to-array repair clears the obsolete parse warning without restart");
+            check(Warnings().Contains(runtimeWarning) && config.Warnings.Count == configWarningCount,
+                "manager: configuration warning refresh preserves independent runtime warnings and leaves shared warnings unchanged");
+            string variable = "CODEXISH_MANAGER_DISPLAY_ARGS", previous = Environment.GetEnvironmentVariable(variable) ?? "";
+            try
+            {
+                Environment.SetEnvironmentVariable(variable, "same");
+                config.McpServers = JsonSerializer.SerializeToElement(new { warnings = new { command = "unused-fixture", args = new[] { "${" + variable + "}" } } });
+                reload.Invoke(runtime.Mounts, null);
+                check(ReferenceEquals(original, runtime.Mounts.ResourceTargets.Single()) &&
+                      JsonSerializer.SerializeToElement(runtime.Capabilities()).GetProperty("mcp").GetProperty("mounted")[0].GetProperty("args")[0].GetString() == "${" + variable + "}",
+                    "manager: equivalent variable spelling refreshes as-written argument display without replacing the mount");
+                SetArgs(false); reload.Invoke(runtime.Mounts, null);
+                check(ReferenceEquals(original, runtime.Mounts.ResourceTargets.Single()) &&
+                      JsonSerializer.SerializeToElement(runtime.Capabilities()).GetProperty("mcp").GetProperty("mounted")[0].GetProperty("args")[0].GetString() == "same",
+                    "manager: variable-to-literal effective-equivalent args keep the instance and display the current literal configuration");
+            }
+            finally { Environment.SetEnvironmentVariable(variable, previous.Length == 0 ? null : previous); }
+        }
+        finally { TestCleanup.RemoveDirectory(directory); }
+    }
+
+    private static async Task InitialPreparationFailureRecovers(Action<bool, string> check)
+    {
+        string directory = Path.Combine(Path.GetTempPath(), "codexish-mcp-initial-recovery-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        string path = Path.Combine(directory, "codexish.json");
+        File.WriteAllText(path, "{\"mcp_servers\":{\"recovered\":{\"command\":\"unused-fixture\",\"disabled\":true}}}");
+        try
+        {
+            using var runtime = new CodexishRuntime(new ServerConfig { StateDir = Path.Combine(directory, "state"), SourcePath = path }, true);
+            int reads = 0;
+            runtime.Mounts.BeforeReloadRead = () =>
+            {
+                if (Interlocked.Increment(ref reads) == 1) throw new InvalidOperationException("initial injected reader failure");
+            };
+            Task preparation = runtime.Mounts.PrepareAsync();
+            await preparation;
+            string? error = JsonSerializer.SerializeToElement(runtime.Mounts.Describe()).GetProperty("reload_error").GetString();
+            check(preparation.IsCompletedSuccessfully && error?.Contains("initial injected reader failure", StringComparison.Ordinal) == true && runtime.Mounts.ResourceTargets.Count == 0,
+                "manager: initial reader exception produces a warning without faulting the cached preparation task");
+            runtime.Mounts.Start();
+            check(await Observe(() => runtime.Mounts.ResourceTargets.Any(t => t.Identity == "recovered")) && reads >= 2,
+                "manager: normal polling retries the initial preparation failure and applies the unchanged file");
+            Task disposal = runtime.Mounts.DisposeAsync().AsTask(); await disposal;
+            check(disposal.IsCompletedSuccessfully,
+                "manager: disposal completes after initial preparation failure and successful polling recovery");
         }
         finally { TestCleanup.RemoveDirectory(directory); }
     }

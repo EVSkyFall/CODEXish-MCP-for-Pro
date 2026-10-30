@@ -391,6 +391,7 @@ public static class BrowserTests
                     await using var hangClient = await McpClient.CreateAsync(new HttpClientTransport(new() { Endpoint = new Uri(address + "/mcp") }),
                         new() { ProtocolVersion = CodexishRuntime.ProtocolVersion });
                     var early = await hangClient.CallToolAsync(new CallToolRequestParams { Name = "workspace_info", Arguments = new Dictionary<string, JsonElement>() });
+                    await hangRuntime.Mounts.PrepareAsync();
                     Check(Reply.CodeOf(early) is null && hangRuntime.Browsers.Resources("hang").State is "starting" or "not_started",
                         "the host listens and answers while a mount is still in its handshake");
                     Check(await Until(() => hangRuntime.Browsers.Resources("quick").State == "connected", 60) &&
@@ -418,6 +419,7 @@ public static class BrowserTests
             {
                 await using var flakyApp = CodexishHost.Build(flakyRuntime, 0);
                 await flakyApp.StartAsync();
+                await flakyRuntime.Mounts.PrepareAsync();
                 try
                 {
                     string address = flakyApp.Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>()!.Addresses.Single();
@@ -449,6 +451,7 @@ public static class BrowserTests
             flakyConfig.BrowserMounts = [new() { Id = "brief", RootId = "test", Kind = "custom", Command = missingBackend, ReadOnlyTools = ["snapshot"] }];
             using (var afterRuntime = new CodexishRuntime(flakyConfig, true))
             {
+                await afterRuntime.Mounts.PrepareAsync();
                 Check(afterRuntime.Browsers.Tools.Count == 7 && afterRuntime.Browsers.Resources("brief").ToolsSource == "manifest",
                     "after a restart the saved tool list is published before the backend has connected");
                 await using var afterApp = CodexishHost.Build(afterRuntime, 0);
@@ -507,6 +510,7 @@ public static class BrowserTests
             }
 
             await McpResourceTests.Run(Check);
+            await McpHostResourceTests.Run(Check);
             await LocalMcpIntegrationTests.Run(Check);
             await McpNotificationTests.Run(Check);
             await McpHttpTests.Run(Check);

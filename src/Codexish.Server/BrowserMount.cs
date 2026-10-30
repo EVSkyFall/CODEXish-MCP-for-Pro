@@ -15,6 +15,7 @@ namespace Codexish.Server;
 
 public sealed class BrowserMountConfig
 {
+    [JsonIgnore] public string? ParseError { get; set; }
     [JsonPropertyName("id")] public string Id { get; set; } = "playwright";
     [JsonPropertyName("root_id")] public string RootId { get; set; } = "";
     [JsonPropertyName("kind")] public string Kind { get; set; } = "playwright";
@@ -97,6 +98,7 @@ public sealed class BrowserMounts(CodexishRuntime owner) : IAsyncDisposable
 
     internal static string? Invalid(BrowserMountConfig mount, ISet<string> ids)
     {
+        if (mount.ParseError is not null) return mount.ParseError;
         if (!Regex.IsMatch(mount.Id, "^[A-Za-z0-9_-]{1,24}$")) return "id must be 1-24 ASCII letters, digits, underscores or hyphens.";
         if (ids.Contains(mount.Id)) return $"id '{mount.Id}' is already used by an earlier mount (ids are compared without case).";
         if (string.IsNullOrWhiteSpace(mount.Command)) return "command is required.";
@@ -110,7 +112,16 @@ public sealed class BrowserMounts(CodexishRuntime owner) : IAsyncDisposable
         return null;
     }
 
-    internal static JsonElement WrapSchema(JsonElement backendSchema, bool readOnly)
+    internal static JsonElement WrapSchema(JsonElement backendSchema, bool readOnly, Action<string>? warning = null)
+    {
+        try { return WrapSchemaCore(backendSchema, readOnly); }
+        catch (Exception error) when (error is JsonException or InvalidOperationException or ArgumentException or NotSupportedException)
+        {
+            warning?.Invoke("The backend input schema could not be wrapped (" + error.GetType().Name + "); arguments accepts any object.");
+            return WrapSchemaCore(JsonSerializer.SerializeToElement(new { type = "object" }), readOnly);
+        }
+    }
+    private static JsonElement WrapSchemaCore(JsonElement backendSchema, bool readOnly)
     {
         var inner = JsonNode.Parse(backendSchema.GetRawText()) as JsonObject ?? new JsonObject { ["type"] = "object" };
         Rebase(inner);

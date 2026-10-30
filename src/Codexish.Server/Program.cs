@@ -13,6 +13,7 @@ if (args.Contains("--design-preview"))
 }
 if (args.Contains("--tray-smoke-test")) return await TrayApplication.Run("", smoke: true);
 if (args.Contains("--tray-tests")) return await TrayTests.Run();
+if (args.Contains("--mcp-host-resource-fixture")) return await McpHostResourceTests.Fixture(args);
 if (args.Contains("--mcp-initialize-first-fixture")) return await McpHandshakeIntegrationTests.Fixture(args);
 if (args.Contains("--mcp-notification-fixture")) return await McpNotificationTests.Fixture(args);
 if (args.Contains("--mcp-http-fixture")) return await McpHttpTests.Fixture(args);

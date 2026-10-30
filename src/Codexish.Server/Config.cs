@@ -3,7 +3,6 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
-using System.Text.Json.Nodes;
 
 namespace Codexish.Server;
 
@@ -117,9 +116,49 @@ public sealed class ServerConfig
         return config;
     }
 
-    private static ServerConfig Parse(byte[] bytes, string path) =>
-        JsonSerializer.Deserialize<ServerConfig>(bytes)
-            ?? throw new InvalidDataException($"The configuration at {path} is not a JSON object.");
+    private static ServerConfig Parse(byte[] bytes, string path)
+    {
+        using var document = McpConfiguration.ParseDocument(bytes);
+        if (document.RootElement.ValueKind != JsonValueKind.Object)
+            throw new InvalidDataException($"The configuration at {path} is not a JSON object.");
+        using var stream = new MemoryStream();
+        using (var writer = new Utf8JsonWriter(stream))
+        {
+            writer.WriteStartObject();
+            foreach (var property in document.RootElement.EnumerateObject())
+                if (!property.NameEquals("browser_mounts") && !property.NameEquals("mcp_servers") && !property.NameEquals("mcpServers")) property.WriteTo(writer);
+            writer.WriteEndObject();
+        }
+        var config = JsonSerializer.Deserialize<ServerConfig>(stream.ToArray())!;
+        if (document.RootElement.TryGetProperty("mcp_servers", out var mcp)) config.McpServers = mcp.Clone();
+        if (document.RootElement.TryGetProperty("mcpServers", out var alias)) config.McpServersAlias = alias.Clone();
+        if (document.RootElement.TryGetProperty("browser_mounts", out var browser))
+            try { config.BrowserMounts = ParseBrowserMounts(browser); }
+            catch (Exception error) { config.BrowserMountParseWarning = "browser_mounts: " + McpConfiguration.Reason(error); }
+        return config;
+    }
+
+    [JsonIgnore] public string? BrowserMountParseWarning { get; private set; }
+
+    // Each optional browser entry is isolated just like an MCP definition, including failures decoding Unicode.
+    private static readonly JsonSerializerOptions MountReadOptions = new() { ReadCommentHandling = JsonCommentHandling.Skip, AllowTrailingCommas = true };
+    public static BrowserMountConfig[] ParseBrowserMounts(JsonElement raw)
+    {
+        if (raw.ValueKind == JsonValueKind.Null) return [];
+        if (raw.ValueKind != JsonValueKind.Array) throw new JsonException("browser_mounts must be an array");
+        List<BrowserMountConfig> result = [];
+        foreach (var entry in raw.EnumerateArray())
+        {
+            try { result.Add(entry.Deserialize<BrowserMountConfig>(MountReadOptions) ?? new BrowserMountConfig { Id = "", ParseError = "browser entry must be an object" }); }
+            catch (Exception error)
+            {
+                string id = "(unreadable entry " + (result.Count + 1) + ")";
+                try { if (entry.ValueKind == JsonValueKind.Object && entry.TryGetProperty("id", out var name)) id = name.GetString() ?? id; } catch (Exception) { }
+                result.Add(new BrowserMountConfig { Id = id, ParseError = McpConfiguration.Reason(error) });
+            }
+        }
+        return result.ToArray();
+    }
 
     // The unreadable bytes are kept first. The backup replaces the main file only while that file still holds exactly
     // those bytes: if another writer saved in between, its newer file is loaded instead, or, when that one is
@@ -191,16 +230,45 @@ public sealed class ServerConfig
         SourcePath = full;
     }
 
-    // The tray edits only roots. Read the file at save time, not the stale configuration it displayed,
-    // preserving other applications' and future versions' fields as JSON nodes.
-    public static void SaveRoots(string path, RootConfig[] roots)
+    internal ServerConfig CopyForRootEdit(RootConfig[] roots)
+    {
+        // Raw optional definitions may contain unreadable Unicode. They are not edited or serialized here.
+        var ordinary = (ServerConfig)MemberwiseClone();
+        ordinary.McpServers = ordinary.McpServersAlias = null;
+        ordinary.BrowserMounts = [];
+        var copy = JsonSerializer.Deserialize<ServerConfig>(JsonSerializer.Serialize(ordinary))!;
+        copy.McpServers = McpServers; copy.McpServersAlias = McpServersAlias;
+        copy.BrowserMounts = BrowserMounts; copy.BrowserMountParseWarning = BrowserMountParseWarning;
+        copy.Roots = roots;
+        return copy;
+    }
+
+    // Prepare while the host is still running. JsonDocument preserves duplicate properties, unlike JsonNode.
+    public static byte[] PrepareRoots(string path, RootConfig[] roots)
+    {
+        using var current = McpConfiguration.ParseDocument(File.ReadAllBytes(path));
+        if (current.RootElement.ValueKind != JsonValueKind.Object)
+            throw new InvalidDataException("The configuration is not a JSON object; roots were not saved.");
+        using var stream = new MemoryStream();
+        using (var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { Indented = true }))
+        {
+            writer.WriteStartObject();
+            foreach (var property in current.RootElement.EnumerateObject())
+                if (!property.NameEquals("roots"))
+                { writer.WritePropertyName(property.Name); writer.WriteRawValue(property.Value.GetRawText(), skipInputValidation: true); }
+            writer.WritePropertyName("roots"); JsonSerializer.Serialize(writer, roots);
+            writer.WriteEndObject();
+        }
+        return stream.ToArray();
+    }
+
+    public static void SavePrepared(string path, byte[] bytes)
     {
         string full = System.IO.Path.GetFullPath(path);
-        var current = JsonNode.Parse(File.ReadAllBytes(full), documentOptions: McpConfiguration.JsonOptions) as JsonObject
-            ?? throw new InvalidDataException("The configuration is not a JSON object; roots were not saved.");
-        current["roots"] = JsonSerializer.SerializeToNode(roots);
-        WriteAtomically(full, Encoding.UTF8.GetBytes(current.ToJsonString(Format)), full + ".bak");
+        WriteAtomically(full, bytes, full + ".bak");
     }
+
+    public static void SaveRoots(string path, RootConfig[] roots) => SavePrepared(path, PrepareRoots(path, roots));
 
     // A temporary file in the same directory is written and flushed, then swapped in with File.Replace, or moved into
     // place when there is nothing to replace.
@@ -229,6 +297,7 @@ public sealed class ServerConfig
     public void Validate()
     {
         List<string> warnings = [];
+        if (BrowserMountParseWarning is { } browserWarning) warnings.Add(browserWarning);
         if (Port is < 0 or > 65535) throw new ArgumentException("port must be between 0 and 65535.");
         NormalizeNulls(warnings);
         // An entry the access policy cannot use is dropped here, so AccessPolicy never sees it.

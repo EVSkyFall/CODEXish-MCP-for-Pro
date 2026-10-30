@@ -7,20 +7,23 @@ using ModelContextProtocol.Protocol;
 
 namespace Codexish.Server;
 
-// A lease keeps an old session alive while a resource operation drains during configuration reload.
+// Reads drain; listings are session-scoped and never keep a retiring session alive.
 // Implementations check grants before consulting connection state.
 public interface IMcpResourceTarget
 {
     string Identity { get; }
     bool IsBrowser { get; }
-    McpResourceLease AcquireResourceLease();
+    bool WillStart => true;
+    McpResourceLease AcquireResourceLease(bool listing = false);
     CallToolResult Unavailable();
 }
 
 public sealed class McpResourceLease(McpClient? client, string state, DateTimeOffset? nextRetry,
-    Action? release = null, Action<Exception>? transportFailure = null) : IDisposable
+    Action? release = null, Action<Exception>? transportFailure = null, object? sessionId = null, CancellationToken sessionCancellation = default) : IDisposable
 {
     public McpClient? Client { get; } = client;
+    public object SessionId { get; } = sessionId ?? (object?)client ?? new object();
+    public CancellationToken SessionCancellation { get; } = sessionCancellation;
     public string State { get; } = state;
     public DateTimeOffset? NextRetry { get; } = nextRetry;
     private Action? released = release;
@@ -51,11 +54,13 @@ public sealed class McpResources(Func<IReadOnlyList<IMcpResourceTarget>> targets
     }
 
     private readonly object sync = new();
-    private readonly Dictionary<IMcpResourceTarget, Task<JsonElement>> listings = new(ReferenceEqualityComparer.Instance);
+    private readonly Dictionary<(IMcpResourceTarget Target, object Session), Task<JsonElement>> listings = new();
 
     public async Task<CallToolResult> List(string? server = null, int wait_ms = 10000, CancellationToken cancellation = default)
     {
-        var selected = targets().Where(t => server is null || Matches(t, server)).ToArray();
+        var selected = targets().Where(t => server is null || Matches(t, server))
+            .GroupBy(t => (t.IsBrowser ? "browser:" : "mcp:") + t.Identity, StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.OrderByDescending(t => t.WillStart).First()).ToArray();
         if (server is not null && selected.Length == 0) return NotFound(server);
         var calls = selected.Select(target => WaitForListing(target, wait_ms, cancellation)).ToArray();
         try { return Reply.Ok(new { servers = await Task.WhenAll(calls).ConfigureAwait(false) }); }
@@ -64,32 +69,34 @@ public sealed class McpResources(Func<IReadOnlyList<IMcpResourceTarget>> targets
 
     private async Task<JsonElement> WaitForListing(IMcpResourceTarget target, int wait, CancellationToken cancellation)
     {
-        // A second caller joining a pending listing still rechecks the current grants.
-        try { using var permission = target.AcquireResourceLease(); }
+        McpResourceLease lease;
+        try { lease = target.AcquireResourceLease(listing: true); }
         catch (CodexishFault error) { return Clean(new { server = Address(target), identity = target.Identity, state = error.Code == "PERMISSION_DENIED" ? "permission_denied" : "error", error = error.Message, code = error.Code }); }
+        var key = (target, lease.SessionId);
         Task<JsonElement> task;
         lock (sync)
         {
-            if (!listings.TryGetValue(target, out task!))
+            if (!listings.TryGetValue(key, out task!))
             {
-                task = Query(target);
-                listings[target] = task;
+                task = Query(target, lease);
+                listings[key] = task;
                 _ = task.ContinueWith(done =>
                 {
                     lock (sync)
-                        if (listings.TryGetValue(target, out var current) && ReferenceEquals(current, done)) listings.Remove(target);
+                        if (listings.TryGetValue(key, out var current) && ReferenceEquals(current, done)) listings.Remove(key);
                 }, CancellationToken.None, TaskContinuationOptions.None, TaskScheduler.Default);
             }
+            else lease.Dispose();
         }
         try { return await task.WaitAsync(TimeSpan.FromMilliseconds(Math.Max(0, wait)), cancellation).ConfigureAwait(false); }
         catch (TimeoutException) { return Clean(new { server = Address(target), identity = target.Identity, state = "waiting" }); }
     }
 
-    private static async Task<JsonElement> Query(IMcpResourceTarget target)
+    private static async Task<JsonElement> Query(IMcpResourceTarget target, McpResourceLease lease)
     {
         try
         {
-            using var lease = target.AcquireResourceLease();
+            using var listingLease = lease;
             if (lease.Client is not { } client)
                 return Clean(new { server = Address(target), identity = target.Identity, state = lease.State, next_retry = lease.NextRetry, reason = target.Unavailable().StructuredContent?.GetProperty("error") });
             if (client.ServerCapabilities.Resources is null) return Clean(new { server = Address(target), identity = target.Identity, state = "none", reason = "The server has no resources capability." });
@@ -99,13 +106,13 @@ public sealed class McpResources(Func<IReadOnlyList<IMcpResourceTarget>> targets
                 var templates = new List<ResourceTemplate>();
                 await Pages(async cursor =>
                 {
-                    var page = await client.ListResourcesAsync(new ListResourcesRequestParams { Cursor = cursor }).ConfigureAwait(false);
+                    var page = await client.ListResourcesAsync(new ListResourcesRequestParams { Cursor = cursor }, lease.SessionCancellation).ConfigureAwait(false);
                     resources.AddRange(page.Resources);
                     return page.NextCursor;
                 }).ConfigureAwait(false);
                 await Pages(async cursor =>
                 {
-                    var page = await client.ListResourceTemplatesAsync(new ListResourceTemplatesRequestParams { Cursor = cursor }).ConfigureAwait(false);
+                    var page = await client.ListResourceTemplatesAsync(new ListResourceTemplatesRequestParams { Cursor = cursor }, lease.SessionCancellation).ConfigureAwait(false);
                     templates.AddRange(page.ResourceTemplates);
                     return page.NextCursor;
                 }).ConfigureAwait(false);
@@ -113,7 +120,7 @@ public sealed class McpResources(Func<IReadOnlyList<IMcpResourceTarget>> targets
             }
             catch (Exception error)
             {
-                if (IsTransportFailure(error)) lease.TransportFailed(error);
+                if (IsTransportFailure(error) && !lease.SessionCancellation.IsCancellationRequested) lease.TransportFailed(error);
                 return Clean(new { server = Address(target), identity = target.Identity, state = "error", error = error.Message });
             }
         }
@@ -131,21 +138,36 @@ public sealed class McpResources(Func<IReadOnlyList<IMcpResourceTarget>> targets
 
     public async Task<CallToolResult> Read(string server, string uri, CancellationToken cancellation = default)
     {
-        var target = targets().FirstOrDefault(t => Matches(t, server));
+        var target = targets().Where(t => Matches(t, server)).OrderByDescending(t => t.WillStart).FirstOrDefault();
         if (target is null) return NotFound(server);
         McpResourceLease? lease = null;
         try
         {
             lease = target.AcquireResourceLease();
             if (lease.Client is not { } client) return target.Unavailable();
-            var result = await client.ReadResourceAsync(new ReadResourceRequestParams { Uri = uri }, cancellation).ConfigureAwait(false);
-            var blocks = result.Contents.Select(resource =>
+            var result = await client.SendRequestAsync<ReadResourceRequestParams, JsonElement>(RequestMethods.ResourcesRead,
+                new ReadResourceRequestParams { Uri = uri }, cancellationToken: cancellation).ConfigureAwait(false);
+            if (result.ValueKind != JsonValueKind.Object || !result.TryGetProperty("contents", out var contents) || contents.ValueKind != JsonValueKind.Array)
+                throw new JsonException("Resource result contents must be an array.");
+            var blocks = new List<ContentBlock>();
+            var metadata = new List<JsonElement>();
+            foreach (var raw in contents.EnumerateArray())
             {
-                var node = JsonSerializer.SerializeToNode(new EmbeddedResourceBlock { Resource = resource }, McpJsonUtilities.DefaultOptions);
-                Scrub(node);
-                return node.Deserialize<ContentBlock>(McpJsonUtilities.DefaultOptions)!;
-            }).ToArray();
-            var envelope = Reply.Ok(Clean(new { server = Address(target), identity = target.Identity, contents = result.Contents }));
+                try
+                {
+                    var clean = McpResultDecoder.Clean(raw);
+                    var resource = clean.Deserialize<ResourceContents>(McpJsonUtilities.DefaultOptions) ?? throw new JsonException("Null resource content.");
+                    blocks.Add(new EmbeddedResourceBlock { Resource = resource });
+                    metadata.Add(Clean(new { uri = resource.Uri, mimeType = resource.MimeType, text = (resource as TextResourceContents)?.Text }));
+                }
+                catch (Exception error) when (error is JsonException or NotSupportedException or InvalidOperationException or FormatException)
+                {
+                    var fallback = McpResultDecoder.Unreadable(raw, "resource");
+                    blocks.Add(fallback);
+                    metadata.Add(Clean(new { text = fallback.Text }));
+                }
+            }
+            var envelope = Reply.Ok(Clean(new { server = Address(target), identity = target.Identity, contents = metadata }));
             return new CallToolResult { StructuredContent = envelope.StructuredContent, Content = [.. envelope.Content, .. blocks] };
         }
         catch (CodexishFault fault) { return Reply.Fault(fault); }
@@ -167,6 +189,9 @@ public sealed class McpResources(Func<IReadOnlyList<IMcpResourceTarget>> targets
         catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { return Reply.Error("CANCELLED", "Cancelled after the backend received the call; check the state the tool acts on before another action."); }
         catch (Exception error)
         {
+            if (!IsTransportFailure(error))
+                return Reply.Error("MCP_BACKEND_ERROR", $"MCP server '{target.Identity}' answered the resource read with an error; read protocol_error and check the uri with mcp_resource_list.",
+                    details: Clean(new { server = target.Identity, uri, protocol_error = error.Message }));
             lease?.TransportFailed(error);
             return Reply.Error("MCP_UNAVAILABLE", "The MCP transport did not produce a confirmed result; do not replay an uncertain action.",
                 details: Clean(new { server = target.Identity, state = lease?.State, next_retry = lease?.NextRetry, provider_error = error.GetType().Name }),
@@ -175,8 +200,8 @@ public sealed class McpResources(Func<IReadOnlyList<IMcpResourceTarget>> targets
         finally { lease?.Dispose(); }
     }
 
-    private static bool IsTransportFailure(Exception error) => error is not McpProtocolException &&
-        (error is not HttpRequestException http || http.StatusCode is null or HttpStatusCode.NotFound);
+    private static bool IsTransportFailure(Exception error) => error is IOException or ObjectDisposedException or OperationCanceledException ||
+        error is HttpRequestException { StatusCode: null or HttpStatusCode.NotFound };
     private static CallToolResult NotFound(string server) => Reply.Error("NOT_FOUND", $"No mounted server has identity '{Redaction.Apply(server).Text}'; see host_capabilities.");
     internal static JsonElement Clean(object value)
     {

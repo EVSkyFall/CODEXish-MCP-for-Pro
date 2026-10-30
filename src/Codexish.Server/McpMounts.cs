@@ -10,17 +10,22 @@ namespace Codexish.Server;
 // All mounts share a publication lock and immutable snapshots. File reads never invoke config recovery.
 public sealed class McpMounts : IAsyncDisposable
 {
-    private sealed record Entry(string Key, string Signature, string PolicyState, McpMount Mount, BrowserMountConfig? Browser, string? Profile);
-    private sealed record Published(Entry[] Entries, McpServerTool[] Tools, McpServerTool[] BrowserTools, (Entry Entry, McpServerTool Tool)[] Allocations);
+    private sealed record Entry(string Key, string Signature, string PolicyState, McpMount Mount, BrowserMountConfig? Browser, string? Profile, McpDefinition Display);
+    private sealed record Published(Entry[] Entries, McpServerTool[] Tools, McpServerTool[] BrowserTools, (Entry Entry, McpServerTool Tool)[] Allocations, McpProjectFile[] Projects, int BrowserCount, string[] Warnings);
     private readonly CodexishRuntime owner;
     private readonly object publication = new();
     private readonly object reloadSync = new();
     private readonly CancellationTokenSource stopping = new();
-    private Published snapshot = new([], [], [], []);
+    private Published snapshot = new([], [], [], [], [], 0, []);
+    private readonly object prepareSync = new();
+    private Task? preparation;
+    private McpDefinition[] topDefinitions = [];
+    private string[] topWarnings = [];
+    private HashSet<string> changedPaths = new(StringComparer.Ordinal);
     private McpProjectFile[] projects = [];
     private readonly Dictionary<string, (bool Exists, long Length, long Ticks)> stamps = new(StringComparer.Ordinal);
     private readonly List<Task> retirements = [];
-    private readonly Dictionary<string, Task> lifetimes = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, Task> lifetimes = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<McpMount> retiredMounts = [];
     private Task reloadLoop = Task.CompletedTask;
     private int started, disposed;
@@ -28,16 +33,31 @@ public sealed class McpMounts : IAsyncDisposable
     public McpMounts(CodexishRuntime runtime)
     {
         owner = runtime;
-        // Remember the pre-read generation. A save during parsing/applying must remain visible next tick.
-        Changed();
-        ReadDefinitionsAndApply();
+    }
+    public Task PrepareAsync()
+    {
+        lock (prepareSync) return preparation ??= Task.Run(() =>
+        {
+            lock (reloadSync)
+            {
+                // Stamp before reading; a save during this work is detected by the next poll.
+                try { Changed(); ReadDefinitionsAndApply(); }
+                catch (Exception error)
+                {
+                    // Initial optional discovery has the same recovery boundary as subsequent polls.
+                    // Do not retain a faulted preparation task that could later short-circuit disposal.
+                    stamps.Clear();
+                    Warn("Mount configuration reload failed: " + error.Message);
+                }
+            }
+        });
     }
     public IReadOnlyList<McpServerTool> Tools => Volatile.Read(ref snapshot).Tools;
     public IReadOnlyList<McpServerTool> BrowserTools => Volatile.Read(ref snapshot).BrowserTools;
     public McpServerTool? Find(string? name) => Tools.FirstOrDefault(t => t.ProtocolTool.Name == name);
     public IReadOnlyList<IMcpResourceTarget> ResourceTargets => Volatile.Read(ref snapshot).Entries.Select(e => (IMcpResourceTarget)e.Mount).ToArray();
     public McpMount Current(McpMount prior) => Volatile.Read(ref snapshot).Entries
-        .FirstOrDefault(e => e.Mount.Identity.Equals(prior.Identity, StringComparison.OrdinalIgnoreCase)
+        .FirstOrDefault(e => e.Mount.Definition.State != "invalid_config" && e.Mount.Identity.Equals(prior.Identity, StringComparison.OrdinalIgnoreCase)
             && e.Mount.IsBrowser == prior.IsBrowser
             && e.Mount.Definition.IsProject == prior.Definition.IsProject
             && e.Mount.Definition.Source == prior.Definition.Source)?.Mount ?? prior;
@@ -45,8 +65,9 @@ public sealed class McpMounts : IAsyncDisposable
     public string BrowserSummary() => Summary(true);
     private string Summary(bool browser)
     {
-        var entries = Volatile.Read(ref snapshot).Entries.Where(e => (e.Browser is not null) == browser).ToArray();
-        return entries.Length == 0 ? "none configured" : string.Join(", ", entries.Select(e => $"{e.Mount.Definition.Identity}={e.Mount.State}"));
+        var current = Volatile.Read(ref snapshot);
+        var entries = current.Entries.Where(e => (e.Browser is not null) == browser).ToArray();
+        return entries.Length == 0 ? "none configured" : string.Join(", ", entries.Select(e => $"{e.Mount.Definition.Identity}={e.Mount.State} ({current.Allocations.Count(x => ReferenceEquals(x.Entry, e))} tools, {e.Mount.ToolsSource})"));
     }
     public string ComposeInstructions()
     {
@@ -57,28 +78,28 @@ public sealed class McpMounts : IAsyncDisposable
     }
     public (string[] Tools, object Browser, object Mcp) CaptureCapabilities()
     {
-        lock (reloadSync)
-        lock (publication)
-            return (snapshot.Tools.Select(t => t.ProtocolTool.Name).ToArray(), DescribeBrowsers(), Describe());
-    }
-    public object Describe()
-    {
         var current = Volatile.Read(ref snapshot);
+        return (current.Tools.Select(t => t.ProtocolTool.Name).ToArray(), DescribeBrowsers(current), Describe(current));
+    }
+    public object Describe() => Describe(Volatile.Read(ref snapshot));
+    private object Describe(Published current)
+    {
         return new
         {
             mounted = current.Entries.Where(e => e.Browser is null).Select(e => DescribeEntry(e, current)).ToArray(),
-            project_files = projects.Select(p => new { root_id = p.RootId, state = p.State, error = p.Error, warnings = p.Warnings, kept_previous = p.KeptPrevious }).ToArray(),
+            warnings = current.Warnings,
+            project_files = current.Projects.Select(p => new { root_id = p.RootId, state = p.State, error = p.Error, warnings = p.Warnings, kept_previous = p.KeptPrevious }).ToArray(),
             environment_source = ChildEnvironment.LastSource, environment_error = ChildEnvironment.LastError,
             reload = ReloadRule, reload_error = reloadError, boundary = Boundary, read_only_tools = ReadOnlyDisclosure
         };
     }
-    public object DescribeBrowsers()
+    public object DescribeBrowsers() => DescribeBrowsers(Volatile.Read(ref snapshot));
+    private object DescribeBrowsers(Published current)
     {
-        var current = Volatile.Read(ref snapshot);
         return new
         {
             mounted = current.Entries.Where(e => e.Browser is not null).Select(e => DescribeEntry(e, current)).ToArray(),
-            configured = owner.Config.BrowserMounts?.Length ?? 0,
+            configured = current.BrowserCount,
             transport = "stdio child process driven by the official MCP client; CODEXish opens no browser debugging listener",
             profile = "dedicated: CODEXish passes --user-data-dir under state_dir to a Playwright backend, unless the mount's own args already select browser state; existing: the configured arguments select the browser state",
             supervision = "Mounts connect in the background after the server listens. A backend that fails to start or exits is restarted after 1 s, doubling to 60 s between attempts, without giving up; five healthy minutes reset the delay. There is no deadline for a backend's handshake.",
@@ -93,6 +114,10 @@ public sealed class McpMounts : IAsyncDisposable
     private JsonObject DescribeEntry(Entry entry, Published current)
     {
         var node = JsonSerializer.SerializeToNode(entry.Mount.Describe())!.AsObject();
+        // Display the current file spelling even when its effective hash did not require a restart.
+        node["command"] = entry.Display.Transport == "stdio" ? Redaction.Apply(entry.Display.Command).Text : null;
+        node["args"] = entry.Display.Transport == "stdio" ? JsonSerializer.SerializeToNode(Redaction.DisplayArguments(entry.Display.Args)) : null;
+        node["url"] = entry.Display.Transport == "stdio" ? null : Redaction.DisplayUrl(entry.Display.Url);
         // The core supplies tool names too; manager owns final collision-resolved names.
         node["tools"] = JsonSerializer.SerializeToNode(current.Allocations.Where(x => ReferenceEquals(x.Entry, entry)).Select(x => x.Tool.ProtocolTool.Name));
         if (entry.Browser is { } b)
@@ -105,24 +130,34 @@ public sealed class McpMounts : IAsyncDisposable
     }
     internal (string State, bool Session, bool Job, int? ProcessId, int Attempts, DateTimeOffset? NextRetry, string ToolsSource) BrowserResources(string id)
     {
-        var m = Volatile.Read(ref snapshot).Entries.Single(e => e.Browser?.Id == id).Mount;
+        var m = Volatile.Read(ref snapshot).Entries.Where(e => e.Browser?.Id.Equals(id, StringComparison.OrdinalIgnoreCase) == true)
+            .OrderByDescending(e => e.Mount.WillStart).First().Mount;
         return (m.State, m.HasSession, m.HasJob, m.ProcessId, m.Attempts, m.NextRetry, m.ToolsSource);
     }
     public void Start()
     {
-        if (Volatile.Read(ref disposed) != 0 || Interlocked.Exchange(ref started, 1) != 0) return;
-        foreach (var e in snapshot.Entries) e.Mount.Start();
+        if (stopping.IsCancellationRequested || Volatile.Read(ref disposed) != 0 || Interlocked.Exchange(ref started, 1) != 0) return;
         reloadLoop = Task.Run(async () =>
         {
             try
             {
+                try { await PrepareAsync().ConfigureAwait(false); }
+                catch (Exception error) when (!stopping.IsCancellationRequested)
+                {
+                    lock (reloadSync) { stamps.Clear(); Warn("Mount configuration reload failed: " + error.Message); }
+                }
+                if (stopping.IsCancellationRequested) return;
+                foreach (var e in Volatile.Read(ref snapshot).Entries) e.Mount.Start();
                 while (true)
                 {
                     await Task.Delay(TimeSpan.FromSeconds(3), stopping.Token);
                     try
                     {
                         lock (reloadSync)
-                            if (Changed()) ReadDefinitionsAndApply();
+                            {
+                                PruneRetirements();
+                                if (Changed()) ApplyRead(changedPaths);
+                            }
                     }
                     catch (OperationCanceledException) when (stopping.IsCancellationRequested) { throw; }
                     catch (Exception error)
@@ -139,40 +174,43 @@ public sealed class McpMounts : IAsyncDisposable
             catch (OperationCanceledException) when (stopping.IsCancellationRequested) { }
         });
     }
-    public async Task InitializeAsync() { Start(); await Task.WhenAll(snapshot.Entries.Select(e => e.Mount.Settled)); }
+    public async Task InitializeAsync() { Start(); await PrepareAsync(); await Task.WhenAll(Volatile.Read(ref snapshot).Entries.Select(e => e.Mount.Settled)); }
     private IEnumerable<string> Paths() => (owner.Config.SourcePath is { } p ? new[] { p } : []).Concat(owner.Config.Roots.Select(r => Path.Combine(r.Path, ".mcp.json")));
     private bool Changed()
     {
         bool changed = false;
+        changedPaths = new(StringComparer.Ordinal);
         foreach (var path in Paths())
         {
             (bool Exists, long Length, long Ticks) stamp;
             try { var f = new FileInfo(path); stamp = (f.Exists, f.Exists ? f.Length : 0, f.Exists ? f.LastWriteTimeUtc.Ticks : 0); }
             catch { stamp = (false, -1, 0); }
-            if (!stamps.TryGetValue(path, out var before) || before != stamp) changed = true;
+            if (!stamps.TryGetValue(path, out var before) || before != stamp) { changed = true; changedPaths.Add(path); }
             stamps[path] = stamp;
         }
         return changed;
     }
     internal Action? BeforeReloadRead { get; set; }
     internal Action? AfterReloadRead { get; set; }
-    private void ReadDefinitionsAndApply()
+    private void ReadDefinitionsAndApply() => ApplyRead(Paths().ToHashSet(StringComparer.Ordinal), force: true);
+    private void ApplyRead(HashSet<string> changed, bool force = false)
     {
         lock (reloadSync)
         {
             BeforeReloadRead?.Invoke();
-            ApplyDefinitions();
+            ApplyDefinitions(changed, force);
         }
     }
-    private void ApplyDefinitions()
+    private void ApplyDefinitions(HashSet<string> changed, bool force)
     {
         var config = owner.Config;
+        bool mainChanged = force || config.SourcePath is { } source && changed.Contains(source);
         bool mainReadFailed = false, browserReadFailed = false;
-        if (config.SourcePath is { } path)
+        if (mainChanged && config.SourcePath is { } path)
         {
             try
             {
-                using var doc = JsonDocument.Parse(File.ReadAllBytes(path), McpConfiguration.JsonOptions);
+                using var doc = McpConfiguration.ParseDocument(File.ReadAllBytes(path));
                 if (doc.RootElement.ValueKind != JsonValueKind.Object) throw new JsonException("codexish.json is not an object.");
                 config.McpServers = doc.RootElement.TryGetProperty("mcp_servers", out var primary) ? primary.Clone() : null;
                 config.McpServersAlias = doc.RootElement.TryGetProperty("mcpServers", out var alias) ? alias.Clone() : null;
@@ -180,16 +218,30 @@ public sealed class McpMounts : IAsyncDisposable
                 try
                 {
                     config.BrowserMounts = doc.RootElement.TryGetProperty("browser_mounts", out var browsers)
-                        ? browsers.Deserialize<BrowserMountConfig[]>() ?? [] : [];
+                        ? ServerConfig.ParseBrowserMounts(browsers) : [];
                 }
-                catch (JsonException error) { browserReadFailed = true; Warn("browser_mounts keeps its previous definitions: " + error.Message); }
+                catch (Exception error) { browserReadFailed = true; Warn("browser_mounts keeps its previous definitions: " + error.Message); }
             }
-            catch (Exception error) when (error is IOException or UnauthorizedAccessException or JsonException)
+            catch (Exception error)
             { mainReadFailed = true; Warn("codexish.json keeps its previous definitions: " + error.Message); }
         }
-        projects = config.Roots.Select(r => McpConfiguration.ReadProject(r, projects.FirstOrDefault(p => p.RootId == r.Id))).ToArray();
+        if (mainChanged && !mainReadFailed)
+        {
+            List<string> warnings = [];
+            topDefinitions = McpConfiguration.ParseTopLevel(config, warnings);
+            topWarnings = warnings.Distinct(StringComparer.Ordinal).Select(w => Redaction.Apply(w).Text).ToArray();
+        }
+        projects = config.Roots.Select(r =>
+        {
+            var previous = projects.FirstOrDefault(p => p.RootId.Equals(r.Id, StringComparison.OrdinalIgnoreCase));
+            return force || previous is null || changed.Contains(Path.Combine(r.Path, ".mcp.json"))
+                ? McpConfiguration.ReadProject(r, previous) : previous;
+        }).ToArray();
         AfterReloadRead?.Invoke();
-        var definitions = McpConfiguration.ApplyOverrides(McpConfiguration.ParseTopLevel(config), projects.SelectMany(p => p.Definitions));
+        var definitions = McpConfiguration.ApplyOverrides(topDefinitions, projects.SelectMany(p => p.Definitions));
+        var prior = Volatile.Read(ref snapshot).Entries.ToDictionary(e => e.Key, StringComparer.OrdinalIgnoreCase);
+        string Effective(string key, McpDefinition definition, bool sourceChanged)
+            => !sourceChanged && prior.TryGetValue(key, out var old) ? old.Signature : McpEffectiveConfiguration.Fingerprint(config, definition);
         var desired = new List<(string Key, string Signature, McpDefinition Definition, BrowserMountConfig? Browser, string? Profile)>();
         var ids = BrowserMounts.NewIdSet();
         int ordinal = 0;
@@ -204,17 +256,21 @@ public sealed class McpMounts : IAsyncDisposable
                 State = problem is null ? "not_started" : "invalid_config", Error = problem };
             if (BrowserMounts.ProfileWarning(b) is { } warning) d.Warnings.Add(warning);
             bool ownsProfile = (b.Kind == "playwright" && b.ProfileMode == "dedicated" && !BrowserMounts.OwnsBrowserState(b)) || b.Args.Any(a => a is not null && a.Contains("{profile_dir}", StringComparison.Ordinal));
-            d.Signature = McpEffectiveConfiguration.Fingerprint(config, d);
-            desired.Add(("browser:" + b.Id.ToLowerInvariant() + (problem is null ? "" : ":invalid:" + ordinal), d.Signature, d, b, ownsProfile ? profile : null));
+            string key = "browser:" + b.Id.Length + ":" + b.Id + ":" + (problem is null ? 0 : ordinal + 1);
+            d.Signature = Effective(key, d, mainChanged && !mainReadFailed && !browserReadFailed);
+            desired.Add((key, d.Signature, d, b, ownsProfile ? profile : null));
             ordinal++;
         }
         ordinal = 0;
         foreach (var d in definitions)
         {
-            desired.Add(((d.IsProject ? "project:" : "mcp:") + d.Identity.ToLowerInvariant() + (d.Error == "duplicate of an earlier entry" ? ":duplicate:" + ordinal : ""), McpEffectiveConfiguration.Fingerprint(config, d), d, null, null));
+            string key = (d.IsProject ? "project:" : "mcp:") + d.Identity.Length + ":" + d.Identity + ":" + (d.Error == "duplicate of an earlier entry" ? ordinal + 1 : 0);
+            bool sourceChanged = d.IsProject
+                ? (force || changed.Contains(Path.Combine(d.RootPath!, ".mcp.json"))) && !projects.Any(p => p.RootId.Equals(d.RootId, StringComparison.OrdinalIgnoreCase) && p.KeptPrevious)
+                : mainChanged && !mainReadFailed;
+            desired.Add((key, Effective(key, d, sourceChanged), d, null, null));
             ordinal++;
         }
-        var prior = snapshot.Entries.ToDictionary(e => e.Key, StringComparer.Ordinal);
         var next = new List<Entry>();
         var replacements = new List<(Entry Old, Entry? New)>();
         foreach (var item in desired)
@@ -223,14 +279,14 @@ public sealed class McpMounts : IAsyncDisposable
                 ? projects.Any(p => p.RootId == item.Definition.RootId && p.State is "unreadable" or "unparseable")
                 : mainReadFailed || item.Browser is not null && browserReadFailed;
             string policyState = item.Definition.State + "\n" + item.Definition.OverriddenBy;
-            if (prior.Remove(item.Key, out var old) && (old.Signature == item.Signature || retainedSource && old.PolicyState == policyState))
-            { next.Add(old); continue; }
+            if (prior.Remove(item.Key, out var old) && (old.Signature == item.Signature && old.PolicyState == policyState || retainedSource && old.PolicyState == policyState))
+            { old.Mount.RefreshConfigurationWarnings(item.Definition.Warnings.ToArray()); old.Mount.RefreshLaunchDefinition(item.Definition); next.Add(old with { Display = item.Definition }); continue; }
             var mount = new McpMount(owner, item.Definition, Republish, item.Browser);
             if (old is not null) mount.MarkStarting();
-            var entry = new Entry(item.Key, item.Signature, policyState, mount, item.Browser, item.Profile);
+            var entry = new Entry(item.Key, item.Signature, policyState, mount, item.Browser, item.Profile, item.Definition);
             next.Add(entry);
             if (old is not null) replacements.Add((old, entry));
-            else if (started != 0)
+            else if (started != 0 && !stopping.IsCancellationRequested)
             {
                 if (lifetimes.TryGetValue(item.Key, out var predecessor) && !predecessor.IsCompleted)
                     Track(item.Key, StartAfter(predecessor, mount));
@@ -244,23 +300,42 @@ public sealed class McpMounts : IAsyncDisposable
             // Retire before publication so even already-resolved wrappers cannot acquire an old session afterward.
             foreach (var (old, fresh) in replacements)
                 drains[old.Mount] = old.Mount.DrainAsync(removed: fresh is null);
-            snapshot = new(next.ToArray(), [], [], []);
-            Republish();
+            var entries = next.ToArray();
+            var all = Allocate(entries).ToArray();
+            Volatile.Write(ref snapshot, new(entries, all.Select(x => x.Tool).ToArray(), all.Where(x => x.Entry.Browser is not null).Select(x => x.Tool).ToArray(), all, projects, config.BrowserMounts?.Length ?? 0, topWarnings));
         }
         foreach (var (old, fresh) in replacements)
         {
             lock (retirements) retiredMounts.Add(old.Mount);
             var drain = drains[old.Mount];
             var predecessor = lifetimes.GetValueOrDefault(old.Key, Task.CompletedTask);
-            Track(old.Key, StartAfter(Task.WhenAll(predecessor, drain), fresh?.Mount));
+            Track(old.Key, CompleteRetirement(old.Mount, StartAfter(Task.WhenAll(predecessor, drain), fresh?.Mount)));
         }
+        PruneRetirements();
     }
     private async Task StartAfter(Task predecessor, McpMount? fresh)
     {
         await predecessor.ConfigureAwait(false);
         if (!stopping.IsCancellationRequested && Volatile.Read(ref started) != 0) fresh?.Start();
     }
-    private void Track(string key, Task task) { lifetimes[key] = task; lock (retirements) retirements.Add(task); }
+    private async Task CompleteRetirement(McpMount retired, Task work)
+    {
+        try { await work.ConfigureAwait(false); }
+        finally { lock (retirements) retiredMounts.Remove(retired); }
+    }
+    private void Track(string key, Task task)
+    {
+        lifetimes[key] = task;
+        lock (retirements) retirements.Add(task);
+    }
+    private void PruneRetirements()
+    {
+        foreach (var key in lifetimes.Where(p => p.Value.IsCompleted).Select(p => p.Key).ToArray()) lifetimes.Remove(key);
+        lock (retirements)
+        {
+            retirements.RemoveAll(t => t.IsCompleted);
+        }
+    }
     private void Warn(string text)
     {
         reloadError = Redaction.Apply(text).Text;
@@ -273,7 +348,7 @@ public sealed class McpMounts : IAsyncDisposable
         lock (publication)
         {
             var all = Allocate(snapshot.Entries);
-            Volatile.Write(ref snapshot, new(snapshot.Entries, all.Select(x => x.Tool).ToArray(), all.Where(x => x.Entry.Browser is not null).Select(x => x.Tool).ToArray(), all.ToArray()));
+            Volatile.Write(ref snapshot, snapshot with { Tools = all.Select(x => x.Tool).ToArray(), BrowserTools = all.Where(x => x.Entry.Browser is not null).Select(x => x.Tool).ToArray(), Allocations = all.ToArray() });
         }
     }
     private static List<(Entry Entry, McpServerTool Tool)> Allocate(Entry[] entries)
@@ -323,6 +398,7 @@ public sealed class McpMounts : IAsyncDisposable
     {
         if (Interlocked.Exchange(ref disposed, 1) != 0) return;
         Stop(); await reloadLoop;
+        if (preparation is { } pendingPreparation) await pendingPreparation;
         await Task.WhenAll(snapshot.Entries.Select(e => e.Mount.DisposeAsync().AsTask()));
         Task[] pending; lock (retirements) pending = retirements.ToArray();
         await Task.WhenAll(pending);

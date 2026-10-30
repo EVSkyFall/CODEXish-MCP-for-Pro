@@ -33,7 +33,7 @@ public static partial class Redaction
 
     public static void AddSensitiveValue(string? value)
     {
-        if (string.IsNullOrEmpty(value)) return;
+        if (value is null || value.Length < MinimumEnvironmentValue) return;
         lock (AdditiveSync)
             additiveValues = additiveValues.Append(value).Distinct(StringComparer.Ordinal).OrderByDescending(v => v.Length).ToArray();
     }
@@ -42,6 +42,53 @@ public static partial class Redaction
     {
         foreach (var (name, value) in environment)
             if (IsSecretName(name)) AddSensitiveValue(value);
+    }
+
+    public static void AddHeaderValue(string name, string? value, bool fromEnvironment = false)
+    {
+        if (fromEnvironment || IsSecretName(name) || name.Equals("Authorization", StringComparison.OrdinalIgnoreCase)
+            || name.Equals("Proxy-Authorization", StringComparison.OrdinalIgnoreCase) || name.Equals("Cookie", StringComparison.OrdinalIgnoreCase))
+            AddSensitiveValue(value);
+    }
+
+    public static void AddUrlQueryValues(Uri endpoint)
+    {
+        foreach (string part in endpoint.Query.TrimStart('?').Split('&'))
+        {
+            int equals = part.IndexOf('=');
+            if (equals < 0) continue;
+            string name = Uri.UnescapeDataString(part[..equals].Replace('+', ' '));
+            if (IsSecretName(name)) AddSensitiveValue(Uri.UnescapeDataString(part[(equals + 1)..].Replace('+', ' ')));
+        }
+    }
+
+    public static string[] DisplayArguments(IEnumerable<string> arguments)
+    {
+        bool hideNext = false;
+        return arguments.Select(argument =>
+        {
+            if (hideNext) { hideNext = false; return "[REDACTED]"; }
+            if (argument.StartsWith('-'))
+            {
+                int equals = argument.IndexOf('=');
+                string name = equals < 0 ? argument : argument[..equals];
+                if (IsSecretName(name))
+                {
+                    if (equals >= 0) return Apply(name).Text + "=[REDACTED]";
+                    hideNext = true;
+                }
+            }
+            return Apply(argument).Text;
+        }).ToArray();
+    }
+
+    public static string? DisplayUrl(string? value)
+    {
+        if (value is null) return null;
+        if (Uri.TryCreate(value, UriKind.Absolute, out var uri) && uri.Scheme is "http" or "https")
+            return Apply(uri.GetComponents(UriComponents.SchemeAndServer, UriFormat.UriEscaped)).Text + "/…";
+        // An unexpanded or malformed URL can still contain credentials in every component: do not echo it.
+        return "[unresolved URL]/…";
     }
 
     // The server snapshots the environment once at startup: a long-running process does not see its parent's

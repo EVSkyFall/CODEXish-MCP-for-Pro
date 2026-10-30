@@ -54,15 +54,15 @@ public static class McpConfiguration
 {
     public static readonly JsonDocumentOptions JsonOptions = new() { AllowTrailingCommas = true, CommentHandling = JsonCommentHandling.Skip };
 
-    public static McpDefinition[] ParseTopLevel(ServerConfig config)
+    public static McpDefinition[] ParseTopLevel(ServerConfig config, ICollection<string>? warnings = null)
     {
-        var primary = ParseObject(config.McpServers, config, null, "mcp_servers");
-        var alias = ParseObject(config.McpServersAlias, config, null, "mcpServers");
+        var primary = ParseObject(config.McpServers, config, null, "mcp_servers", warnings);
+        var alias = ParseObject(config.McpServersAlias, config, null, "mcpServers", warnings);
         var names = primary.Select(d => d.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
         foreach (var entry in alias.Where(d => names.Contains(d.Name)))
         {
             string warning = $"mcpServers server '{entry.Name}' is also in mcp_servers; mcp_servers wins.";
-            config.Warnings.Add(warning);
+            warnings?.Add(warning);
             primary.First(d => d.Name.Equals(entry.Name, StringComparison.OrdinalIgnoreCase)).Warnings.Add(warning);
         }
         return [.. primary, .. alias.Where(d => !names.Contains(d.Name))];
@@ -80,18 +80,20 @@ public static class McpConfiguration
     {
         try
         {
-            using var document = JsonDocument.Parse(File.ReadAllBytes(Path.Combine(root.Path, ".mcp.json")), JsonOptions);
+            using var document = ParseDocument(File.ReadAllBytes(Path.Combine(root.Path, ".mcp.json")));
             if (document.RootElement.ValueKind != JsonValueKind.Object) throw new JsonException("The project MCP configuration is not an object.");
             var context = new ServerConfig { Roots = [root] };
             JsonElement? raw = document.RootElement.TryGetProperty("mcpServers", out var servers) ? servers : null;
-            var definitions = ParseObject(raw, context, root, "mcpServers");
-            return new(root.Id, "read", null, definitions) { Warnings = context.Warnings.ToArray() };
+            List<string> warnings = [];
+            var definitions = ParseObject(raw, context, root, "mcpServers", warnings);
+            return new(root.Id, "read", null, definitions) { Warnings = warnings.Distinct(StringComparer.Ordinal).ToArray() };
         }
         catch (FileNotFoundException) { return new(root.Id, "absent", null, []); }
         catch (DirectoryNotFoundException) { return new(root.Id, "absent", null, []); }
-        catch (JsonException error) { return new(root.Id, "unparseable", Redaction.Apply(error.Message).Text, previous?.Definitions ?? [], previous is not null); }
+
         catch (Exception error) when (error is IOException or UnauthorizedAccessException or System.Security.SecurityException)
-        { return new(root.Id, "unreadable", Redaction.Apply(error.Message).Text, previous?.Definitions ?? [], previous is not null); }
+        { return new(root.Id, "unreadable", Reason(error), previous?.Definitions ?? [], previous is not null); }
+        catch (Exception error) { return new(root.Id, "unparseable", Reason(error), previous?.Definitions ?? [], previous is not null); }
     }
 
     public static McpDefinition[] ApplyOverrides(IEnumerable<McpDefinition> top, IEnumerable<McpDefinition> project)
@@ -110,17 +112,26 @@ public static class McpConfiguration
         return [.. entries, .. projects];
     }
 
-    private static McpDefinition[] ParseObject(JsonElement? value, ServerConfig config, RootConfig? projectRoot, string field)
+    private static McpDefinition[] ParseObject(JsonElement? value, ServerConfig config, RootConfig? projectRoot, string field, ICollection<string>? warnings = null)
     {
         if (value is null || value.Value.ValueKind == JsonValueKind.Null) return [];
         if (value.Value.ValueKind != JsonValueKind.Object)
-        { config.Warnings.Add($"{field} is not an object and is ignored."); return []; }
+        { warnings?.Add($"{field} is not an object and is ignored."); return []; }
         var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         List<McpDefinition> result = [];
         foreach (var property in value.Value.EnumerateObject())
         {
-            var item = ParseDefinition(property.Name, property.Value, config, projectRoot);
-            if (!names.Add(property.Name)) { item.State = "invalid_config"; item.Error = "duplicate of an earlier entry"; }
+            string name = "(unreadable entry " + (result.Count + 1) + ")";
+            McpDefinition item;
+            try { name = property.Name; item = ParseDefinition(name, property.Value, config, projectRoot); }
+            catch (Exception error)
+            {
+                item = new McpDefinition { Name = name, Identity = projectRoot is null ? name : projectRoot.Id + "/" + name,
+                    Source = projectRoot is null ? "codexish.json" : projectRoot.Id + "/.mcp.json",
+                    RootId = projectRoot?.Id, RootPath = projectRoot?.Path, IsProject = projectRoot is not null,
+                    State = "invalid_config", InitialState = "invalid_config", Error = Reason(error), Signature = property.Value.GetRawText() };
+            }
+            if (!names.Add(name)) { item.State = item.InitialState = "invalid_config"; item.Error = "duplicate of an earlier entry"; }
             result.Add(item);
         }
         return result.ToArray();
@@ -161,7 +172,7 @@ public static class McpConfiguration
         }
         bool? Boolean(string key)
         {
-            if (!raw.TryGetProperty(key, out var v)) return null;
+            if (!raw.TryGetProperty(key, out var v) || v.ValueKind == JsonValueKind.Null) return null;
             if (v.ValueKind is JsonValueKind.True or JsonValueKind.False) return v.GetBoolean();
             if (v.ValueKind == JsonValueKind.String && bool.TryParse(v.GetString(), out bool parsed)) return parsed;
             item.Warnings.Add($"{key} is not true or false and is ignored."); return null;
@@ -212,6 +223,11 @@ public static class McpConfiguration
         item.InitialState = item.State;
         return item;
     }
+
+    public static JsonDocument ParseDocument(byte[] bytes) => JsonDocument.Parse(
+        bytes.AsMemory(bytes.AsSpan().StartsWith(new byte[] { 0xef, 0xbb, 0xbf }) ? 3 : 0), JsonOptions);
+
+    internal static string Reason(Exception error) => Redaction.Apply(error.Message).Text.Trim().TrimEnd('.');
 
     public static string Canonical(JsonElement value)
     {

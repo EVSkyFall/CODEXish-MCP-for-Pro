@@ -165,9 +165,9 @@ public static class ChildEnvironment
         if (hasDirectory || Path.IsPathRooted(command))
         {
             string path = Path.GetFullPath(command, workingDirectory);
-            if (Usable(path)) return path;
-            if (windows && Path.GetExtension(path).Length == 0)
+            if (windows && !new[] { ".com", ".exe", ".bat", ".cmd" }.Contains(Path.GetExtension(path), StringComparer.OrdinalIgnoreCase))
                 foreach (string extension in extensions) if (Usable(path + extension)) return path + extension;
+            if (Usable(path)) return path;
             return command;
         }
         foreach (string directory in ((environment.TryGetValue("PATH", out var pathValue) ? pathValue : null) ?? "")

@@ -17,12 +17,12 @@ public static class McpResourceTests
         public bool IsBrowser => isBrowser;
         public int Acquired;
         public int Active;
-        public McpResourceLease AcquireResourceLease()
+        public McpResourceLease AcquireResourceLease(bool listing = false)
         {
             if (denied) throw new CodexishFault("PERMISSION_DENIED", "fixture grant missing");
             Interlocked.Increment(ref Acquired);
-            Interlocked.Increment(ref Active);
-            return new(client, state, null, () => Interlocked.Decrement(ref Active));
+            if (!listing) Interlocked.Increment(ref Active);
+            return new(client, state, null, listing ? null : () => Interlocked.Decrement(ref Active));
         }
         public CallToolResult Unavailable() => Reply.Error("MCP_UNAVAILABLE", $"MCP server '{identity}' is {state}; nothing was sent to it. CODEXish keeps restarting it.", details: new { server = identity, state, next_retry = (string?)null });
     }
@@ -81,7 +81,7 @@ public static class McpResourceTests
                     if (request.Params.Uri == "fixture:transport-loss") { transportReadStarted.TrySetResult(); await Task.Delay(Timeout.Infinite, cancellation); }
                     return new ReadResourceResult
                     {
-                        Contents = [new TextResourceContents { Uri = request.Params.Uri, MimeType = "text/plain", Text = secret }, new BlobResourceContents { Uri = "fixture:blob", MimeType = "application/octet-stream", Blob = System.Text.Encoding.UTF8.GetBytes(secret) }]
+                        Contents = [new TextResourceContents { Uri = request.Params.Uri, MimeType = "text/plain", Text = secret }, new BlobResourceContents { Uri = "fixture:blob", MimeType = "application/octet-stream", Blob = System.Text.Encoding.UTF8.GetBytes(Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(secret))) }]
                     };
                 }
             }
@@ -107,7 +107,7 @@ public static class McpResourceTests
             var read = await mounted.Read("browser:fixture", "fixture:text");
             var blocks = read.Content.OfType<EmbeddedResourceBlock>().ToArray();
             check(Reply.CodeOf(read) is null && blocks.Length == 2 && blocks[0].Resource is TextResourceContents text && !text.Text.Contains(secret), "resource read passes embedded text with redaction");
-            check(blocks[1].Resource is BlobResourceContents blob && blob.Blob.Span.SequenceEqual(System.Text.Encoding.UTF8.GetBytes(secret)), "resource read passes fixture blob unchanged");
+            check(blocks[1].Resource is BlobResourceContents blob && blob.DecodedData.Span.SequenceEqual(System.Text.Encoding.UTF8.GetBytes(secret)) && blob.Blob.Span.SequenceEqual(System.Text.Encoding.UTF8.GetBytes(Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(secret)))), "resource read passes fixture blob unchanged");
             check(Reply.CodeOf(await mounted.Read("browser:fixture", "fixture:missing")) == "MCP_BACKEND_ERROR", "resource protocol errors use MCP_BACKEND_ERROR");
             check(connected.Active == 0, "completed SDK resource operations release drain leases");
             var browserFoo = new Target("browser:foo", client, isBrowser: true);

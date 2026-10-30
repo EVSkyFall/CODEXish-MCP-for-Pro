@@ -76,6 +76,7 @@ public static class McpHandshakeIntegrationTests
                 await app.StartAsync();
                 try
                 {
+                    await Until(() => runtime.Mounts.ResourceTargets.Any(t => t.Identity == "legacy"), "legacy entry prepared");
                     var mount = (McpMount)runtime.Mounts.ResourceTargets.Single(t => t.Identity == "legacy");
                     await Until(() => mount.State == "connected", "initialize-first fallback connects");
                     var methods = File.ReadAllLines(Path.Combine(folder, "first-methods"));
@@ -95,6 +96,7 @@ public static class McpHandshakeIntegrationTests
                 await app.StartAsync();
                 try
                 {
+                    await Until(() => runtime.Mounts.ResourceTargets.Any(t => t.Identity == "legacy"), "legacy entry prepared");
                     var mount = (McpMount)runtime.Mounts.ResourceTargets.Single(t => t.Identity == "legacy");
                     await Until(() => mount.State == "connected", "remembered mode reconnects");
                     check(File.ReadAllLines(Path.Combine(folder, "first-methods")).SequenceEqual(new[] { "server/discover", "initialize", "initialize" }),
@@ -109,6 +111,7 @@ public static class McpHandshakeIntegrationTests
                 await app.StartAsync();
                 try
                 {
+                    await Until(() => runtime.Mounts.ResourceTargets.Any(t => t.Identity == "legacy"), "legacy entry prepared");
                     var mount = (McpMount)runtime.Mounts.ResourceTargets.Single(t => t.Identity == "legacy");
                     await Until(() => mount.State == "retrying", "offline backend retries");
                     check(mount.ToolsSource == "manifest" && mount.Instructions == Instructions, "offline backend loads instructions and tools from manifest");
@@ -116,6 +119,9 @@ public static class McpHandshakeIntegrationTests
                     await using var client = await McpClient.CreateAsync(new HttpClientTransport(new() { Endpoint = new Uri(address + "/mcp") }), new() { ProtocolVersion = "2025-11-25", InitializationTimeout = Timeout.InfiniteTimeSpan });
                     check(client.ServerInstructions?.Contains("## legacy\n" + Instructions, StringComparison.Ordinal) == true,
                         "real host initialize returns cached backend instructions while backend is down");
+                    var capabilities = await client.CallToolAsync(new CallToolRequestParams { Name = "host_capabilities", Arguments = new Dictionary<string, JsonElement>() });
+                    check(capabilities.StructuredContent!.Value.GetProperty("data").GetProperty("mcp").GetProperty("mounted").EnumerateArray().Any(m => m.GetProperty("identity").GetString() == "legacy" && m.GetProperty("instructions").GetString() == Instructions),
+                        "real host capabilities includes cached mounted server instructions while backend is down");
                 }
                 finally { await app.StopAsync(); }
             }

@@ -185,14 +185,15 @@ public static class McpNotificationTests
     private static async Task Burst(Action<bool, string> check, McpMount mount, string folder, string kind)
     {
         int before = Count(folder, "lists");
+        int notificationsBefore = mount.ToolNotificationCount;
         File.WriteAllText(Path.Combine(folder, "hold"), "yes");
         File.WriteAllText(Path.Combine(folder, "burst"), "yes");
         await Until(() => File.Exists(Path.Combine(folder, "burst-sent")), "three notifications sent");
-        // The notifications are delivered asynchronously; leave the first relist blocked while the receive loop runs.
-        await Task.Delay(150);
+        // The first list stays blocked until all three notifications have actually reached the client.
+        await Until(() => mount.ToolNotificationCount == notificationsBefore + 3, "all three notifications observed by mount");
         File.Delete(Path.Combine(folder, "hold"));
         await Until(() => Count(folder, "lists") >= before + 2 && mount.BackendTools.Any(t => t.Name == "added"), "coalesced second relist");
-        await Task.Delay(150);
+        await Until(() => !mount.ToolsRelisting, "coalesced relisting completed");
         check(Count(folder, "lists") == before + 2, $"{kind}: three notifications during a slow list coalesce to two relists");
         check(mount.Tools.Any(t => t.ProtocolTool.Name == "mcp_notify_added"), $"{kind}: new backend tool is published after list_changed");
         string manifest = Directory.GetFiles(Path.Combine(folder, "state", "mcp-mounts"), "*.manifest.json").Single();

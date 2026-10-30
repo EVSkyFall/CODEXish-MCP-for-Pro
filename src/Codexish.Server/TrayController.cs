@@ -57,6 +57,13 @@ public sealed record TrayOptions(bool Start = false, string? PublicUrl = null, s
 // stop ends supervision of that component until the user starts it again.
 public sealed class TrayController(ServerConfig config) : IAsyncDisposable
 {
+    internal static async Task SaveRootsAndRestart(string path, RootConfig[] roots, Func<Task> stop, Action<byte[]> save, Func<Task> restart)
+    {
+        byte[] prepared = ServerConfig.PrepareRoots(path, roots);
+        try { await stop(); save(prepared); }
+        finally { await restart(); }
+    }
+
     public static readonly TimeSpan HealthyRun = Backoff.HealthyRun;
     // The connection log window shows this many recent lines; the files under state_dir\logs keep every line.
     public const int MemoryLines = 5000;
@@ -976,6 +983,28 @@ public static class TrayTests
                     File.ReadAllText(configPath + ".bak") == beforeRootsSave,
                     "Edit roots save preserves both MCP keys, browser mounts and unknown newer fields, and keeps the exact previous file as backup");
             }
+
+            File.WriteAllText(configPath, """{/* tolerant */ "future":1,"roots":[],"future":2,"roots":[],"mcp_servers":{"x":{"command":"x"}},}""");
+            byte[] preparedRoots = ServerConfig.PrepareRoots(configPath, [new RootConfig { Id = "once", Path = directory }]);
+            using (var duplicateRoots = JsonDocument.Parse(preparedRoots))
+                Check(duplicateRoots.RootElement.EnumerateObject().Count(p => p.Name == "roots") == 1 &&
+                      duplicateRoots.RootElement.EnumerateObject().Where(p => p.Name == "future").Select(p => p.Value.GetInt32()).SequenceEqual([1, 2]),
+                      "roots preparation tolerates duplicate keys and preserves every other top-level occurrence");
+            File.WriteAllText(configPath, "{ half-written");
+            int rootsStops = 0, rootsRestarts = 0, rootsWrites = 0;
+            bool rootsParseFailed = false;
+            try { await TrayController.SaveRootsAndRestart(configPath, [], () => { rootsStops++; return Task.CompletedTask; },
+                _ => rootsWrites++, () => { rootsRestarts++; return Task.CompletedTask; }); }
+            catch (JsonException) { rootsParseFailed = true; }
+            Check(rootsParseFailed && rootsStops == 0 && rootsRestarts == 0 && rootsWrites == 0,
+                "half-written roots save fails before stopping or changing a running host");
+            File.WriteAllText(configPath, "{}");
+            bool rootsWriteFailed = false;
+            try { await TrayController.SaveRootsAndRestart(configPath, [], () => { rootsStops++; return Task.CompletedTask; },
+                _ => throw new IOException("synthetic save failure"), () => { rootsRestarts++; return Task.CompletedTask; }); }
+            catch (IOException) { rootsWriteFailed = true; }
+            Check(rootsWriteFailed && rootsStops == 1 && rootsRestarts == 1,
+                "failed atomic roots write restarts the previously running components in finally");
 
             if (OperatingSystem.IsWindows())
             {

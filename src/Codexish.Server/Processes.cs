@@ -218,7 +218,10 @@ public sealed class ProcessSupervisor(Store store, Artifacts artifacts, ServerCo
 
     private static string ResolveShell(string shell, IReadOnlyDictionary<string, string?> environment)
     {
-        string command = shell == "cmd" ? "cmd.exe" : shell == "powershell" ? "powershell.exe" : "pwsh";
+        if (shell is "cmd" or "powershell")
+            return ResolveShell(shell, environment.GetValueOrDefault("PATH"), environment.GetValueOrDefault("ProgramFiles"),
+                OperatingSystem.IsWindows() ? Environment.SystemDirectory : null);
+        string command = "pwsh";
         string found = ChildEnvironment.ResolveCommand(command, environment, Environment.CurrentDirectory);
         if (found != command) return found;
         return ResolveShell(shell, null, environment.GetValueOrDefault("ProgramFiles"),

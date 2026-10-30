@@ -4,6 +4,7 @@ using System.Reflection;
 using System.Text.Json;
 using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.AspNetCore.Hosting.Server.Features;
+using ModelContextProtocol;
 using ModelContextProtocol.AspNetCore;
 using ModelContextProtocol.Client;
 using ModelContextProtocol.Protocol;
@@ -18,12 +19,13 @@ public static class McpHttpTests
         int index = Array.IndexOf(args, "--mcp-http-fixture");
         string directory = args[index + 1]; int port = int.Parse(args[index + 2]);
         bool stateful = args[index + 3] == "stateful";
+        bool vanished = false;
         bool hangList = args[index + 3] == "hanglist";
         var builder = WebApplication.CreateBuilder(Array.Empty<string>());
         builder.Logging.ClearProviders();
         builder.WebHost.ConfigureKestrel(o => o.Listen(IPAddress.Loopback, port));
         builder.Services.AddHttpContextAccessor();
-        builder.Services.AddMcpServer(o => { o.ServerInfo = new() { Name = "http-fixture", Version = "1" }; o.ServerInstructions = "Synthetic HTTP fixture instructions."; })
+        builder.Services.AddMcpServer(o => { o.ServerInfo = new() { Name = "http-fixture", Version = "1" }; o.ServerInstructions = "Synthetic HTTP fixture instructions."; o.Capabilities = new() { Tools = new() { ListChanged = true } }; })
             .WithHttpTransport(o => o.SessionMode = stateful ? HttpServerSessionMode.Stateful : HttpServerSessionMode.Stateless)
             .WithListToolsHandler(async (_, cancellation) =>
             {
@@ -34,16 +36,21 @@ public static class McpHttpTests
                 }
                 return new ListToolsResult
                 {
-                Tools = new[] { "ping", "slow", "slow_change", "error500", "reset404", "die" }.Select(name => new Tool { Name = name,
-                    Description = name, InputSchema = JsonSerializer.SerializeToElement(new { type = "object" }) }).ToList()
+                Tools = new[] { "ping", "slow", "slow_change", "error500", "error500_change", "reset404", "reset404_change", "die", "ping_change", "malformed", "malformed_change", "unknown", "dup_schema", "vanish", "remove_queued" }.Where(name => name != "vanish" || !vanished).Select(name => new Tool { Name = name,
+                    Description = name == "dup_schema" ? "" : name, InputSchema = name == "dup_schema" ? JsonDocument.Parse("{\"type\":\"object\",\"type\":\"object\"}").RootElement.Clone() : JsonSerializer.SerializeToElement(new { type = "object" }) }).ToList()
                 };
             })
             .WithCallToolHandler(async (request, cancellation) =>
             {
+                if (request.Params!.Name == "remove_queued")
+                {
+                    vanished = true;
+                    await request.Server.SendNotificationAsync("notifications/tools/list_changed", cancellation);
+                }
                 if (request.Params!.Name is "slow" or "slow_change")
                 {
                     File.WriteAllText(Path.Combine(directory, request.Params.Name + "-started"), "yes");
-                    await Task.Delay(1500, cancellation);
+                    while (!File.Exists(Path.Combine(directory, "release-" + request.Params.Name))) await Task.Delay(10, cancellation);
                 }
                 return new CallToolResult { Content = [new TextContentBlock { Text = "http-fixture-ok" }] };
             });
@@ -68,8 +75,16 @@ public static class McpHttpTests
                             environment = context.Request.Headers["X-Fixture-Env"] == "fixture-env-value",
                             bearer = context.Request.Headers.Authorization == "Bearer fixture-bearer-value"
                         }));
-                        if (name == "error500") { context.Response.StatusCode = 500; return; }
-                        if (name == "reset404") { context.Response.StatusCode = 404; return; }
+                        if (name is "error500" or "error500_change") { context.Response.StatusCode = 500; return; }
+                        if (name is "reset404" or "reset404_change") { context.Response.StatusCode = 404; return; }
+                        if (name is "malformed" or "malformed_change" or "unknown")
+                        {
+                            context.Response.ContentType = "application/json";
+                            object result = name == "unknown" ? new { content = (object)new object[] { new { type = "text", text = "known" }, new { type = "future-block", value = "fixture-raw-future" } } }
+                                : new { content = (object)"not-an-array" };
+                            await context.Response.WriteAsJsonAsync(new { jsonrpc = "2.0", id = body.RootElement.GetProperty("id").Clone(), result });
+                            return;
+                        }
                         if (name == "die")
                         {
                             File.WriteAllText(Path.Combine(directory, "received-changing-call"), "yes");
@@ -99,23 +114,29 @@ public static class McpHttpTests
         Directory.CreateDirectory(directory);
         string? oldHeader = Environment.GetEnvironmentVariable("CODEXISH_HTTP_FIXTURE_HEADER");
         string? oldBearer = Environment.GetEnvironmentVariable("CODEXISH_HTTP_FIXTURE_BEARER");
+        string? oldUrl = Environment.GetEnvironmentVariable("CODEXISH_HTTP_FIXTURE_URL");
+        string? oldConfig = Environment.GetEnvironmentVariable("CODEXISH_HTTP_FIXTURE_CONFIG");
         Environment.SetEnvironmentVariable("CODEXISH_HTTP_FIXTURE_HEADER", "fixture-env-value");
-        Environment.SetEnvironmentVariable("CODEXISH_HTTP_FIXTURE_BEARER", "fixture-bearer-value");
+        Environment.SetEnvironmentVariable("CODEXISH_HTTP_FIXTURE_BEARER", null);
         Process? fixture = null;
         try
         {
-            fixture = StartFixture(directory, 0, mode);
+            int fixedPort = FixedFixturePort();
+            fixture = StartFixture(directory, fixedPort, mode);
             await Until(() => File.Exists(Path.Combine(directory, "address")), "fixture listen");
             string address = File.ReadAllText(Path.Combine(directory, "address"));
             int port = new Uri(address).Port;
             var config = ServerConfig.Create("", "fixture-password", [("test", directory)], [], 0, Path.Combine(directory, "state"));
             config.McpServers = JsonSerializer.SerializeToElement(new Dictionary<string,object> { ["httpfixture"] = new
             {
-                url = address + "/mcp", headers = new Dictionary<string,string> { ["X-Fixture-Config"] = "fixture-config-value" },
+                cwd = directory, url = "${CODEXISH_HTTP_FIXTURE_URL}", headers = new Dictionary<string,string> { ["X-Fixture-Config"] = "${CODEXISH_HTTP_FIXTURE_CONFIG}", ["Accept"] = "application/json" },
                 env_http_headers = new Dictionary<string,string> { ["X-Fixture-Env"] = "CODEXISH_HTTP_FIXTURE_HEADER" },
-                bearer_token_env_var = "CODEXISH_HTTP_FIXTURE_BEARER", read_only_tools = new[] { "ping", "slow", "error500", "reset404" }
+                bearer_token_env_var = "CODEXISH_HTTP_FIXTURE_BEARER", read_only_tools = new[] { "ping", "slow", "error500", "reset404", "malformed", "unknown", "remove_queued" }
             } });
             using var runtime = new CodexishRuntime(config, true);
+            Environment.SetEnvironmentVariable("CODEXISH_HTTP_FIXTURE_URL", address + "/mcp?v=1");
+            Environment.SetEnvironmentVariable("CODEXISH_HTTP_FIXTURE_CONFIG", "fixture-config-value");
+            Environment.SetEnvironmentVariable("CODEXISH_HTTP_FIXTURE_BEARER", "fixture-bearer-value");
             await using var host = CodexishHost.Build(runtime, 0);
             await host.StartAsync();
             string hostAddress = host.Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>()!.Addresses.Single();
@@ -134,18 +155,61 @@ public static class McpHttpTests
             check(listed.Any(x => x.Name == "mcp_httpfixture_ping") && Reply.CodeOf(await Call("ping")) is null, mode + " HTTP tools list and call through real CODEXish host");
             var headers = JsonDocument.Parse(File.ReadAllText(Path.Combine(directory, "headers.json"))).RootElement;
             check(headers.GetProperty("configured").GetBoolean() && headers.GetProperty("environment").GetBoolean() && headers.GetProperty("bearer").GetBoolean(), mode + " configured, environment and bearer headers reach fixture");
+            Environment.SetEnvironmentVariable("CODEXISH_HTTP_FIXTURE_BEARER", null);
+            Redaction.RefreshEnvironment();
+            File.WriteAllText(Path.Combine(directory, "redaction.txt"), "false 1 application/json Bearer fixture-bearer-value");
+            var read = await client.CallToolAsync(new CallToolRequestParams { Name = "fs_read", Arguments = new Dictionary<string,JsonElement> {
+                ["root_id"] = JsonSerializer.SerializeToElement("test"), ["path"] = JsonSerializer.SerializeToElement("redaction.txt") } });
+            string readJson = read.StructuredContent!.Value.GetRawText();
+            check(readJson.Contains("false 1 application/json") && !readJson.Contains("fixture-bearer-value"), mode + " header added after runtime registers additive redaction while ordinary query and Accept remain intact through fs_read");
+            Environment.SetEnvironmentVariable("CODEXISH_HTTP_FIXTURE_BEARER", "fixture-bearer-value");
+            check(listed.Single(t => t.Name == "mcp_httpfixture_dup_schema").Description!.StartsWith("dup_schema") &&
+                Reply.CodeOf(await Call("dup_schema", true)) is null, mode + " duplicate-key backend schema publishes and calls with any-object fallback; empty description uses backend name");
             int attempts = target.Attempts;
+            using (var lease = target.AcquireResourceLease())
+            {
+                var malformed = await Call("malformed");
+                var malformedChange = await Call("malformed_change", true);
+                using var after = target.AcquireResourceLease();
+                check(Reply.CodeOf(malformed) == "MCP_BACKEND_ERROR" && Effects(malformed) == "none" && Reply.CodeOf(malformedChange) == "MCP_BACKEND_ERROR" && Effects(malformedChange) == "unknown" &&
+                    ReferenceEquals(lease.Client, after.Client) && target.State == "connected" && target.Attempts == attempts && !fixture.HasExited,
+                    mode + " malformed result is per-call backend error with unchanged session and fixture pid");
+            }
+            var unknownBlock = await Call("unknown");
+            check(Reply.CodeOf(unknownBlock) is null && unknownBlock.StructuredContent!.Value.GetRawText().Contains("future-block") && unknownBlock.StructuredContent.Value.GetRawText().Contains("known"),
+                mode + " unknown content block degrades to redacted raw text while known blocks survive");
+            if (mode == "stateful")
+            {
+                runtime.Ledger.Pause();
+                try
+                {
+                    var queued = await client.CallToolAsync(new CallToolRequestParams { Name = "mcp_httpfixture_vanish", Arguments = new Dictionary<string, JsonElement> {
+                        ["arguments"] = JsonSerializer.SerializeToElement(new { }), ["invocation_id"] = JsonSerializer.SerializeToElement("vanished-queued"), ["wait_ms"] = JsonSerializer.SerializeToElement(0) } });
+                    check(Reply.StatusOf(queued) == "queued", "queued disappearing tool is accepted without dispatch");
+                    await Call("remove_queued");
+                    await Until(() => !target.BackendTools.Any(t => t.Name == "vanish"), "queued tool removal notification");
+                }
+                finally { runtime.Ledger.Resume(); }
+                await Until(() => Reply.StatusOf(runtime.Ledger.Inspect("vanished-queued")) is not ("queued" or "running"), "queued removed tool terminal result");
+                var removed = runtime.Ledger.Inspect("vanished-queued");
+                check(Reply.CodeOf(removed) == "MCP_UNAVAILABLE" && Effects(removed) == "none", "queued tool removed before dispatch returns unavailable with no effects");
+            }
             var survives500 = Call("slow");
             await Until(() => File.Exists(Path.Combine(directory, "slow-started")), "slow call before HTTP 500");
             var failure = await Call("error500");
             check(Reply.CodeOf(failure) == "MCP_BACKEND_ERROR" && target.State == "connected" && target.Attempts == attempts,
                 mode + " HTTP 500 is backend error without reconnect");
+            check(Effects(failure) == "none" && Effects(await Call("error500_change", true)) == "unknown" && target.Attempts == attempts,
+                mode + " HTTP 500 preserves read-only and changing effects without reconnect");
+            File.WriteAllText(Path.Combine(directory, "release-slow"), "yes");
             check(Reply.CodeOf(await survives500) is null, mode + " HTTP 500 does not cancel a different in-flight call");
             File.Delete(Path.Combine(directory, "slow-started"));
+            File.Delete(Path.Combine(directory, "release-slow"));
             var slow = Call("slow");
             var changingSlow = Call("slow_change", changing: true);
             await Until(() => File.Exists(Path.Combine(directory, "slow-started")) && File.Exists(Path.Combine(directory, "slow_change-started")), "read and changing calls entered backend");
             var reset = await Call("reset404");
+            if (mode == "stateless") { File.WriteAllText(Path.Combine(directory, "release-slow"), "yes"); File.WriteAllText(Path.Combine(directory, "release-slow_change"), "yes"); }
             var slowResult = await slow;
             var changingResult = await changingSlow;
             check(Reply.CodeOf(reset) == "MCP_UNAVAILABLE", mode + " HTTP 404 triggers unavailable and reconnect");
@@ -162,7 +226,12 @@ public static class McpHttpTests
                     "stateless HTTP 404 has no SDK session to expire and other in-flight calls finish");
             await Until(() => target.State == "connected", "404 reconnect");
             check(Reply.CodeOf(await Call("ping")) is null, mode + " calls succeed after 404 reconnect");
+            var changed404 = await Call("reset404_change", true);
+            check(Reply.CodeOf(changed404) == "MCP_UNAVAILABLE" && Effects(changed404) == "none", mode + " actual HTTP 404 changing request proves no effects");
+            await Until(() => target.State == "connected", "changing404 reconnect");
             fixture.Kill(entireProcessTree: true); await fixture.WaitForExitAsync(); fixture.Dispose(); fixture = null;
+            var downChange = await Call("ping_change", true);
+            check(Reply.CodeOf(downChange) == "EXECUTION_UNKNOWN" && Effects(downChange) == "unknown", mode + " changing request hitting a lost connection preserves uncertain effects");
             var down = await Call("ping");
             check(Reply.CodeOf(down) == "MCP_UNAVAILABLE" && down.StructuredContent!.Value.GetProperty("error").GetProperty("side_effects").GetString() == "none" && target.State == "retrying",
                 mode + " stopped HTTP fixture returns nothing-sent unavailable and retries");
@@ -181,6 +250,8 @@ public static class McpHttpTests
             if (fixture is not null) { try { fixture.Kill(entireProcessTree: true); } catch { } fixture.Dispose(); }
             Environment.SetEnvironmentVariable("CODEXISH_HTTP_FIXTURE_HEADER", oldHeader);
             Environment.SetEnvironmentVariable("CODEXISH_HTTP_FIXTURE_BEARER", oldBearer);
+            Environment.SetEnvironmentVariable("CODEXISH_HTTP_FIXTURE_URL", oldUrl);
+            Environment.SetEnvironmentVariable("CODEXISH_HTTP_FIXTURE_CONFIG", oldConfig);
             try { Directory.Delete(directory, true); } catch { }
         }
     }
@@ -195,7 +266,7 @@ public static class McpHttpTests
             await Until(() => File.Exists(Path.Combine(directory, "address")), "hanging-list fixture listen");
             string address = File.ReadAllText(Path.Combine(directory, "address"));
             var config = ServerConfig.Create("", "fixture-password", [("test", directory)], [], 0, Path.Combine(directory, "state"));
-            config.McpServers = JsonSerializer.SerializeToElement(new { hanging = new { url = address + "/mcp" } });
+            config.McpServers = JsonSerializer.SerializeToElement(new { hanging = new { cwd = directory, url = address + "/mcp" } });
             runtime = new CodexishRuntime(config, true);
             runtime.Mounts.Start();
             await Until(() => File.Exists(Path.Combine(directory, "listing-started")), "initial tools/list entered");
@@ -209,6 +280,19 @@ public static class McpHttpTests
             try { fixture.Kill(entireProcessTree: true); } catch { }
             runtime?.Dispose();
             try { Directory.Delete(directory, true); } catch { }
+        }
+    }
+    private static string? Effects(CallToolResult result) => result.StructuredContent?.GetProperty("error").GetProperty("side_effects").GetString();
+    private static int FixedFixturePort()
+    {
+        // Explicit non-ephemeral fixture ports cannot be consumed by an outbound ephemeral connection on restart.
+        while (true)
+        {
+            int port = Random.Shared.Next(10000, 20000);
+            var listener = new System.Net.Sockets.TcpListener(IPAddress.Loopback, port);
+            try { listener.Start(); return port; }
+            catch (System.Net.Sockets.SocketException) { }
+            finally { listener.Stop(); }
         }
     }
     private static Process StartFixture(string directory, int port, string mode)

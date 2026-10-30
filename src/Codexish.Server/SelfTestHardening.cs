@@ -342,6 +342,7 @@ internal static class HardeningTests
         var nested = ServerConfig.Load(nestedPath);
         using (var runtime = new CodexishRuntime(nested))
         {
+            await runtime.Mounts.PrepareAsync();
             var mounts = JsonSerializer.SerializeToElement(runtime.Browsers.Describe()).GetProperty("mounted");
             Check(nested.Roots.Select(r => r.Id).SequenceEqual(["proj"]) && nested.Shell.EffectiveDefault == "pwsh" && nested.Git.Path == "" &&
                   nested.OAuth.ClientId == new OAuthConfig().ClientId && nested.OAuth.RedirectUris.Length == 0 && nested.Tunnel.Args.SequenceEqual(["--flag"]) &&
