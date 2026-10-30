@@ -108,6 +108,13 @@ public static class LocalMcpIntegrationTests
             async Task<McpClient> Client(bool instructions = true) => await McpClient.CreateAsync(new HttpClientTransport(new() { Endpoint = new Uri(address + "/mcp") }), new() { ProtocolVersion = CodexishRuntime.ProtocolVersion });
             await using var client = await Client();
             JsonElement State(string identity) => JsonSerializer.SerializeToElement(runtime.Mounts.Describe()).GetProperty("mounted").EnumerateArray().Single(s => s.GetProperty("identity").GetString() == identity);
+            // Newly saved definitions do not exist in the published snapshot until the reload loop observes them.
+            bool HasState(string identity, string state)
+            {
+                var entry = JsonSerializer.SerializeToElement(runtime.Mounts.Describe()).GetProperty("mounted")
+                    .EnumerateArray().SingleOrDefault(s => s.GetProperty("identity").GetString() == identity);
+                return entry.ValueKind != JsonValueKind.Undefined && entry.GetProperty("state").GetString() == state;
+            }
             Task<CallToolResult> Call(string tool, object input) => client.CallToolAsync(new CallToolRequestParams { Name = tool, Arguments = new Dictionary<string, JsonElement> { ["arguments"] = JsonSerializer.SerializeToElement(input) } }).AsTask();
             async Task<int> Pid(string tool) => FixtureData(await Call(tool, new { })).GetProperty("pid").GetInt32();
             void Save(JsonObject node) { string next = path + ".test-next"; File.WriteAllText(next, node.ToJsonString()); File.Move(next, path, true); }
@@ -127,6 +134,8 @@ public static class LocalMcpIntegrationTests
                 check(result.GetProperty("names").EnumerateArray().Any(n => n.GetString() == "CODEXISH_MCP_EXPLICIT_SECRET") && !values.GetProperty("CODEXISH_MCP_EXPLICIT_SECRET").GetString()!.Contains("synthetic-local-mcp-secret"), "MCP explicit secret reaches child and its echoed value is redacted");
                 await using (var initialized = await Client()) check(initialized.ServerInstructions?.Contains(FixtureInstructions) == true, "MCP backend instructions appear in real host initialization");
                 check(Directory.EnumerateFiles(Path.Combine(config.StateDir, "mcp-mounts"), "*.manifest.json").Any(f => File.ReadAllText(f).Contains(FixtureInstructions)), "MCP backend instructions are preserved in manifests");
+                check(!HasState("shim", "connected") && !HasState("invalidshim", "invalid_config"),
+                    "MCP reload polling treats an unpublished new server as pending, not an exception");
                 if (OperatingSystem.IsWindows())
                 {
                     string shimDirectory = Path.Combine(directory, "shim path"); Directory.CreateDirectory(shimDirectory);
@@ -137,12 +146,12 @@ public static class LocalMcpIntegrationTests
                     shimNode["mcp_servers"]!["shim"] = new JsonObject { ["command"] = "mcpfixture", ["args"] = JsonSerializer.SerializeToNode(special), ["root_id"] = "root", ["read_only_tools"] = new JsonArray("inspect"), ["env"] = new JsonObject { ["PATH"] = shimDirectory + ";${PATH}" } };
                     shimNode["mcp_servers"]!["invalidshim"] = new JsonObject { ["command"] = shim, ["args"] = new JsonArray("invalid\rargument") };
                     Save(shimNode);
-                    check(await Until(() => State("shim").GetProperty("state").GetString() == "connected"), "MCP Windows bare command finds cmd shim on explicitly expanded PATH");
+                    check(await Until(() => HasState("shim", "connected")), "MCP Windows bare command finds cmd shim on explicitly expanded PATH");
                     var shimData = FixtureData(await Call("mcp_shim_inspect", new { }));
                     check(shimData.GetProperty("args").EnumerateArray().Select(a => a.GetString()).TakeLast(special.Length).SequenceEqual(special) && !File.Exists(Path.Combine(root, "(")) && !File.Exists(Path.Combine(root, ")")), "MCP Windows shim delivers spaces and every cmd metacharacter literally without stray files");
                     var shimMount = runtime.Mounts.ResourceTargets.OfType<McpMount>().Single(m => m.Identity == "shim");
-                    check(shimMount.ProcessId != shimData.GetProperty("pid").GetInt32(), "MCP Windows shim reports the cmd supervisor process id");
-                    check(await Until(() => State("invalidshim").GetProperty("state").GetString() == "invalid_config"), "MCP Windows batch CR argument is invalid_config");
+                    check(shimMount.ProcessId is { } cmdPid && cmdPid != shimData.GetProperty("pid").GetInt32(), "MCP Windows shim reports the cmd supervisor process id");
+                    check(await Until(() => HasState("invalidshim", "invalid_config")), "MCP Windows batch CR argument is invalid_config");
                     var invalidProcess = await new CodexishTools(runtime).ProcessStart("root", "invalid-batch-argument", executable: shim, args: ["bad\nargument"], wait_ms: 10000);
                     check(Reply.CodeOf(invalidProcess) == "INVALID_ARGUMENT", "MCP process_start rejects an unrepresentable batch argument");
                 }

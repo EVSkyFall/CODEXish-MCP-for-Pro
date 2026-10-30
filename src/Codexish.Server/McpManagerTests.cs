@@ -122,6 +122,7 @@ public static class McpManagerTests
         await RapidReplacement(check);
         await PausedReplacement(check);
         RetainedBrowser(check);
+        await ReloadRecoversUnexpectedFailure(check);
     }
     private static async Task RapidReplacement(Action<bool, string> check)
     {
@@ -268,6 +269,56 @@ public static class McpManagerTests
                 "manager: repaired browser configuration applies the changed effective environment on next save");
         }
         finally { Environment.SetEnvironmentVariable(variable, original.Length == 0 ? null : original); TestCleanup.RemoveDirectory(directory); }
+    }
+
+    private static async Task ReloadRecoversUnexpectedFailure(Action<bool, string> check)
+    {
+        string directory = Path.Combine(Path.GetTempPath(), "codexish-mcp-reload-recovery-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        string path = Path.Combine(directory, "codexish.json");
+        void Save(string identity)
+        {
+            string next = path + ".next";
+            File.WriteAllText(next, JsonSerializer.Serialize(new { mcp_servers = new Dictionary<string, object>
+            { [identity] = new { command = "unused-fixture", disabled = true } } }));
+            File.Move(next, path, overwrite: true);
+        }
+        static async Task<bool> Until(Func<bool> condition)
+        {
+            var clock = Stopwatch.StartNew();
+            while (!condition()) { if (clock.Elapsed > TimeSpan.FromSeconds(30)) return false; await Task.Delay(20); }
+            return true;
+        }
+        Save("before");
+        try
+        {
+            using var runtime = new CodexishRuntime(new ServerConfig { StateDir = Path.Combine(directory, "state"), SourcePath = path }, true);
+            var original = runtime.Mounts.ResourceTargets.Single();
+            int reads = 0;
+            string secret = "ghp_" + new string('q', 36);
+            runtime.Mounts.BeforeReloadRead = () =>
+            {
+                if (Interlocked.Increment(ref reads) == 1) throw new InvalidOperationException("injected reader failure " + secret);
+            };
+            Save("after-failure");
+            byte[] unchangedFile = File.ReadAllBytes(path);
+            DateTime timestamp = File.GetLastWriteTimeUtc(path);
+            runtime.Mounts.Start();
+            string? Warning() => JsonSerializer.SerializeToElement(runtime.Mounts.Describe()).GetProperty("reload_error").GetString();
+            check(await Until(() => Warning()?.Contains("injected reader failure", StringComparison.Ordinal) == true),
+                "manager: unexpected reload reader exception is reported instead of ending supervision");
+            string warning = Warning()!;
+            check(!warning.Contains(secret, StringComparison.Ordinal) && warning.Contains("REDACTED", StringComparison.Ordinal) &&
+                  ReferenceEquals(original, runtime.Mounts.ResourceTargets.Single()),
+                "manager: unexpected reader warning is redacted and the previous mount survives the failed iteration");
+            check(await Until(() => runtime.Mounts.ResourceTargets.Single().Identity == "after-failure") && reads >= 2 &&
+                  File.ReadAllBytes(path).SequenceEqual(unchangedFile) && File.GetLastWriteTimeUtc(path) == timestamp,
+                "manager: reload retries consumed file stamps and applies the exact unchanged file after a reader failure");
+            Save("subsequent-save");
+            check(await Until(() => runtime.Mounts.ResourceTargets.Single().Identity == "subsequent-save") && Warning() is null,
+                "manager: later saves still apply normally after unexpected reload recovery");
+        }
+        finally { TestCleanup.RemoveDirectory(directory); }
     }
 
 }

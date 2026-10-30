@@ -117,7 +117,21 @@ public sealed class McpMounts : IAsyncDisposable
                 while (true)
                 {
                     await Task.Delay(TimeSpan.FromSeconds(3), stopping.Token);
-                    if (Changed()) ReadDefinitionsAndApply();
+                    try
+                    {
+                        lock (reloadSync)
+                            if (Changed()) ReadDefinitionsAndApply();
+                    }
+                    catch (OperationCanceledException) when (stopping.IsCancellationRequested) { throw; }
+                    catch (Exception error)
+                    {
+                        lock (reloadSync)
+                        {
+                            // Changed consumed the observed stamps. Retry even if the file is not saved again.
+                            stamps.Clear();
+                            Warn($"Mount configuration reload failed: {error.GetType().Name}: {error.Message}");
+                        }
+                    }
                 }
             }
             catch (OperationCanceledException) when (stopping.IsCancellationRequested) { }
@@ -138,7 +152,15 @@ public sealed class McpMounts : IAsyncDisposable
         }
         return changed;
     }
-    private void ReadDefinitionsAndApply() { lock (reloadSync) ApplyDefinitions(); }
+    internal Action? BeforeReloadRead { get; set; }
+    private void ReadDefinitionsAndApply()
+    {
+        lock (reloadSync)
+        {
+            BeforeReloadRead?.Invoke();
+            ApplyDefinitions();
+        }
+    }
     private void ApplyDefinitions()
     {
         var config = owner.Config;
@@ -236,7 +258,12 @@ public sealed class McpMounts : IAsyncDisposable
         if (!stopping.IsCancellationRequested && Volatile.Read(ref started) != 0) fresh?.Start();
     }
     private void Track(string key, Task task) { lifetimes[key] = task; lock (retirements) retirements.Add(task); }
-    private void Warn(string text) { reloadError = Redaction.Apply(text).Text; owner.Store.Event("mcp_reload_warning", null, new { error = reloadError }); }
+    private void Warn(string text)
+    {
+        reloadError = Redaction.Apply(text).Text;
+        // A logging failure must not terminate configuration supervision either.
+        try { owner.Store.Event("mcp_reload_warning", null, new { error = reloadError }); } catch { }
+    }
     private static bool Publishes(McpDefinition d) => d.State is not ("disabled" or "needs_shell_grant" or "overridden" or "invalid_config");
     private void Republish()
     {

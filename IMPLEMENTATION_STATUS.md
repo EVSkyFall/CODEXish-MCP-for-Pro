@@ -21,13 +21,13 @@ collision naming; roots-only tray saves. No merge, deployment or owner-PC config
 | `--self-test` | Exit 0; SELF_TEST_PASSED 412, DESKTOP_CORE_PASSED 57, DESKTOP_REGRESSIONS 11 passed / 0 failed (fake platform) |
 | `--browser-tests` | Exit 0; BROWSER_TESTS_PASSED 178; real fixture transports and HTTP host, not a real browser/ChatGPT trial |
 | `--tray-tests` | Exit 0; TRAY_CONTROLLER_PASSED 59; Windows-only checks skipped with reasons |
-| CI ubuntu-latest / windows-latest, all three entries | Not yet recorded; required before acceptance |
+| Initial CI on `1370e7f` | Ubuntu server and both probe jobs passed. Windows server build and self-test (429, desktop core 57, regressions 11) passed; browser suite failed after 89; tray step not reached. See follow-up below. |
 | Owner's real Unity MCP via `uvx`/`npx` stdio and HTTP, used from ChatGPT | Not run by this work; separate live acceptance required |
 
 The integration lead ran the final suites sequentially. Local logs are
 `/tmp/local-mcp-final-self-test.log`, `/tmp/local-mcp-final-browser-tests.log` and
 `/tmp/local-mcp-final-tray-tests.log`; these are execution-workspace evidence, not repository artifacts.
-Windows-only runtime checks, notification icon, live desktop, real Unity MCP and ChatGPT were not run.
+Windows-only runtime checks were not run in the local Linux workspace; the initial Windows CI outcome is recorded above. Notification icon, live desktop, real Unity MCP and ChatGPT were not run.
 
 Earlier integration failures are retained here rather than replaced by the passing result:
 - Browser runs stopped at checks 54 (null arguments) and 82 (pending state); both were corrected before rerunning.
@@ -37,6 +37,19 @@ Earlier integration failures are retained here rather than replaced by the passi
   valid HOME corrected the fixture environment.
 - A self-test run failed at check 213 on a File.Exists-before-close race; waiting for ledger completion corrected
   the observation ordering. No passing count from these failed runs is treated as final acceptance.
+
+CI follow-up: [Windows job 123920060843](https://github.com/EVSkyFall/CODEXish-MCP-for-Pro/actions/runs/41012103691/job/123920060843)
+failed in the Windows-only shim fixture before its newly saved definition was published by the three-second
+reload loop. The polling predicate used strict `Single` lookup and threw instead of observing "not present yet".
+The fixture now uses presence-aware state polling, with an additional cross-platform assertion for unpublished
+entries; its connected state, exact argument round-trip, process identity and invalid-argument assertions remain.
+The same follow-up also fixes the review finding that an unexpected reload exception could terminate the
+background loop after consuming file stamps. Each iteration now records a redacted warning and clears the
+stamps so the unchanged saved file is retried on the next tick; logging failure cannot terminate supervision.
+An injected-reader regression covers the warning, retry without another save, and a subsequent valid save.
+Time bounds and workflow/scripts are unchanged. Follow-up Linux Release validation passed self-test 412,
+desktop core 57, regressions 11, browser-tests 183, and tray-tests 59; Windows-target/WPF cross-compilation again has
+0 errors and 4 MCP9005 warnings. Windows CI rerun remains required; cross-compilation is not execution.
 
 Known limitations remain: one backend is shared across conversations; ChatGPT refreshes tools/instructions only
 on a new list/initialization; stateless HTTP tool changes are learned on reconnect; no remote OAuth, MCP prompts,
