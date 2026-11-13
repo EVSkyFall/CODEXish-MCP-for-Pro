@@ -19,21 +19,29 @@ public static class CodexishHost
         builder.Logging.SetMinimumLevel(LogLevel.Warning);
         builder.Services.AddSingleton(runtime);
         builder.Services.AddSingleton(runtime.Desktop);
+        bool readOnly = config.ReadOnly;
         // Mounted browser tools are listed and dispatched per request, so a mount that connects, reconnects or is still
         // starting changes the tool list without rebuilding the host.
         builder.Services.AddMcpServer(o =>
         {
             o.ServerInfo = new() { Name = "CODEXish", Version = CodexishRuntime.ServerVersion };
-            o.ServerInstructions = instructions ? CodexishRuntime.Instructions : null;
+            o.ServerInstructions = instructions ? (readOnly ? CodexishRuntime.ReadOnlyInstructions : CodexishRuntime.Instructions) : null;
         }).WithHttpTransport(o => o.SessionMode = HttpServerSessionMode.Stateless)
           .WithTools<CodexishTools>().WithTools<DesktopTools>()
-          .WithListToolsHandler((_, _) => ValueTask.FromResult(new ModelContextProtocol.Protocol.ListToolsResult { Tools = runtime.Browsers.Tools.Select(t => t.ProtocolTool).ToList() }))
-          .WithCallToolHandler((request, token) => runtime.Browsers.Find(request.Params?.Name) is { } tool
+          .WithListToolsHandler((_, _) => ValueTask.FromResult(new ModelContextProtocol.Protocol.ListToolsResult { Tools = runtime.Browsers.Tools.Where(_ => !readOnly).Select(t => t.ProtocolTool).ToList() }))
+          .WithCallToolHandler((request, token) => !readOnly && runtime.Browsers.Find(request.Params?.Name) is { } tool
               ? tool.InvokeAsync(request, token)
               : throw new ModelContextProtocol.McpProtocolException($"Unknown tool: '{request.Params?.Name}'", ModelContextProtocol.McpErrorCode.InvalidParams));
+        // Runs after the SDK has collected the registered tools, so a removed tool is unknown to both list and call.
+        if (readOnly)
+            builder.Services.PostConfigure<ModelContextProtocol.Server.McpServerOptions>(o =>
+            {
+                foreach (var tool in o.ToolCollection?.Where(t => !CodexishRuntime.ReadOnlyToolNames.Contains(t.ProtocolTool.Name)).ToArray() ?? [])
+                    o.ToolCollection!.Remove(tool);
+            });
         var app = builder.Build();
         // Mounts connect only once Kestrel listens, each in the background, so none can delay or stop the host.
-        app.Lifetime.ApplicationStarted.Register(runtime.Browsers.Start);
+        if (!readOnly) app.Lifetime.ApplicationStarted.Register(runtime.Browsers.Start);
         // In-flight browser calls are cancelled as soon as the host starts stopping, so its request drain is not held
         // by a backend that never answers.
         app.Lifetime.ApplicationStopping.Register(runtime.Browsers.Stop);

@@ -369,3 +369,44 @@ New checks:
 
 Not run and not claimed: the tray UI itself (`--tray`, `--tray-smoke-test`, a real balloon or a real open menu), a
 screen reader, ChatGPT, CI, a Linux run, `--self-test-desktop`, `--self-test-desktop-http` and `--browser-live-test`.
+
+## v1.0.3: read-only review mode and browser-extension origins (2026-11-13)
+
+Branch `feat/v1.0.3-review-mode` from `main` ecb536c. The runs below used the uncommitted working tree on the owner's
+Windows 11 PC with portable SDK 10.0.404, as a framework-dependent Release build. Nothing here showed a window, used a
+browser, extension, Google AI Studio, ChatGPT or a tunnel, or touched the installed app, its state folder, the real
+Startup folder, port 38451 or a running Codexish.Server.
+
+| Item | What changed |
+| --- | --- |
+| A tools | `ServerConfig.ReadOnly` (`read_only`, a converter reads JSON `null` as `false`). `CodexishRuntime.ReadOnlyToolNames` holds the 11 read tools next to `ToolNames`. With `read_only`, `CodexishHost.Build` adds a `PostConfigure<McpServerOptions>` that removes every other tool from `ToolCollection`, so `tools/list` omits them and `tools/call` falls through to the existing call handler's `Unknown tool: '<name>'` error. Tool registration is unchanged. |
+| A mounts | With `read_only`, the list handler returns no mounted tool, the call handler finds none (same unknown-tool error), and `Browsers.Start` is not registered, so mounts never connect. |
+| A grants | `Validate()` sets `write` and `shell` to false on every usable root and warns "read_only is on, so root '<id>' is read-only." when either was asked for; `read` is untouched. |
+| A reporting | `host_capabilities` and `workspace_info` carry `read_only`; with it on, `host_capabilities.tools` is the 11 names. `initialize.instructions` is `CodexishRuntime.ReadOnlyInstructions`; `--no-instructions` still omits it. |
+| B origins | `AccessPolicy.NormalizeOrigin` accepts exactly `chrome-extension://` plus 32 letters a-p, without case, and returns it in lower case; anything after the id (path, port, query, fragment) or an id of another length or alphabet is null. The rejected-entry warning ends "is not an exact http(s) or chrome-extension origin and is ignored." The Host and Origin checks are otherwise unchanged. |
+| C tests | `SelfTestReadOnly.cs`, run after the hardening tests: 15 new checks (below). |
+| D | `<Version>1.0.3</Version>`; `docs/release-notes/v1.0.3.md` (includes v1.0.2's tray changes, which were never released); reference: "Read-only review instance". |
+
+| Command | Result |
+| --- | --- |
+| Release build | 0 warnings, 0 errors; `1.0.3` |
+| `--self-test`, three runs (the first on the same source before the version bump) | SELF_TEST_PASSED 383 (368 before) in each; DESKTOP_CORE_PASSED 56; DESKTOP_REGRESSIONS 11 passed, 0 failed |
+| `--browser-tests`, one run | BROWSER_TESTS_PASSED 55 (unchanged) |
+| `--tray-tests`, one run | TRAY_CONTROLLER_PASSED 73 (unchanged) |
+
+New checks (self-test):
+- `read_only` is false when missing or `null`, true when set.
+- `NormalizeOrigin` accepts a valid extension id in either case and lower-cases it; it rejects an id of 31 or 33
+  letters, a `q` or a digit, a trailing `/` or path, a port, a query, a fragment, user info, `moz-extension://` and an
+  empty id.
+- A `read_only` loopback configuration with write and shell roots: the roots come out read-only with the warning, a
+  malformed extension origin is skipped with the new warning, and `NoAuthRefusal`/`TransportRefusal` accept it.
+- Through the real HTTP host with `--no-auth` and `Origin: chrome-extension://<listed id>`: `initialize` returns the
+  read-only instructions; `tools/list` lists exactly the 11 tools; `fs_write`, `computer_act` and `shell_run` fail as
+  unknown tools; `fs_read` still reads; `host_capabilities` and `workspace_info` report `read_only: true`, 11 tools and
+  no write grant; an unlisted extension id gets 403 `origin_not_allowed`.
+- With `read_only` false, the same `--no-auth` host keeps the grants without a warning and lists the same 24 tools,
+  with the full instructions and `read_only: false`.
+
+Not run and not claimed: a real browser extension, Google AI Studio, a mounted browser backend under `read_only`, the
+tray UI, CI, a Linux run, `--self-test-desktop`, `--self-test-desktop-http` and `--browser-live-test`.

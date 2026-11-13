@@ -74,6 +74,8 @@ public sealed class ServerConfig
     [JsonPropertyName("browser_mounts")] public BrowserMountConfig[] BrowserMounts { get; set; } = [];
     [JsonPropertyName("tunnel")] public TunnelConfig Tunnel { get; set; } = new();
     [JsonPropertyName("retention")] public RetentionConfig Retention { get; set; } = new();
+    // A review instance: only the read tools are served and every root is read-only. JSON null means false.
+    [JsonPropertyName("read_only"), JsonConverter(typeof(NullAsFalse))] public bool ReadOnly { get; set; }
 
     // Problems that no longer stop the server: they go to the startup log and host_capabilities.warnings.
     [JsonIgnore] public List<string> Warnings { get; private set; } = [];
@@ -224,7 +226,7 @@ public sealed class ServerConfig
         AllowHosts = hosts;
         string[] origins = AllowOrigins.Where(o => AccessPolicy.NormalizeOrigin(o) is not null).Select(o => o!).ToArray();
         foreach (string? rejected in AllowOrigins.Where(o => AccessPolicy.NormalizeOrigin(o) is null))
-            warnings.Add($"allow_origins entry '{rejected ?? "null"}' is not an exact http(s) origin and is ignored.");
+            warnings.Add($"allow_origins entry '{rejected ?? "null"}' is not an exact http(s) or chrome-extension origin and is ignored.");
         AllowOrigins = origins;
         if (OAuth.AccessTokenHours <= 0)
         {
@@ -258,6 +260,12 @@ public sealed class ServerConfig
             if (PathRules.IsInside(root.Path, StateDir) || PathRules.IsInside(StateDir, root.Path))
                 warnings.Add($"state_dir {StateDir} overlaps root '{root.Id}' ({root.Path}), so the ledger, backups and artifacts " +
                     "are reachable through that root's file and shell tools. Move state_dir outside every root.");
+            if (ReadOnly && (root.Write || root.Shell))
+            {
+                warnings.Add($"read_only is on, so root '{root.Id}' is read-only.");
+                root.Write = false;
+                root.Shell = false;
+            }
             usable.Add(root);
         }
         Roots = usable.ToArray();
@@ -428,5 +436,13 @@ public sealed class ServerConfig
             config.AllowHosts = [url.Host];
         config.Validate();
         return config;
+    }
+
+    private sealed class NullAsFalse : JsonConverter<bool>
+    {
+        public override bool HandleNull => true;
+        public override bool Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options) =>
+            reader.TokenType != JsonTokenType.Null && reader.GetBoolean();
+        public override void Write(Utf8JsonWriter writer, bool value, JsonSerializerOptions options) => writer.WriteBooleanValue(value);
     }
 }
