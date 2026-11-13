@@ -108,6 +108,10 @@ public sealed class CodexishRuntime : IDisposable
         "returned after every action. Focus the selected window when needed. Crop for detail, never replay " +
         "unverified input, and verify saved files separately from input delivery.";
 
+    public const string ReadOnlyInstructions =
+        "Read-only review access to the user's code. Use fs_list, fs_read, fs_search and git_diff/git_log to inspect " +
+        "files under the listed roots; nothing can be changed or run.";
+
     private static readonly (string Feature, string Reason)[] Unsupported =
     [
 
@@ -126,6 +130,7 @@ public sealed class CodexishRuntime : IDisposable
         protocol_version = ProtocolVersion,
         schema_version = Reply.SchemaVersion,
         execution_boundary = Reply.Boundary,
+        read_only = Config.ReadOnly,
         boundaries = new
         {
             structured_file_scope = "fs_* tools are fenced to the configured roots and verify every opened handle.",
@@ -134,7 +139,7 @@ public sealed class CodexishRuntime : IDisposable
         },
         roots = Config.Roots.Select(r => new { id = r.Id, path = r.Path, exists = Directory.Exists(r.Path), grants = new { r.Read, r.Write, r.Shell } }),
         warnings = Warnings,
-        tools = ToolNames.Concat(Browsers.Tools.Select(t => t.ProtocolTool.Name)).ToArray(),
+        tools = Config.ReadOnly ? ReadOnlyToolNames : ToolNames.Concat(Browsers.Tools.Select(t => t.ProtocolTool.Name)).ToArray(),
         browser = Browsers.Describe(),
         desktop = new { native_available = OperatingSystem.IsWindows(), coordinate_space = "virtual desktop physical pixels", uia_thread = "dedicated MTA", input_tick = "metadata only" },
         unsupported = Unsupported.Select(u => new { feature = u.Feature, reason = u.Reason }),
@@ -172,6 +177,7 @@ public sealed class CodexishRuntime : IDisposable
             exists = Directory.Exists(r.Path),
             is_git_repository = Directory.Exists(Path.Combine(r.Path, ".git")) || File.Exists(Path.Combine(r.Path, ".git"))
         }),
+        read_only = Config.ReadOnly,
         state_dir = Config.StateDir,
         state_dir_note = Config.Roots.Any(r => PathRules.IsInside(r.Path, Config.StateDir) || PathRules.IsInside(Config.StateDir, r.Path))
             ? "state_dir overlaps a root, so the ledger, backups and artifacts are reachable through that root's tools; see warnings."
@@ -233,6 +239,14 @@ public sealed class CodexishRuntime : IDisposable
         "fs_apply_patch", "shell_run", "process_start", "process_poll", "process_write", "process_stop",
         "git_status", "git_diff", "git_log", "artifact_read", "artifact_search", "operation_inspect",
         "operation_cancel", "session_checkpoint", "computer_observe", "computer_query_ui", "computer_act"
+    ];
+
+    // The only tools a read_only review instance serves: whoever reads the results may only read code, so nothing
+    // that writes, runs, or captures the screen is offered.
+    public static readonly string[] ReadOnlyToolNames =
+    [
+        "host_capabilities", "workspace_info", "fs_list", "fs_stat", "fs_read", "fs_search", "git_status", "git_diff",
+        "git_log", "artifact_read", "artifact_search"
     ];
 
     // Every step runs even when an earlier one fails, and the store and the state-directory lock are released in

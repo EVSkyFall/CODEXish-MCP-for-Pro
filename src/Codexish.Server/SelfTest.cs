@@ -74,6 +74,7 @@ public static class SelfTest
             }
             Restart(config);
             await HardeningTests.Run(temp, password);
+            await ReadOnlyTests.Run(temp, password);
             Console.WriteLine($"SELF_TEST_PASSED: {passed}; no tunnel was opened, no desktop input was sent, " +
                 "and no ChatGPT connector measurement was performed.");
             return 0;

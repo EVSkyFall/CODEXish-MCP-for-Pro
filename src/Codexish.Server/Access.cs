@@ -2,8 +2,8 @@ using System.Net;
 
 namespace Codexish.Server;
 
-// Host and Origin are routing and browser checks, NOT client authentication. Identical semantics to the P0
-// ProbeAccessPolicy, which the F-1 review accepted: exact hostnames, exact origins, a rejection log, and no
+// Host and Origin are routing and browser checks, NOT client authentication. The semantics of the P0
+// ProbeAccessPolicy, which the F-1 review accepted (plus exact chrome-extension origins): exact hostnames, exact origins, a rejection log, and no
 // trust in forwarded headers. Authentication is the bearer token from D12.
 public sealed class AccessPolicy
 {
@@ -47,8 +47,17 @@ public sealed class AccessPolicy
     // True when a non-loopback host was configured; --no-auth is refused in that case.
     public bool AllowsPublicHost { get; }
 
+    private const string ExtensionScheme = "chrome-extension://";
+
+    // A browser extension's service worker sends Origin: chrome-extension://<id>, where the id is 32 letters a-p.
     public static string? NormalizeOrigin(string? value)
     {
+        if (value is not null && value.StartsWith(ExtensionScheme, StringComparison.OrdinalIgnoreCase))
+        {
+            string id = value[ExtensionScheme.Length..];
+            return id.Length == 32 && id.All(c => c is (>= 'a' and <= 'p') or (>= 'A' and <= 'P'))
+                ? ExtensionScheme + id.ToLowerInvariant() : null;
+        }
         if (string.IsNullOrWhiteSpace(value) || value != value.Trim() || value.Contains('\\') ||
             value.Any(char.IsControl) || !Uri.TryCreate(value, UriKind.Absolute, out var uri) ||
             uri.Scheme is not ("http" or "https") || uri.UserInfo.Length != 0 ||

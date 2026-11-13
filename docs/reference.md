@@ -74,6 +74,50 @@ authentication — the bearer token is. `--no-auth` is accepted only when `allow
 loopback development. To have the server start with Windows and restart by itself, use the
 [tray](#tray) with **Start with Windows**.
 
+## Read-only review instance
+
+A second CODEXish can give a model in the browser, for example Google AI Studio through a browser extension you have
+reviewed, read access to your code and nothing else. It runs next to your main CODEXish, on loopback only, without
+authentication, and is never published through a tunnel.
+
+Write its configuration by hand, in its own folder:
+
+```json
+{
+  "read_only": true,
+  "port": 38452,
+  "state_dir": "C:\\Users\\<you>\\AppData\\Local\\Codexish-review",
+  "allow_origins": ["chrome-extension://<the extension's 32-letter id>"],
+  "roots": [{ "id": "proj", "path": "C:\\Projects\\Example", "read": true, "write": false, "shell": false }]
+}
+```
+
+and start it with that file and `--no-auth`:
+
+```powershell
+& $codexish --config "$env:LOCALAPPDATA\Codexish-review\codexish.json" --no-auth
+```
+
+- **`read_only: true`** serves only `host_capabilities`, `workspace_info`, `fs_list`, `fs_stat`, `fs_read`,
+  `fs_search`, `git_status`, `git_diff`, `git_log`, `artifact_read` and `artifact_search`. Every other tool, including
+  the desktop tools (screen content must not leave the PC), is removed and answers as an unknown tool. Browser mounts
+  are not started. Every root is read-only whatever it asks for; a root that asks for `write` or `shell` gets a
+  warning. `host_capabilities` and `workspace_info` report `read_only`, and `initialize` returns a short read-only text
+  instead of the full instructions. Missing or `null` means `false`.
+- **`allow_origins`** lists the extension's origin, `chrome-extension://` followed by its 32-letter id (letters a to
+  p, shown on `chrome://extensions`). The extension calls `http://127.0.0.1:38452/mcp` from its service worker. A
+  request from any other extension or web page is rejected with 403; local programs that send no Origin can still
+  connect, as with any loopback server.
+- **`port`** is a loopback port of its own, different from your main CODEXish and from anything a tunnel forwards.
+- **`state_dir`** is a folder of its own: two servers cannot share one, and the main ledger, sign-ins and artifacts
+  stay out of reach. Keep it outside every root.
+- **`--no-auth`** is accepted because `allow_hosts` is empty and there is no `public_url`. The startup log warns that
+  the OAuth secrets and the control token are empty; with `--no-auth` nothing uses them.
+
+**Never publish this instance through a tunnel.** It has no authentication, so anyone who reaches the port can read
+every file under its roots. Also keep in mind that every tool result, meaning the file contents, diffs and search
+hits, goes to whatever model reads it, under that service's terms. Share only roots you are willing to send there.
+
 ## Tunnel
 
 Use Tailscale Funnel as the persistent tunnel. Its `https://<machine>.<tailnet>.ts.net` address does not change, so
